@@ -41,7 +41,8 @@
 
 -export([parse_offset_arg/1]).
 
--export([status/2,
+-export([dump/2,
+         status/2,
          tracking_status/2]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
@@ -560,6 +561,38 @@ status(Vhost, QueueName) ->
                   get_key(readers, C),
                   get_key(segments, C)]
              end || {Role, C} <- get_counters(Q)];
+        {error, not_found} = E ->
+            E
+    end.
+
+dump(Vhost, QueueName) ->
+    QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} when ?amqqueue_is_classic(Q) ->
+            {error, classic_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_quorum(Q) ->
+            {error, quorum_queue_not_supported};
+        {ok, Q} when ?amqqueue_is_stream(Q) ->
+            %% alternative to get stream directory:
+            % StreamQueueState = ?amqqueue_v2_field_type_state(Q),
+            % case maps:find(name, StreamQueueState) of
+                % {ok, Name} ->
+                    % osiris_log:directory(Name);
+                % error ->
+                    % {error, stream_queue_name_not_found}
+            % end;
+            OsirisWriterPid = amqqueue:get_pid(Q),
+            OsirisWriterNode = amqqueue:qnode(OsirisWriterPid),
+            #{dir := Dir} = gen_batch_server:call(OsirisWriterPid, get_reader_context),
+            %%TODO instead of RPC here, make CLI client locate the stream leader;
+            %% or even better: only RPC to leader if not found locally (on replica) since
+            %% client might want to check replica log
+            case rpc:call(OsirisWriterNode, osiris_log, dump, [Dir]) of
+                {badrpc, Reason} ->
+                    {error, Reason};
+                Lines ->
+                    Lines
+            end;
         {error, not_found} = E ->
             E
     end.
