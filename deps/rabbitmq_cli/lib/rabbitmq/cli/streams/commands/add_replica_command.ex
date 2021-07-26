@@ -54,7 +54,7 @@ defmodule RabbitMQ.CLI.Streams.Commands.AddReplicaCommand do
 
   def help_section, do: :replication
 
-  def description, do: "Adds a stream queue replica on the given node."
+  def description, do: "Adds a stream queue replica on the given node"
 
   def banner([name, node], _) do
     [

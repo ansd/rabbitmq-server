@@ -55,7 +55,7 @@ defmodule RabbitMQ.CLI.Streams.Commands.DeleteReplicaCommand do
 
   def help_section, do: :replication
 
-  def description, do: "Removes a stream queue replica on the given node."
+  def description, do: "Removes a stream queue replica on the given node"
 
   def banner([name, node], _) do
     "Removing a replica of queue #{name} on node #{node}..."

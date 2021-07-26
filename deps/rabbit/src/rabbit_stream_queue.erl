@@ -41,7 +41,7 @@
 
 -export([parse_offset_arg/1]).
 
--export([dump/2,
+-export([parse/2,
          status/2,
          tracking_status/2]).
 
@@ -565,7 +565,7 @@ status(Vhost, QueueName) ->
             E
     end.
 
-dump(Vhost, QueueName) ->
+parse(Vhost, QueueName) ->
     QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
     case rabbit_amqqueue:lookup(QName) of
         {ok, Q} when ?amqqueue_is_classic(Q) ->
@@ -587,7 +587,7 @@ dump(Vhost, QueueName) ->
             %%TODO instead of RPC here, make CLI client locate the stream leader;
             %% or even better: only RPC to leader if not found locally (on replica) since
             %% client might want to check replica log
-            case rpc:call(OsirisWriterNode, osiris_log, dump, [Dir]) of
+            case rpc:call(OsirisWriterNode, osiris_log, parse, [Dir]) of
                 {badrpc, Reason} ->
                     {error, Reason};
                 Lines ->
