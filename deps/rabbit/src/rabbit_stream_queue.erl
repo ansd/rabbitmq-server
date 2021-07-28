@@ -542,57 +542,68 @@ i(_, _) ->
 -spec status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
     [[{binary(), term()}]] | {error, term()}.
 status(Vhost, QueueName) ->
-    %% Handle not found queues
-    QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
-    case rabbit_amqqueue:lookup(QName) of
-        {ok, Q} when ?amqqueue_is_classic(Q) ->
-            {error, classic_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_quorum(Q) ->
-            {error, quorum_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_stream(Q) ->
-            _Pid = amqqueue:get_pid(Q),
-            % Max = maps:get(max_segment_size_bytes, Conf, osiris_log:get_default_max_segment_size_bytes()),
-            [begin
-                 [{role, Role},
-                  get_key(node, C),
-                  get_key(offset, C),
-                  get_key(committed_offset, C),
-                  get_key(first_offset, C),
-                  get_key(readers, C),
-                  get_key(segments, C)]
-             end || {Role, C} <- get_counters(Q)];
-        {error, not_found} = E ->
-            E
-    end.
+    stream_queue(
+      Vhost, QueueName,
+      fun(Q) ->
+              _Pid = amqqueue:get_pid(Q),
+              % Max = maps:get(max_segment_size_bytes, Conf, osiris_log:get_default_max_segment_size_bytes()),
+              [begin
+                   [{role, Role},
+                    get_key(node, C),
+                    get_key(offset, C),
+                    get_key(committed_offset, C),
+                    get_key(first_offset, C),
+                    get_key(readers, C),
+                    get_key(segments, C)]
+               end || {Role, C} <- get_counters(Q)]
+      end).
+
+-spec tracking_status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
+    [[{atom(), term()}]] | {error, term()}.
+tracking_status(Vhost, QueueName) ->
+    stream_queue(
+      Vhost, QueueName,
+      fun(Q) ->
+              Leader = amqqueue:get_pid(Q),
+              Map = osiris:read_tracking(Leader),
+              maps:fold(fun(Type, Trackings, Acc) ->
+                                %% Convert for example 'offsets' to 'offset' or 'sequences' to 'sequence'
+                                T = list_to_atom(lists:droplast(atom_to_list(Type))),
+                                maps:fold(fun(TrkId, TrkData, Acc0) ->
+                                                  [[{type, T},
+                                                    {reference, TrkId},
+                                                    {value, TrkData}] | Acc0]
+                                          end, [], Trackings) ++ Acc
+                        end, [], Map)
+      end).
 
 parse(Vhost, QueueName) ->
-    QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
+    stream_queue(
+      Vhost, QueueName,
+      fun(Q) ->
+              StreamQueueState = ?amqqueue_v2_field_type_state(Q),
+              {ok, StreamNodes} = maps:find(nodes, StreamQueueState),
+              case lists:member(node(), StreamNodes) of
+                  true ->
+                      {ok, StreamName} = maps:find(name, StreamQueueState),
+                      StreamDir = osiris_log:directory(StreamName),
+                      osiris_log:parse(StreamDir);
+                  false ->
+                      {error, io_lib:format(
+                                "Node ~s is not part of the replicas for stream ~s: ~p.",
+                                [node(), QueueName, StreamNodes])}
+              end
+      end).
+
+stream_queue(Vhost, Name, F) ->
+    QName = rabbit_misc:r(Vhost, queue, Name),
     case rabbit_amqqueue:lookup(QName) of
         {ok, Q} when ?amqqueue_is_classic(Q) ->
             {error, classic_queue_not_supported};
         {ok, Q} when ?amqqueue_is_quorum(Q) ->
             {error, quorum_queue_not_supported};
         {ok, Q} when ?amqqueue_is_stream(Q) ->
-            %% alternative to get stream directory:
-            % StreamQueueState = ?amqqueue_v2_field_type_state(Q),
-            % case maps:find(name, StreamQueueState) of
-                % {ok, Name} ->
-                    % osiris_log:directory(Name);
-                % error ->
-                    % {error, stream_queue_name_not_found}
-            % end;
-            OsirisWriterPid = amqqueue:get_pid(Q),
-            OsirisWriterNode = amqqueue:qnode(OsirisWriterPid),
-            #{dir := Dir} = gen_batch_server:call(OsirisWriterPid, get_reader_context),
-            %%TODO instead of RPC here, make CLI client locate the stream leader;
-            %% or even better: only RPC to leader if not found locally (on replica) since
-            %% client might want to check replica log
-            case rpc:call(OsirisWriterNode, osiris_log, parse, [Dir]) of
-                {badrpc, Reason} ->
-                    {error, Reason};
-                Lines ->
-                    Lines
-            end;
+            F(Q);
         {error, not_found} = E ->
             E
     end.
@@ -629,33 +640,6 @@ get_counter(QName, Data, Add) ->
             end;
         M ->
             {writer, maps:merge(Add, M)}
-    end.
-
-
--spec tracking_status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
-    [[{atom(), term()}]] | {error, term()}.
-tracking_status(Vhost, QueueName) ->
-    %% Handle not found queues
-    QName = #resource{virtual_host = Vhost, name = QueueName, kind = queue},
-    case rabbit_amqqueue:lookup(QName) of
-        {ok, Q} when ?amqqueue_is_classic(Q) ->
-            {error, classic_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_quorum(Q) ->
-            {error, quorum_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_stream(Q) ->
-            Leader = amqqueue:get_pid(Q),
-            Map = osiris:read_tracking(Leader),
-            maps:fold(fun(Type, Trackings, Acc) ->
-                              %% Convert for example 'offsets' to 'offset' or 'sequences' to 'sequence'
-                              T = list_to_atom(lists:droplast(atom_to_list(Type))),
-                              maps:fold(fun(TrkId, TrkData, Acc0) ->
-                                                [[{type, T},
-                                                  {reference, TrkId},
-                                                  {value, TrkData}] | Acc0]
-                                        end, [], Trackings) ++ Acc
-                      end, [], Map);
-        {error, not_found} = E->
-            E
     end.
 
 readers(QName) ->
@@ -733,43 +717,31 @@ set_retention_policy(Name, VHost, Policy) ->
             end
     end.
 
-add_replica(VHost, Name, Node) ->
-    QName = rabbit_misc:r(VHost, queue, Name),
-    case rabbit_amqqueue:lookup(QName) of
-        {ok, Q} when ?amqqueue_is_classic(Q) ->
-            {error, classic_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_quorum(Q) ->
-            {error, quorum_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_stream(Q) ->
-            case lists:member(Node, rabbit_mnesia:cluster_nodes(running)) of
-                false ->
-                    {error, node_not_running};
-                true ->
-                    rabbit_stream_coordinator:add_replica(Q, Node)
-            end;
-        E ->
-            E
-    end.
+add_replica(Vhost, Name, Node) ->
+    stream_queue(
+      Vhost, Name,
+      fun(Q) ->
+              case lists:member(Node, rabbit_mnesia:cluster_nodes(running)) of
+                  false ->
+                      {error, node_not_running};
+                  true ->
+                      rabbit_stream_coordinator:add_replica(Q, Node)
+              end
+      end).
 
-delete_replica(VHost, Name, Node) ->
-    QName = rabbit_misc:r(VHost, queue, Name),
-    case rabbit_amqqueue:lookup(QName) of
-        {ok, Q} when ?amqqueue_is_classic(Q) ->
-            {error, classic_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_quorum(Q) ->
-            {error, quorum_queue_not_supported};
-        {ok, Q} when ?amqqueue_is_stream(Q) ->
-            case lists:member(Node, rabbit_mnesia:cluster_nodes(running)) of
-                false ->
-                    {error, node_not_running};
-                true ->
-                    #{name := StreamId} = amqqueue:get_type_state(Q),
-                    {ok, Reply, _} = rabbit_stream_coordinator:delete_replica(StreamId, Node),
-                    Reply
-            end;
-        E ->
-            E
-    end.
+delete_replica(Vhost, Name, Node) ->
+    stream_queue(
+      Vhost, Name,
+      fun(Q) ->
+              case lists:member(Node, rabbit_mnesia:cluster_nodes(running)) of
+                  false ->
+                      {error, node_not_running};
+                  true ->
+                      #{name := StreamId} = amqqueue:get_type_state(Q),
+                      {ok, Reply, _} = rabbit_stream_coordinator:delete_replica(StreamId, Node),
+                      Reply
+              end
+      end).
 
 make_stream_conf(Node, Q) ->
     QName = amqqueue:get_name(Q),
