@@ -41,7 +41,7 @@
 
 -export([parse_offset_arg/1]).
 
--export([parse/2,
+-export([parse/4,
          status/2,
          tracking_status/2]).
 
@@ -577,7 +577,7 @@ tracking_status(Vhost, QueueName) ->
                         end, [], Map)
       end).
 
-parse(Vhost, QueueName) ->
+parse(Vhost, QueueName, StartOffset, EndOffset) ->
     stream_queue(
       Vhost, QueueName,
       fun(Q) ->
@@ -587,7 +587,8 @@ parse(Vhost, QueueName) ->
                   true ->
                       {ok, StreamName} = maps:find(name, StreamQueueState),
                       StreamDir = osiris_log:directory(StreamName),
-                      osiris_log:parse(StreamDir);
+                      osiris_log:parse(StreamDir, #{start_offset => StartOffset,
+                                                    end_offset => EndOffset});
                   false ->
                       {error, io_lib:format(
                                 "Node ~s is not part of the replicas for stream ~s: ~p.",

@@ -11,11 +11,41 @@ defmodule RabbitMQ.CLI.Streams.Commands.ParseStreamLogCommand do
 
   def merge_defaults(args, opts), do: {args, Map.merge(%{vhost: "/"}, opts)}
 
-  use RabbitMQ.CLI.Core.AcceptsOnePositionalArgument
+  # use RabbitMQ.CLI.Core.AcceptsOnePositionalArgument
   use RabbitMQ.CLI.Core.RequiresRabbitAppRunning
 
-  def run([name] = _args, %{node: node_name, vhost: vhost}) do
-    case :rabbit_misc.rpc_call(node_name, :rabbit_stream_queue, :parse, [vhost, name]) do
+  def validate(args, _) when length(args) < 3 do
+    {:validation_failure, :not_enough_args}
+  end
+
+  def validate(args, _) when length(args) > 3 do
+    {:validation_failure, :too_many_args}
+  end
+
+  def validate([_, start_offset, end_offset], _) when is_integer(start_offset) and is_integer(end_offset) do
+    :ok
+  end
+
+  def validate([_, start_offset, _], _) do
+    case Integer.parse(start_offset) do
+      {n, _} when n >= 0 -> :ok
+      :error -> {:validation_failure, {:bad_argument, "start_offset must be a non-negative integer"}}
+    end
+  end
+
+  def validate([_, _, end_offset], _) do
+    case Integer.parse(end_offset) do
+      {n, _} when n >= 0 -> :ok
+      :error -> {:validation_failure, {:bad_argument, "end_offset must be a non-negative integer"}}
+    end
+  end
+
+  def validate(_, _, _), do: :ok
+
+  def run([name, start_offset, end_offset] = _args, %{node: node_name, vhost: vhost}) do
+    {start_off, _} = Integer.parse(start_offset)
+    {end_off, _} = Integer.parse(end_offset)
+    case :rabbit_misc.rpc_call(node_name, :rabbit_stream_queue, :parse, [vhost, name, start_off, end_off]) do
       {:error, :classic_queue_not_supported} ->
         {:error, "Cannot parse stream log of a classic queue"}
 
@@ -30,12 +60,14 @@ defmodule RabbitMQ.CLI.Streams.Commands.ParseStreamLogCommand do
   use RabbitMQ.CLI.DefaultOutput
 
   def usage() do
-    "parse_stream_log [--vhost <vhost>] <stream>"
+    "parse_stream_log [--vhost <vhost>] <stream> <start offset> <end offset>"
   end
 
   def usage_additional do
     [
-      ["<stream>", "Name of the stream"]
+      ["<stream>", "Name of the stream"],
+      ["<start offset>", "Offset to start parsing"],
+      ["<end offset>", "Offset to stop parsing"]
     ]
   end
 
@@ -49,6 +81,6 @@ defmodule RabbitMQ.CLI.Streams.Commands.ParseStreamLogCommand do
 
   def description(), do: "Parses the on-disk binary append-only log of a stream"
 
-  def banner([name], %{node: node_name}),
-    do: "Parsing log of stream #{name} on node #{node_name} ..."
+  def banner([name, start_offset, end_offset], %{node: node_name}),
+  do: "Parsing log of stream #{name} from offset #{start_offset} to offset #{end_offset} node #{node_name} ..."
 end
