@@ -207,15 +207,13 @@ apply(Meta,
 
     end;
 apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
-      #?MODULE{consumers = Cons0} = State0) ->
+      #?MODULE{consumers = Cons0} = State) ->
     case Cons0 of
-        #{ConsumerId := Con0} ->
-            Discarded = maps:with(MsgIds, Con0#consumer.checked_out),
-            Effects = dead_letter_effects(rejected, Discarded, State0, []),
-            complete_and_checkout(Meta, MsgIds, ConsumerId, Con0,
-                                  Effects, State0);
+        #{ConsumerId := #consumer{checked_out = Checked0}} ->
+            Discarded = maps:with(MsgIds, Checked0),
+            discard(Meta, ConsumerId, Discarded, [], State);
         _ ->
-            {State0, ok}
+            {State, ok}
     end;
 apply(Meta, #return{msg_ids = MsgIds, consumer_id = ConsumerId},
       #?MODULE{consumers = Cons0} = State) ->
@@ -356,6 +354,7 @@ apply(Meta, #checkout{spec = Spec, meta = ConsumerMeta,
 apply(#{index := Index}, #purge{},
       #?MODULE{messages_total = Tot,
                returns = Returns,
+               discards = Discards,
                messages = Messages,
                ra_indexes = Indexes0} = State0) ->
     Total = messages_ready(State0),
@@ -364,16 +363,22 @@ apply(#{index := Index}, #purge{},
                                (_, Acc) ->
                                    Acc
                            end, Indexes0, lqueue:to_list(Returns)),
+    Indexes2 = lists:foldl(fun (?INDEX_MSG(I, _), Acc0) when is_integer(I) ->
+                                   rabbit_fifo_index:delete(I, Acc0);
+                               (_, Acc) ->
+                                   Acc
+                           end, Indexes1, lqueue:to_list(Discards)),
     Indexes = lists:foldl(fun (?INDEX_MSG(I, _), Acc0) when is_integer(I) ->
                                   rabbit_fifo_index:delete(I, Acc0);
                               (_, Acc) ->
                                   Acc
-                          end, Indexes1, lqueue:to_list(Messages)),
+                          end, Indexes2, lqueue:to_list(Messages)),
 
     State1 = State0#?MODULE{ra_indexes = Indexes,
                             messages = lqueue:new(),
                             messages_total = Tot - Total,
                             returns = lqueue:new(),
+                            discards = lqueue:new(),
                             msg_bytes_enqueue = 0,
                             prefix_msgs = {0, [], 0, []},
                             msg_bytes_in_memory = 0,
@@ -796,8 +801,10 @@ overview(#?MODULE{consumers = Cons,
                   enqueuers = Enqs,
                   release_cursors = Cursors,
                   enqueue_count = EnqCount,
+                  discards = Discards,
                   msg_bytes_enqueue = EnqueueBytes,
                   msg_bytes_checkout = CheckoutBytes,
+                  msg_bytes_discard = DiscardBytes,
                   cfg = Cfg} = State) ->
     Conf = #{name => Cfg#cfg.name,
              resource => Cfg#cfg.resource,
@@ -819,11 +826,13 @@ overview(#?MODULE{consumers = Cons,
       num_enqueuers => maps:size(Enqs),
       num_ready_messages => messages_ready(State),
       num_messages => messages_total(State),
+      num_discarded_messages => lqueue:len(Discards),
       num_release_cursors => lqueue:len(Cursors),
       release_cursors => [{I, messages_total(S)} || {_, I, S} <- lqueue:to_list(Cursors)],
       release_cursor_enqueue_counter => EnqCount,
       enqueue_message_bytes => EnqueueBytes,
       checkout_message_bytes => CheckoutBytes,
+      discard_message_bytes => DiscardBytes,
       smallest_raft_index => Smallest}.
 
 -spec get_checked_out(consumer_id(), msg_id(), msg_id(), state()) ->
@@ -1393,6 +1402,23 @@ maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
             {duplicate, State0, Effects0}
     end.
 
+discard(#{index := IncomingRaftIdx} = Meta, ConsumerId, Discarded,
+       Effects0, State0) ->
+    {State1, Effects} = maps:fold(
+                           fun(MsgId, Msg, {S0, E0}) ->
+                                   discard_one(MsgId, Msg, S0, E0, ConsumerId)
+                           end, {State0, Effects0}, Discarded),
+    State =
+        case State1#?MODULE.consumers of
+            #{ConsumerId := Con0} ->
+                Con = Con0#consumer{credit = increase_credit(Con0,
+                                                             map_size(Discarded))},
+                update_or_remove_sub(Meta, ConsumerId, Con, State1);
+            _ ->
+                State1
+        end,
+    update_smallest_raft_index(IncomingRaftIdx, State, Effects).
+
 return(#{index := IncomingRaftIdx} = Meta, ConsumerId, Returned,
        Effects0, State0) ->
     {State1, Effects1} = maps:fold(
@@ -1573,6 +1599,19 @@ get_header(_Key, Header) when is_integer(Header) ->
     undefined;
 get_header(Key, Header) when is_map(Header) ->
     maps:get(Key, Header, undefined).
+
+discard_one(MsgId, Msg,
+            #?MODULE{discards = Discards,
+                     consumers = Consumers} = State0,
+            Effects0, ConsumerId) ->
+    #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
+    Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
+    State1 = State0#?MODULE{consumers = Consumers#{ConsumerId => Con},
+                            discards = lqueue:in(?TUPLE(rejected, Msg), Discards)},
+    Header = get_msg_header(Msg),
+    State2 = add_bytes_discard(Header, State1),
+    %TODO @ansd: add effect that wakes up (or sends a message to) companion proc to shovel the discarded msg?
+    {State2, Effects0}.
 
 return_one(Meta, MsgId, Msg0,
            #?MODULE{returns = Returns,
@@ -1996,6 +2035,7 @@ dehydrate_state(#?MODULE{messages = Messages,
                          returns = Returns,
                          prefix_msgs = {PRCnt, PrefRet0, PPCnt, PrefMsg0},
                          waiting_consumers = Waiting0} = State) ->
+    %% TODO @ansd: do we need to add Discards here too?
     RCnt = lqueue:len(Returns),
     %% TODO: optimise this function as far as possible
     PrefRet1 = lists:foldr(fun (M, Acc) ->
@@ -2145,6 +2185,13 @@ add_bytes_settle(Header,
                  #?MODULE{msg_bytes_checkout = Checkout} = State) ->
     Size = get_header(size, Header),
     State#?MODULE{msg_bytes_checkout = Checkout - Size}.
+
+add_bytes_discard(Header,
+                  #?MODULE{msg_bytes_checkout = Checkout,
+                           msg_bytes_discard = Discard} = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_checkout = Checkout - Size,
+                  msg_bytes_discard = Discard + Size}.
 
 add_bytes_return(Header,
                  #?MODULE{msg_bytes_checkout = Checkout,
