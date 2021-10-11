@@ -207,18 +207,23 @@ apply(Meta,
 
     end;
 apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
-      #?MODULE{consumers = Cons0} = State) ->
+      #?MODULE{consumers = Cons0} = State0) ->
     case Cons0 of
-        #{ConsumerId := #consumer{checked_out = Checked0}} ->
+        #{ConsumerId := #consumer{checked_out = Checked0,
+                                  %% dead-letter consumers cannot discard messages
+                                  discards = false}} ->
             Discarded = maps:with(MsgIds, Checked0),
-            discard(Meta, ConsumerId, Discarded, [], State);
+            {State, ok, Effects} = discard(Meta, ConsumerId, Discarded, [], State0),
+            checkout(Meta, State0, State, Effects, false);
         _ ->
-            {State, ok}
+            {State0, ok}
     end;
 apply(Meta, #return{msg_ids = MsgIds, consumer_id = ConsumerId},
       #?MODULE{consumers = Cons0} = State) ->
     case Cons0 of
-        #{ConsumerId := #consumer{checked_out = Checked0}} ->
+        #{ConsumerId := #consumer{checked_out = Checked0,
+                                  %% dead-letter consumers cannot return messages
+                                  discards = false}} ->
             Returned = maps:with(MsgIds, Checked0),
             return(Meta, ConsumerId, Returned, [], State);
         _ ->
@@ -306,9 +311,9 @@ apply(#{index := Index,
             {State0, {dequeue, empty}};
         Ready ->
             State1 = update_consumer(ConsumerId, ConsumerMeta,
-                                     {once, 1, simple_prefetch}, 0,
+                                     {once, 1, simple_prefetch}, 0, false,
                                      State0),
-            {success, _, MsgId, Msg, State2} = checkout_one(Meta, State1),
+            {success, _, MsgId, Msg, State2} = checkout_one(Meta, false, State1),
             {State4, Effects1} = case Settlement of
                                      unsettled ->
                                          {_, Pid} = ConsumerId,
@@ -349,7 +354,8 @@ apply(Meta, #checkout{spec = Spec, meta = ConsumerMeta,
                       consumer_id = {_, Pid} = ConsumerId},
       State0) ->
     Priority = get_priority_from_args(ConsumerMeta),
-    State1 = update_consumer(ConsumerId, ConsumerMeta, Spec, Priority, State0),
+    IsDiscardsConsumer = is_discards_consumer_from_args(ConsumerMeta),
+    State1 = update_consumer(ConsumerId, ConsumerMeta, Spec, Priority, IsDiscardsConsumer, State0),
     checkout(Meta, State0, State1, [{monitor, process, Pid}]);
 apply(#{index := Index}, #purge{},
       #?MODULE{messages_total = Tot,
@@ -805,6 +811,7 @@ overview(#?MODULE{consumers = Cons,
                   msg_bytes_enqueue = EnqueueBytes,
                   msg_bytes_checkout = CheckoutBytes,
                   msg_bytes_discard = DiscardBytes,
+                  msg_bytes_discard_checkout = DiscardCheckoutBytes,
                   cfg = Cfg} = State) ->
     Conf = #{name => Cfg#cfg.name,
              resource => Cfg#cfg.resource,
@@ -833,6 +840,7 @@ overview(#?MODULE{consumers = Cons,
       enqueue_message_bytes => EnqueueBytes,
       checkout_message_bytes => CheckoutBytes,
       discard_message_bytes => DiscardBytes,
+      discard_checkout_message_bytes => DiscardCheckoutBytes,
       smallest_raft_index => Smallest}.
 
 -spec get_checked_out(consumer_id(), msg_id(), msg_id(), state()) ->
@@ -1145,6 +1153,7 @@ num_checked_out(#?MODULE{consumers = Cons}) ->
                       maps:size(C) + Acc
               end, 0, Cons).
 
+%%TODO @ansd cancel discards consumer
 cancel_consumer(Meta, ConsumerId,
                 #?MODULE{cfg = #cfg{consumer_strategy = competing}} = State,
                 Effects, Reason) ->
@@ -1191,6 +1200,7 @@ consumer_update_active_effects(#?MODULE{cfg = #cfg{resource = QName}},
 cancel_consumer0(Meta, ConsumerId,
                  #?MODULE{consumers = C0} = S0, Effects0, Reason) ->
     case C0 of
+        %%TODO @ansd pattern match against #consumer.discards and handle cancelling of discard consumers
         #{ConsumerId := Consumer} ->
             {S, Effects2} = maybe_return_all(Meta, ConsumerId, Consumer,
                                              S0, Effects0, Reason),
@@ -1413,7 +1423,7 @@ discard(#{index := IncomingRaftIdx} = Meta, ConsumerId, Discarded,
             #{ConsumerId := Con0} ->
                 Con = Con0#consumer{credit = increase_credit(Con0,
                                                              map_size(Discarded))},
-                update_or_remove_sub(Meta, ConsumerId, Con, State1);
+                update_or_remove_sub(Meta, ConsumerId, Con, false, State1);
             _ ->
                 State1
         end,
@@ -1430,7 +1440,7 @@ return(#{index := IncomingRaftIdx} = Meta, ConsumerId, Returned,
             #{ConsumerId := Con0} ->
                 Con = Con0#consumer{credit = increase_credit(Con0,
                                                              map_size(Returned))},
-                update_or_remove_sub(Meta, ConsumerId, Con, State1);
+                update_or_remove_sub(Meta, ConsumerId, Con, false, State1);
             _ ->
                 State1
         end,
@@ -1439,7 +1449,8 @@ return(#{index := IncomingRaftIdx} = Meta, ConsumerId, Returned,
 
 % used to processes messages that are finished
 complete(Meta, ConsumerId, DiscardedMsgIds,
-         #consumer{checked_out = Checked} = Con0, Effects,
+         #consumer{checked_out = Checked,
+                  discards = IsDiscardsConsumer} = Con0, Effects,
          #?MODULE{messages_total = Tot,
                   ra_indexes = Indexes0} = State0) ->
     %% credit_mode = simple_prefetch should automatically top-up credit
@@ -1447,7 +1458,7 @@ complete(Meta, ConsumerId, DiscardedMsgIds,
     Discarded = maps:with(DiscardedMsgIds, Checked),
     Con = Con0#consumer{checked_out = maps:without(DiscardedMsgIds, Checked),
                         credit = increase_credit(Con0, map_size(Discarded))},
-    State1 = update_or_remove_sub(Meta, ConsumerId, Con, State0),
+    State1 = update_or_remove_sub(Meta, ConsumerId, Con, IsDiscardsConsumer, State0),
     %% TODO: optimise by passing a list to rabbit_fifo_index
     Indexes = maps:fold(fun (_, ?INDEX_MSG(I, _), Acc0) when is_integer(I) ->
                                 rabbit_fifo_index:delete(I, Acc0);
@@ -1606,8 +1617,10 @@ discard_one(MsgId, Msg,
             Effects0, ConsumerId) ->
     #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
     Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
+    %%TODO @ansd, write correct dead letter headers including reason before putting msg into discard queue
+    %% see module rabbit_dead_letter
     State1 = State0#?MODULE{consumers = Consumers#{ConsumerId => Con},
-                            discards = lqueue:in(?TUPLE(rejected, Msg), Discards)},
+                            discards = lqueue:in(Msg, Discards)},
     Header = get_msg_header(Msg),
     State2 = add_bytes_discard(Header, State1),
     %TODO @ansd: add effect that wakes up (or sends a message to) companion proc to shovel the discarded msg?
@@ -1841,6 +1854,14 @@ take_next_msg(#?MODULE{returns = Returns0,
             end
     end.
 
+take_next_discard_msg(#?MODULE{discards = Discards0} = State) ->
+    case lqueue:out(Discards0) of
+        {empty, _} ->
+            empty;
+        {{value, IndexMsg}, Discards} ->
+            {IndexMsg, State#?MODULE{discards = Discards}}
+    end.
+
 delivery_effect({CTag, CPid}, [], InMemMsgs) ->
     {send_msg, CPid, {delivery, CTag, lists:reverse(InMemMsgs)},
      [local, ra_event]};
@@ -1868,13 +1889,28 @@ reply_log_effect(RaftIdx, MsgId, Header, Ready, From) ->
                              {dequeue, {MsgId, {Header, Msg}}, Ready}}}]
      end}.
 
-checkout_one(Meta, #?MODULE{service_queue = SQ0,
-                            messages = Messages0,
-                            consumers = Cons0} = InitState) ->
-    case priority_queue:out(SQ0) of
-        {{value, ConsumerId}, SQ1}
+%% check out discarded messages to dedicated discard consumers
+%% before checking out regular messages to regular consumers
+checkout_one(Meta, InitState) ->
+    case checkout_one(Meta, true, InitState) of
+        {success, _, _, _, _} = Success ->
+            Success;
+        _ ->
+            checkout_one(Meta, false, InitState)
+    end.
+
+checkout_one(Meta, Discards, #?MODULE{consumers = Cons0} = InitState) ->
+    ElemServiceQueue = elem_service_queue(Discards),
+    case priority_queue:out(element(ElemServiceQueue, InitState)) of
+        {{value, ConsumerId}, SQ}
           when is_map_key(ConsumerId, Cons0) ->
-            case take_next_msg(InitState) of
+            {TakeNextMsg, AddBytes} = case Discards of
+                                          true ->
+                                              {fun take_next_discard_msg/1, fun add_bytes_discard_checkout/2};
+                                          false ->
+                                              {fun take_next_msg/1, fun add_bytes_checkout/2}
+                                      end,
+            case TakeNextMsg(InitState) of
                 {ConsumerMsg, State0} ->
                     %% there are consumers waiting to be serviced
                     %% process consumer checkout
@@ -1883,11 +1919,11 @@ checkout_one(Meta, #?MODULE{service_queue = SQ0,
                             %% no credit but was still on queue
                             %% can happen when draining
                             %% recurse without consumer on queue
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+                            checkout_one(Meta, Discards, setelement(ElemServiceQueue, InitState, SQ));
                         #consumer{status = cancelled} ->
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+                            checkout_one(Meta, Discards, setelement(ElemServiceQueue, InitState, SQ));
                         #consumer{status = suspected_down} ->
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+                            checkout_one(Meta, Discards, setelement(ElemServiceQueue, InitState, SQ));
                         #consumer{checked_out = Checked0,
                                   next_msg_id = Next,
                                   credit = Credit,
@@ -1898,47 +1934,60 @@ checkout_one(Meta, #?MODULE{service_queue = SQ0,
                                                 credit = Credit - 1,
                                                 delivery_count = DelCnt + 1},
                             State1 = update_or_remove_sub(
-                                       Meta, ConsumerId, Con,
-                                       State0#?MODULE{service_queue = SQ1}),
+                                       Meta, ConsumerId, Con, Discards,
+                                       setelement(ElemServiceQueue, State0, SQ)),
                             Header = get_msg_header(ConsumerMsg),
                             State = case is_disk_msg(ConsumerMsg) of
                                         true ->
-                                            add_bytes_checkout(Header, State1);
+                                            AddBytes(Header, State1);
                                         false ->
                                             subtract_in_memory_counts(
-                                              Header, add_bytes_checkout(Header, State1))
+                                              Header, AddBytes(Header, State1))
                                     end,
                             {success, ConsumerId, Next, ConsumerMsg, State};
                         error ->
                             %% consumer did not exist but was queued, recurse
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1})
+                            checkout_one(Meta, Discards, setelement(ElemServiceQueue, InitState, SQ))
                     end;
                 empty ->
                     {nochange, InitState}
             end;
-        {{value, _ConsumerId}, SQ1} ->
+        {{value, _ConsumerId}, SQ} ->
             %% consumer did not exist but was queued, recurse
-            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+            checkout_one(Meta, Discards, setelement(ElemServiceQueue, InitState, SQ));
         {empty, _} ->
-            case lqueue:len(Messages0) of
+            case lqueue:len(element(elem_messages(Discards), InitState)) of
                 0 -> {nochange, InitState};
                 _ -> {inactive, InitState}
             end
     end.
 
+elem_service_queue(_Discards = false) ->
+    #?MODULE.service_queue;
+elem_service_queue(_Discards = true) ->
+    #?MODULE.discards_service_queue.
+
+elem_messages(_Discards = false) ->
+    #?MODULE.messages;
+elem_messages(_Discards = true) ->
+    #?MODULE.discards.
+
+%%TODO @ansd remove this function
+update_or_remove_sub(Meta, ConsumerId, Con, State) ->
+    update_or_remove_sub(Meta, ConsumerId, Con, false, State).
+
 update_or_remove_sub(_Meta, ConsumerId, #consumer{lifetime = auto,
                                                   credit = 0} = Con,
-                     #?MODULE{consumers = Cons} = State) ->
+                     _Discards, #?MODULE{consumers = Cons} = State) ->
     State#?MODULE{consumers = maps:put(ConsumerId, Con, Cons)};
 update_or_remove_sub(_Meta, ConsumerId, #consumer{lifetime = auto} = Con,
-                     #?MODULE{consumers = Cons,
-                              service_queue = ServiceQueue} = State) ->
-    State#?MODULE{consumers = maps:put(ConsumerId, Con, Cons),
-                  service_queue = uniq_queue_in(ConsumerId, Con, ServiceQueue)};
+                     Discards, #?MODULE{consumers = Cons} = State) ->
+    queueConsumer(ConsumerId, Con, Cons, Discards, State);
 update_or_remove_sub(#{system_time := Ts},
                      ConsumerId, #consumer{lifetime = once,
                                            checked_out = Checked,
                                            credit = 0} = Con,
+                     _Discards,
                      #?MODULE{consumers = Cons} = State) ->
     case maps:size(Checked) of
         0 ->
@@ -1950,10 +1999,15 @@ update_or_remove_sub(#{system_time := Ts},
             State#?MODULE{consumers = maps:put(ConsumerId, Con, Cons)}
     end;
 update_or_remove_sub(_Meta, ConsumerId, #consumer{lifetime = once} = Con,
-                     #?MODULE{consumers = Cons,
-                              service_queue = ServiceQueue} = State) ->
-    State#?MODULE{consumers = maps:put(ConsumerId, Con, Cons),
-                  service_queue = uniq_queue_in(ConsumerId, Con, ServiceQueue)}.
+                     Discards, #?MODULE{consumers = Cons} = State) ->
+    queueConsumer(ConsumerId, Con, Cons, Discards, State).
+
+queueConsumer(ConsumerId, Con, Cons, Discards, State0) ->
+    State = State0#?MODULE{consumers = maps:put(ConsumerId, Con, Cons)},
+    ElemServiceQueue = elem_service_queue(Discards),
+    ServiceQueue0 = element(ElemServiceQueue, State),
+    ServiceQueue = uniq_queue_in(ConsumerId, Con, ServiceQueue0),
+    setelement(ElemServiceQueue, State, ServiceQueue).
 
 uniq_queue_in(Key, #consumer{priority = P}, Queue) ->
     % TODO: queue:member could surely be quite expensive, however the practical
@@ -1965,19 +2019,22 @@ uniq_queue_in(Key, #consumer{priority = P}, Queue) ->
             priority_queue:in(Key, P, Queue)
     end.
 
-update_consumer(ConsumerId, Meta, Spec, Priority,
+update_consumer(ConsumerId, Meta, Spec, Priority, IsDiscardsConsumer,
                 #?MODULE{cfg = #cfg{consumer_strategy = competing}} = State0) ->
     %% general case, single active consumer off
-    update_consumer0(ConsumerId, Meta, Spec, Priority, State0);
-update_consumer(ConsumerId, Meta, Spec, Priority,
+    update_consumer0(ConsumerId, Meta, Spec, Priority, IsDiscardsConsumer, State0);
+update_consumer(ConsumerId, Meta, Spec, Priority, IsDiscardsConsumer,
                 #?MODULE{consumers = Cons0,
                          cfg = #cfg{consumer_strategy = single_active}} = State0)
   when map_size(Cons0) == 0 orelse
-       is_map_key(ConsumerId, Cons0) ->
+       is_map_key(ConsumerId, Cons0) orelse
+       IsDiscardsConsumer ->
     %% single active consumer on, no one is consuming yet or
-    %% the currently active consumer is the same
-    update_consumer0(ConsumerId, Meta, Spec, Priority, State0);
-update_consumer(ConsumerId, Meta, {Life, Credit, Mode}, Priority,
+    %% the currently active consumer is the same or
+    %% discards consumer (added alongside single active consumer; use case:
+    %% reliable dead-lettering for single-active consumer queues)
+    update_consumer0(ConsumerId, Meta, Spec, Priority, IsDiscardsConsumer, State0);
+update_consumer(ConsumerId, Meta, {Life, Credit, Mode}, Priority, false,
                 #?MODULE{cfg = #cfg{consumer_strategy = single_active},
                          waiting_consumers = WaitingConsumers0} = State0) ->
     %% single active consumer on and one active consumer already
@@ -1988,12 +2045,13 @@ update_consumer(ConsumerId, Meta, {Life, Credit, Mode}, Priority,
     WaitingConsumers1 = WaitingConsumers0 ++ [{ConsumerId, Consumer}],
     State0#?MODULE{waiting_consumers = WaitingConsumers1}.
 
-update_consumer0(ConsumerId, Meta, {Life, Credit, Mode}, Priority,
+update_consumer0(ConsumerId, Meta, {Life, Credit, Mode}, Priority, IsDiscardsConsumer,
                  #?MODULE{consumers = Cons0,
-                          service_queue = ServiceQueue0} = State0) ->
+                          service_queue = ServiceQueue0,
+                          discards_service_queue = DisServiceQueue0} = State0) ->
     %% TODO: this logic may not be correct for updating a pre-existing consumer
     Init = #consumer{lifetime = Life, meta = Meta,
-                     priority = Priority,
+                     priority = Priority, discards = IsDiscardsConsumer,
                      credit = Credit, credit_mode = Mode},
     Cons = maps:update_with(ConsumerId,
                             fun(S) ->
@@ -2003,9 +2061,16 @@ update_consumer0(ConsumerId, Meta, {Life, Credit, Mode}, Priority,
                                 C = max(0, Credit - N),
                                 S#consumer{lifetime = Life, credit = C}
                             end, Init, Cons0),
-    ServiceQueue = maybe_queue_consumer(ConsumerId, maps:get(ConsumerId, Cons),
-                                        ServiceQueue0),
-    State0#?MODULE{consumers = Cons, service_queue = ServiceQueue}.
+    case IsDiscardsConsumer of
+        true ->
+            DisServiceQueue = maybe_queue_consumer(ConsumerId, maps:get(ConsumerId, Cons),
+                                                 DisServiceQueue0),
+            State0#?MODULE{consumers = Cons, discards_service_queue = DisServiceQueue};
+        false ->
+            ServiceQueue = maybe_queue_consumer(ConsumerId, maps:get(ConsumerId, Cons),
+                                                ServiceQueue0),
+            State0#?MODULE{consumers = Cons, service_queue = ServiceQueue}
+    end.
 
 maybe_queue_consumer(ConsumerId, #consumer{credit = Credit} = Con,
                      ServiceQueue0) ->
@@ -2193,6 +2258,14 @@ add_bytes_discard(Header,
     State#?MODULE{msg_bytes_checkout = Checkout - Size,
                   msg_bytes_discard = Discard + Size}.
 
+add_bytes_discard_checkout(Header,
+                           #?MODULE{msg_bytes_discard = Discard,
+                                    msg_bytes_discard_checkout = DiscardCheckout
+                                   } = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_discard = Discard - Size,
+                  msg_bytes_discard_checkout = DiscardCheckout + Size}.
+
 add_bytes_return(Header,
                  #?MODULE{msg_bytes_checkout = Checkout,
                           msg_bytes_enqueue = Enqueue} = State) ->
@@ -2304,6 +2377,15 @@ get_priority_from_args(#{args := Args}) ->
     end;
 get_priority_from_args(_) ->
     0.
+
+is_discards_consumer_from_args(#{args := Args}) ->
+    case rabbit_misc:table_lookup(Args, <<"x-internal-queue">>) of
+        {_Key, <<"discards">>} ->
+            true;
+        _ -> false
+    end;
+is_discards_consumer_from_args(_) ->
+    false.
 
 maybe_notify_decorators(_, false) ->
     false;

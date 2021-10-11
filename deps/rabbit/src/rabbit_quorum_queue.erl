@@ -309,6 +309,8 @@ become_leader(QName, Name) ->
                           ok
                   end
           end).
+%%TODO @ansd: here leader should spawn and monitor dead letter companion process;
+%% when not leader anymore rabbit_fifo:state_enter -> end that companion proc
 
 -spec all_replica_states() -> {node(), #{atom() => atom()}}.
 all_replica_states() ->
@@ -390,7 +392,10 @@ capabilities() ->
                           <<"x-max-in-memory-bytes">>, <<"x-overflow">>,
                           <<"x-single-active-consumer">>, <<"x-queue-type">>,
                           <<"x-quorum-initial-group-size">>, <<"x-delivery-limit">>],
-      consumer_arguments => [<<"x-priority">>, <<"x-credit">>],
+      consumer_arguments => [<<"x-priority">>, <<"x-credit">>,
+                             %% if value <<"discards">> consumer will get delivered only discarded messages
+                             %% that need to be dead-lettered
+                             <<"x-internal-queue">>],
       server_named => false}.
 
 rpc_delete_metrics(QName) ->
