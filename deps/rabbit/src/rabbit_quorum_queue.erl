@@ -307,6 +307,13 @@ become_leader(QName, Name) ->
                            || Node <- Nodes, Node =/= node()];
                       _ ->
                           ok
+                  end,
+                  case gen_server:call(rabbit_dead_letter_forwarder, {consume, QName}, 60_000) of
+                      ok ->
+                          ok;
+                      Reply ->
+                          rabbit_log:error("failed to register ~s with dead-letter forwarder. Reason: ~p",
+                                           [rabbit_misc:rs(QName), Reply])
                   end
           end).
 %%TODO @ansd: here leader should spawn and monitor dead letter companion process;
