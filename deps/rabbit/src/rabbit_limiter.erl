@@ -131,12 +131,14 @@
 -record(lstate, {pid, prefetch_limited}).
 -record(qstate, {pid, state, credits}).
 
--type lstate() :: #lstate{pid              :: pid(),
+-opaque lstate() :: #lstate{pid              :: pid(),
                           prefetch_limited :: boolean()}.
 -type qstate() :: #qstate{pid :: pid(),
                           state :: 'dormant' | 'active' | 'suspended'}.
 
 -type credit_mode() :: 'manual' | 'drain' | 'auto'.
+
+-export_type([lstate/0]).
 
 %%----------------------------------------------------------------------------
 

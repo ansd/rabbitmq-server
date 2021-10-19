@@ -1628,8 +1628,8 @@ credit(Q, CTag, Credit, Drain, QStates) ->
           {'ok', non_neg_integer(), qmsg(), rabbit_queue_type:state()} |
           {'empty', rabbit_queue_type:state()} |
           {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
-basic_get(Q, NoAck, LimiterPid, CTag, QStates0) ->
-    rabbit_queue_type:dequeue(Q, NoAck, LimiterPid, CTag, QStates0).
+basic_get(Q, NoAck, LimiterPid, CTag, QStates) ->
+    rabbit_queue_type:dequeue(Q, NoAck, LimiterPid, CTag, QStates).
 
 
 -spec basic_consume(amqqueue:amqqueue(), boolean(), pid(), pid(), boolean(),
@@ -1641,7 +1641,7 @@ basic_get(Q, NoAck, LimiterPid, CTag, QStates0) ->
     {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
 basic_consume(Q, NoAck, ChPid, LimiterPid,
               LimiterActive, ConsumerPrefetchCount, ConsumerTag,
-              ExclusiveConsume, Args, OkMsg, ActingUser, Contexts) ->
+              ExclusiveConsume, Args, OkMsg, ActingUser, QStates) ->
 
     QName = amqqueue:get_name(Q),
     %% first phase argument validation
@@ -1657,7 +1657,7 @@ basic_consume(Q, NoAck, ChPid, LimiterPid,
              args => Args,
              ok_msg => OkMsg,
              acting_user =>  ActingUser},
-    rabbit_queue_type:consume(Q, Spec, Contexts).
+    rabbit_queue_type:consume(Q, Spec, QStates).
 
 -spec basic_cancel(amqqueue:amqqueue(), rabbit_types:ctag(), any(),
                    rabbit_types:username(),
