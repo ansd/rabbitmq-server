@@ -309,9 +309,9 @@ become_leader(QName, Name) ->
                           ok
                   end,
                   %%TODO Spawn leader companion process directly in Ra.
-                  %%TODO Supervise rabbit_safe_dead_letter and its limiter (see rabbit_channel_sup for inspiration).
-                  {ok, Pid} = rabbit_safe_dead_letter:start_link(QName),
-                  rabbit_log:debug("Started rabbit_safe_dead_letter process ~p", [Pid])
+                  %%TODO Supervise rabbit_fifo_dlx_worker (see rabbit_channel_sup for inspiration).
+                  {ok, Pid} = rabbit_fifo_dlx_worker:start_link(QName),
+                  rabbit_log:debug("Started rabbit_fifo_dlx_worker process ~p", [Pid])
           end).
 
 -spec all_replica_states() -> {node(), #{atom() => atom()}}.
