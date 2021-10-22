@@ -11,17 +11,22 @@
 %%TODO make configurable or leave at 0 which means 2000 as in
 %% https://github.com/rabbitmq/rabbitmq-server/blob/1e7df8c436174735b1d167673afd3f1642da5cdc/deps/rabbit/src/rabbit_quorum_queue.erl#L726-L729
 -define(CONSUMER_PREFETCH_COUNT, 10).
+-define(HIBERNATE_AFTER, 180_000).
+%% If no publisher confirm was received for at least SETTLE_TIMEOUT, message will be redelivered.
+%% To prevent duplicates in the target queue and to ensure message will eventually be acked to the source queue,
+%% set this value higher than the maximum time it takes for a queue to settle a message.
+-define(SETTLE_TIMEOUT, 120_000).
 
 -record(pending, {
           consumed_msg_id :: non_neg_integer(),
-          delivery :: rabbit_types:delivery(),
+          content :: rabbit_types:decoded_content(),
+          %% target queues for which publisher confirm has not been received yet
           unsettled :: [rabbit_amqqueue:name()],
-          settled = [] :: [rabbit_amqqueue:name()],
+          %% target queues for which publisher confirm was received
+          settled :: [rabbit_amqqueue:name()],
           %% number of times the message was (tried to be) published
-          %% to target dead-letter queues that haven't confirmed yet
-          count = 1 :: non_neg_integer(),
+          count :: non_neg_integer(),
           %% epoch time in milliseconds when the message was last (tried to be) published
-          %% to target dead-letter queues that haven't confirmed yet
           last_publish :: integer()
          }).
 
@@ -32,18 +37,23 @@
           consumer_queue_ref :: rabbit_amqqueue:name(),
           consumer_tag :: rabbit_types:ctag(),
           queue_type_state :: rabbit_queue_type:state(),
-          %% Consumed messages for which we haven't received a publisher confirms yet.
-          %% Therefore, they also haven't been ACKed yet back to the source discards queue.
+          %% Consumed messages for which we have not received all publisher confirms yet.
+          %% Therefore, they have not been ACKed yet to the consumer queue.
           %% This buffer contains at most CONSUMER_PREFETCH_COUNT pending messages at any given point in time.
           pendings = #{} :: #{OutSeq :: non_neg_integer() => #pending{}},
           %% next publisher confirm delivery tag sequence number
-          next_out_seq = 1
+          next_out_seq = 1,
+          %% Timer firing every SETTLE_TIMEOUT milliseconds
+          %% redelivering messages for which not all publisher confirms were received.
+          %% If there are no pending messages, this timer will eventually be cancelled to allow
+          %% this worker to hibernate.
+          timer = inactive :: reference() | inactive
          }).
 
 -type state() :: #state{}.
 
 start_link(QRef) ->
-    gen_server:start_link(?MODULE, QRef, [{hibernate_after, 60_000}]).
+    gen_server:start_link(?MODULE, QRef, [{hibernate_after, ?HIBERNATE_AFTER}]).
 
 -spec init(rabbit_amqqueue:name()) -> {ok, state()}.
 init(QRef) ->
@@ -97,6 +107,14 @@ handle_cast(Request, State) ->
     rabbit_log:warning("~s received unhandled cast ~p", [?MODULE, Request]),
     {noreply, State}.
 
+handle_info(settle_timeout, State0) ->
+    State1 = State0#state{timer = inactive},
+    State2 = redeliver_timed_out_messsages(State1),
+    %% Routes could have been changed dynamically.
+    %% If a publisher confirm timed out for a target queue to which we now don't route anymore, ack the message.
+    State3 = maybe_ack(State2),
+    State4 = maybe_set_timer(State3),
+    {noreply, State4};
 handle_info(Info, State) ->
     rabbit_log:warning("~s received unhandled info ~p", [?MODULE, Info]),
     {noreply, State}.
@@ -104,15 +122,16 @@ handle_info(Info, State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-
 %% https://github.com/rabbitmq/rabbitmq-server/blob/9cf18e83f279408e20430b55428a2b19156c90d7/deps/rabbit/src/rabbit_channel.erl#L2855-L2888
 handle_queue_actions(Actions, State0) ->
     lists:foldl(
       fun ({deliver, CTag, AckRequired, Msgs}, S0) ->
-              handle_deliver(CTag, AckRequired, Msgs, S0);
+              S1 = handle_deliver(CTag, AckRequired, Msgs, S0),
+              maybe_set_timer(S1);
           ({settled, QRef, MsgSeqs}, S0) ->
               S1 = handle_settled(QRef, MsgSeqs, S0),
-              maybe_ack(S1);
+              S2 = maybe_ack(S1),
+              maybe_cancel_timer(S2);
           ({rejected, _QRef, _MsgSeqNos}, S0) ->
               rabbit_log:error("queue action rejected not yet implemented", []),
               S0
@@ -120,50 +139,63 @@ handle_queue_actions(Actions, State0) ->
 
 handle_deliver(CTag, _AckRequired = true, Msgs,
                #state{consumer_tag = CTag,
-                      consumer_queue_ref = {resource, Vhost, queue, _} = QRef
+                      consumer_queue_ref = QRef
                      } = State) when is_list(Msgs) ->
-    %% Lookup policies and routes on every deliver because they can change dynamically.
+    {DLXRef, DLX, DLRKey} = lookup_dlx(QRef),
+    lists:foldl(fun({_QName, _QPid, MsgId, _Redelivered, #basic_message{content = Content}}, S) ->
+                        deliver(Content, DLXRef, DLX, DLRKey, MsgId, 0, [], S)
+                end, State, Msgs).
+
+deliver(Content, DLXRef, DLX, DLRKey, ConsumedMsgId, Count, Settled,
+        #state{next_out_seq = OutSeq,
+               pendings = Pendings} = State0) ->
+    {ok, BasicMsg} = rabbit_basic:message(DLXRef, DLRKey, Content),
+    Delivery = rabbit_basic:delivery(true, true, BasicMsg, OutSeq),
+    QNames = rabbit_exchange:route(DLX, Delivery),
+    %% When this is a re-deliver, we won't send to queues for which we already received a publisher confirm.
+    RouteToQNames = QNames -- Settled,
+    Pend = #pending{
+              consumed_msg_id = ConsumedMsgId,
+              content = Content,
+              unsettled = RouteToQNames,
+              settled = Settled,
+              count = Count + 1,
+              last_publish = os:system_time(millisecond)
+             },
+    State1 = State0#state{next_out_seq = OutSeq + 1,
+                          pendings = maps:put(OutSeq, Pend, Pendings)},
+    case RouteToQNames of
+        [] when Settled =:= []->
+            rabbit_log:warning("Cannot deliver message with sequence number ~b "
+                               "(for consumed message sequence number ~b) "
+                               "because no queue is bound to dead-letter ~s with routing key '~s'.",
+                               [OutSeq, ConsumedMsgId, rabbit_misc:rs(DLXRef), DLRKey]),
+            State1;
+        [] ->
+            %% Original delivery timed out on publisher confirm.
+            %% However, route changed dynamically so that we don't need to route to any queues anymore.
+            %% This message will be acked later on.
+            State1;
+        _ ->
+            %% This is the normal case. We (re)deliver message to target queues.
+            deliver_to_queues(Delivery, RouteToQNames, State1)
+    end.
+
+deliver_to_queues(Delivery, RouteToQNames, #state{queue_type_state = QTypeState0} = State0) ->
+    Qs = rabbit_amqqueue:lookup(RouteToQNames),
+    {ok, QTypeState1, Actions} = rabbit_queue_type:deliver(Qs, Delivery, QTypeState0),
+    State = State0#state{queue_type_state = QTypeState1},
+    % rabbit_global_counters:messages_routed(amqp091, length(Qs)),
+    handle_queue_actions(Actions, State).
+
+%% Lookup policies and routes before delivering because they can change dynamically.
+lookup_dlx({resource, Vhost, queue, _} = QRef) ->
     {ok, Q} = rabbit_amqqueue:lookup(QRef),
     DLRKey = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-routing-key">>, fun res_arg/2, Q),
     DLXName = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-exchange">>, fun res_arg/2, Q),
     DLXRef = rabbit_misc:r(Vhost, exchange, DLXName),
     DLX = rabbit_exchange:lookup_or_die(DLXRef),
-    lists:foldl(fun(Msg, S) ->
-                        handle_deliver0(Msg, DLXRef, DLX, DLRKey, S)
-                end, State, Msgs).
-
-handle_deliver0({_QName, _QPid, MsgId, _Redelivered, #basic_message{content = Content}},
-                DLXRef, DLX, DLRKey,
-                State0 = #state{next_out_seq = OutSeq,
-                                pendings = Pendings}) ->
-    {ok, BasicMsg} = rabbit_basic:message(DLXRef, DLRKey, Content),
-    Delivery = rabbit_basic:delivery(true, true, BasicMsg, OutSeq),
-    QNames = rabbit_exchange:route(DLX, Delivery),
-    Pend = #pending{
-              consumed_msg_id = MsgId,
-              delivery = Delivery,
-              unsettled = QNames,
-              last_publish = os:system_time(millisecond)
-             },
-    State1 = State0#state{next_out_seq = OutSeq + 1,
-                          pendings = maps:put(OutSeq, Pend, Pendings)},
-    deliver_to_queues({Delivery, QNames}, State1).
-
-deliver_to_queues({Delivery = #delivery{message = #basic_message{exchange_name = XName,
-                                                                 routing_keys = RKeys}},
-                   RoutedToQueueNames}, State0 = #state{queue_type_state = QTypeState0}) ->
-    Qs =  rabbit_amqqueue:lookup(RoutedToQueueNames),
-    {ok, QTypeState1, Actions} = rabbit_queue_type:deliver(Qs, Delivery, QTypeState0),
-    State1 = State0#state{queue_type_state = QTypeState1},
-    % rabbit_global_counters:messages_routed(amqp091, length(Qs)),
-    case Qs of
-        [] ->
-            rabbit_log:warning("No queue bound to dead-letter exchange ~p with routing keys ~p.",
-                               [XName, RKeys]),
-            State1;
-        _ ->
-            handle_queue_actions(Actions, State1)
-    end.
+    {DLXRef, DLX, DLRKey}.
 
 handle_settled(QRef, MsgSeqs, #state{pendings = Pendings0} = State0) ->
     Pendings1 = lists:foldl(fun (MsgSeq, P0) ->
@@ -172,11 +204,18 @@ handle_settled(QRef, MsgSeqs, #state{pendings = Pendings0} = State0) ->
     State0#state{pendings = Pendings1}.
 
 handle_settled0(QRef, MsgSeq, Pendings) ->
-    #pending{unsettled = Unset0, settled = Set0} = Pend0 = maps:get(MsgSeq, Pendings),
-    Unset1 = lists:delete(QRef, Unset0),
-    Set1 = [QRef | Set0],
-    Pend1 = Pend0#pending{unsettled = Unset1, settled = Set1},
-    maps:update(MsgSeq, Pend1, Pendings).
+    case maps:find(MsgSeq, Pendings) of
+        {ok, #pending{unsettled = Unset0, settled = Set0} = Pend0} ->
+            Unset1 = lists:delete(QRef, Unset0),
+            Set1 = [QRef | Set0],
+            Pend1 = Pend0#pending{unsettled = Unset1, settled = Set1},
+            maps:update(MsgSeq, Pend1, Pendings);
+        error ->
+            rabbit_log:warning("Ignoring publisher confirm for sequence number ~b "
+                               "from target dead letter ~s after settle timeout of ~bms. "
+                               "Troubleshoot why that queue confirms so slowly.",
+                               [MsgSeq, rabbit_misc:rs(QRef), ?SETTLE_TIMEOUT])
+    end.
 
 maybe_ack(#state{consumer_queue_ref = QRef,
                  consumer_tag = CTag,
@@ -190,18 +229,95 @@ maybe_ack(#state{consumer_queue_ref = QRef,
                              (_, _) ->
                                   false
                           end, Pendings0),
-    %%TODO The order doesn't matter, does it?
-    SettledOutSeqs = maps:keys(Settled),
-    {ok, QTypeState1, Actions} = rabbit_queue_type:settle(QRef, complete, CTag,
-                                                          SettledOutSeqs, QTypeState0),
-    %%TODO Before deleting settled messages from our state,
-    %% we don't have to wait until the quorum queue applied the ack, do we?
-    Pendings1 = maps:without(SettledOutSeqs, Pendings0),
-    State1 = State0#state{queue_type_state = QTypeState1,
-                          pendings = Pendings1},
-    handle_queue_actions(Actions, State1).
+    case maps:size(Settled) of
+        0 ->
+            %% nothing to ack
+            State0;
+        _ ->
+            SettledOutSeqs = maps:keys(Settled),
+            {ok, QTypeState1, Actions} = rabbit_queue_type:settle(QRef, complete, CTag,
+                                                                  SettledOutSeqs, QTypeState0),
+            Pendings1 = maps:without(SettledOutSeqs, Pendings0),
+            State1 = State0#state{queue_type_state = QTypeState1,
+                                  pendings = Pendings1},
+            handle_queue_actions(Actions, State1)
+    end.
+
+redeliver_timed_out_messsages(#state{pendings = Pendings,
+                                     consumer_queue_ref = SourceQRef} = State) ->
+    Now = os:system_time(millisecond),
+    {DLXRef, DLX, DLRKey} = lookup_dlx(SourceQRef),
+    maps:fold(fun(OutSeq, #pending{consumed_msg_id = CMsgId,
+                                   last_publish = LastPub,
+                                   count = Count,
+                                   content = Content,
+                                   unsettled = Unsettled,
+                                   settled = Settled}, S0) when LastPub + ?SETTLE_TIMEOUT < Now ->
+                      %% Publisher confirm timed out.
+                      %%
+                      %% Quorum queues maintain their own Raft sequene number mapping to the message sequence number (= Raft correlation ID).
+                      %% So, they would just send us a 'settled' queue action containing the correct message sequence number.
+                      %%
+                      %% Classic queues however maintain their state by mapping the message sequence number to pending and confirmed queues.
+                      %% While re-using the same message sequence number could work there as well, it just gets unnecssary complicated when
+                      %% different target queues settle two separate deliveries referring to the same message sequence number (and same basic message).
+                      %%
+                      %% Therefore, to keep things simple, create a brand new delivery, store it in our state and forget about the old delivery and
+                      %% sequence number.
+                      %%
+                      %% If a sequene number gets settled after SETTLE_TIMEOUT, we can't map it anymore to the #pending{}. Hence, we ignore it.
+                      %%
+                      %% This can lead to issues when SETTLE_TIMEOUT is too low and time to settle takes too long.
+                      %% For example, if SETTLE_TIMEOUT is set to only 10 seconds, but settling a message takes always longer than 10 seconds
+                      %% (e.g. due to extremly slow hypervisor disks that ran out of credit), we will re-deliver the same message all over again
+                      %% leading to many duplicates in the target queue without ever acking the message back to the source discards queue.
+                      %%
+                      %% Therefore, set SETTLE_TIMEOUT reasonably high (e.g. 2 minutes).
+                      rabbit_log:debug("Redelivering message with sequence number ~b (for consumed message sequence number ~b) "
+                                       "that has been published ~b time(s) because of time out after ~bms waiting on publisher confirm. "
+                                       "Received confirm from: [~s]. Did not receive confirm from: [~s].",
+                                       [OutSeq, CMsgId, Count, ?SETTLE_TIMEOUT, strings(Settled), strings(Unsettled)]),
+                      #state{pendings = Pends0} = S = deliver(Content, DLXRef, DLX, DLRKey, CMsgId, Count, Settled, S0),
+                      Pends1 = maps:remove(OutSeq, Pends0),
+                      S#state{pendings = Pends1};
+                 (_OutSeq, _Pending, S) ->
+                      %% Publisher confirm did not time out (yet).
+                      S
+              end, State, Pendings).
 
 name({resource, Vhost, queue, Queue}) ->
     <<"internal-dead-letter-", Vhost/binary, "-", Queue/binary>>.
 
+strings(QRefs) when is_list(QRefs) ->
+    L0 = lists:map(fun rabbit_misc:rs/1, QRefs),
+    L1 = lists:join(", ", L0),
+    lists:flatten(L1).
+
 res_arg(_PolVal, ArgVal) -> ArgVal.
+
+maybe_set_timer(#state{timer = inactive,
+                       pendings = Pendings} = State) ->
+    case maps:size(Pendings) of
+        0 ->
+            State;
+        _ ->
+            TRef = erlang:send_after(?SETTLE_TIMEOUT, self(), settle_timeout),
+            % rabbit_log:debug("set timer"),
+            State#state{timer = TRef}
+    end;
+maybe_set_timer(#state{timer = TRef} = State) when is_reference(TRef) ->
+    State.
+
+maybe_cancel_timer(#state{timer = inactive} = State) ->
+    State;
+maybe_cancel_timer(#state{timer = TRef,
+                          pendings = Pendings} = State) ->
+    case maps:size(Pendings) of
+        0 ->
+            ok = erlang:cancel_timer(TRef, [{async, true},
+                                            {info, false}]),
+            % rabbit_log:debug("cancelled timer"),
+            State#state{timer = inactive};
+        _ ->
+            State
+    end.
