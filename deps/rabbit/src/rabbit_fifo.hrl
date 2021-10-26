@@ -110,10 +110,7 @@
          credit_mode = simple_prefetch :: credit_mode(), % part of snapshot data
          lifetime = once :: once | auto,
          status = up :: up | suspected_down | cancelled,
-         priority = 0 :: non_neg_integer(),
-         %% true if this consumer consumes only discarded messages that need to be
-         %% reliably dead-lettered
-         discards = false :: boolean()
+         priority = 0 :: non_neg_integer()
         }).
 
 -type consumer() :: #consumer{}.
@@ -168,11 +165,6 @@
          messages_total = 0 :: non_neg_integer(),
          % queue of returned msg_in_ids - when checking out it picks from
          returns = lqueue:new() :: lqueue:lqueue(term()),
-         % This queue allows for safe dead lettering by having consumers
-         % reliably moving messages from this queue to the target dead letter queue.
-         % Messages discarded due to 'maxlen' will never be part of this queue as they are
-         % moved with at-most-once semantics using rabbit_dead_letter:publish/5.
-         discards = lqueue:new() :: lqueue:lqueue(indexed_msg()),
          % a counter of enqueues - used to trigger shadow copy points
          enqueue_count = 0 :: non_neg_integer(),
          % a map containing all the live processes that have ever enqueued
@@ -193,7 +185,6 @@
          % consumers that require further service are queued here
          % needs to be part of snapshot
          service_queue = priority_queue:new() :: priority_queue:q(),
-         discards_service_queue = priority_queue:new() :: priority_queue:q(),
          %% This is a special field that is only used for snapshots
          %% It represents the queued messages at the time the
          %% dehydrated snapshot state was cached.
@@ -204,11 +195,9 @@
          %% This is done so that consumers are still served in a deterministic
          %% order on recovery.
          prefix_msgs = {0, [], 0, []} :: prefix_msgs(),
+         dlx :: rabbit_fifo_dlx:state(),
          msg_bytes_enqueue = 0 :: non_neg_integer(),
          msg_bytes_checkout = 0 :: non_neg_integer(),
-         msg_bytes_discard = 0 :: non_neg_integer(),
-         %% bytes checked out from the discard queue
-         msg_bytes_discard_checkout = 0 :: non_neg_integer(),
          %% waiting consumers, one is picked active consumer is cancelled or dies
          %% used only when single active consumer is on
          waiting_consumers = [] :: [{consumer_id(), consumer()}],

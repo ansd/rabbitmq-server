@@ -1,3 +1,16 @@
+%% This module consumes from a single quroum queue's discards queue (containing dead-letttered messages)
+%% and forwards the DLX messages at least once to every target queue.
+%%
+%% Some parts of this module resemble the channel process in the sense that it needs to keep track what messages
+%% are consumed but not acked yet and what messages are published but not confirmed yet.
+%% Compared to the channel process, this module is protocol independent since it doesn't deal with AMQP clients.
+%%
+%% This module consumes directly from the rabbit_fifo_dlx_client bypassing the rabbit_queue_type interface,
+%% but publishes via the rabbit_queue_type interface.
+%% While consuming via rabbit_queue_type interface would have worked in practice (by using a special consumer argument,
+%% e.g. {<<"x-internal-queue">>, longstr, <<"discards">>} ) using the rabbit_fifo_dlx_client directly provides
+%% separation of concerns making things much easier to test, to debug, and to understand.
+
 -module(rabbit_fifo_dlx_worker).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
@@ -18,6 +31,11 @@
 -define(SETTLE_TIMEOUT, 120_000).
 
 -record(pending, {
+          %% consumed_msg_id is not to be confused with consumer delivery tag.
+          %% The latter represents a means for AMQP clients to (multi-)ack to a channel process.
+          %% However, queues are not aware of delivery tags.
+          %% This rabbit_fifo_dlx_worker does not have the concept of delivery tags because it settles (acks)
+          %% message IDs directly back to the queue (and there is no AMQP consumer).
           consumed_msg_id :: non_neg_integer(),
           content :: rabbit_types:decoded_content(),
           %% target queues for which publisher confirm has not been received yet
@@ -35,7 +53,8 @@
           %% (if x-dead-letter-strategy at-least-once is used).
           %% Hence, there is a single queue we consume from.
           consumer_queue_ref :: rabbit_amqqueue:name(),
-          consumer_tag :: rabbit_types:ctag(),
+          % consumer_tag :: rabbit_types:ctag(),
+          dlx_client_state :: rabbit_fifo_dlx_client:state(),
           queue_type_state :: rabbit_queue_type:state(),
           %% Consumed messages for which we have not received all publisher confirms yet.
           %% Therefore, they have not been ACKed yet to the consumer queue.
@@ -58,26 +77,13 @@ start_link(QRef) ->
 -spec init(rabbit_amqqueue:name()) -> {ok, state()}.
 init(QRef) ->
     {ok, Q} = rabbit_amqqueue:lookup(QRef),
-    QTypeState0 = rabbit_queue_type:init(),
-    ConsumerTag = name(QRef),
-    ConsumeSpec = #{no_ack => false,
-                    channel_pid => self(),
-                    %% limiter is about global QoS which is not supported in quorum queues
-                    %% and about to be deprecated in RabbitMQ
-                    limiter_pid => undefined,
-                    limiter_active => false,
-                    prefetch_count => ?CONSUMER_PREFETCH_COUNT,
-                    consumer_tag => ConsumerTag,
-                    exclusive_consume => false,
-                    args => [{<<"x-internal-queue">>, longstr, <<"discards">>}],
-                    ok_msg => undefined,
-                    acting_user =>  none},
-    %%TODO call rabbit_fifo_client directly?
-    %%TODO refactor fifo dlx stuff into separate module (and call e.g. rabbit_fifo_dlx:checkout() here)
-    {ok, QTypeState1, _Actions = []} = rabbit_queue_type:consume(Q, ConsumeSpec, QTypeState0),
+    Node = node(),
+    {_ClusterName, Node} = Leader = amqqueue:get_pid(Q),
+    {ok, ConsumerState} = rabbit_fifo_dlx_client:checkout(QRef, Leader, ?CONSUMER_PREFETCH_COUNT),
     {ok, #state{consumer_queue_ref = QRef,
-                consumer_tag = ConsumerTag,
-                queue_type_state = QTypeState1}}.
+                % consumer_tag = ConsumerTag,
+                dlx_client_state = ConsumerState,
+                queue_type_state = rabbit_queue_type:init()}}.
 
 terminate(_Reason, _State) ->
     %% cancel subscription?
@@ -87,13 +93,23 @@ handle_call(Request, From, State) ->
     rabbit_log:warning("~s received unhandled call from ~p: ~p", [?MODULE, From, Request]),
     {noreply, State}.
 
+handle_cast({queue_event, QRef, {From, Evt} = E},
+            #state{consumer_queue_ref = QRef,
+                   dlx_client_state = DlxState0} = State0) ->
+    %% received dead-letter messsage from source queue
+    rabbit_log:debug("~s received queue event: ~p", [rabbit_misc:rs(QRef), E]),
+    {ok, DlxState, Actions} = rabbit_fifo_dlx_client:handle_ra_event(From, Evt, DlxState0),
+    State1 = State0#state{dlx_client_state = DlxState},
+    State = handle_queue_actions(Actions, State1),
+    {noreply, State};
 handle_cast({queue_event, QRef, Evt},
             #state{queue_type_state = QTypeState0} = State0) ->
+    %% received e.g. confirm from target queue
     case rabbit_queue_type:handle_event(QRef, Evt, QTypeState0) of
         {ok, QTypeState1, Actions} ->
             State1 = State0#state{queue_type_state = QTypeState1},
-            State2 = handle_queue_actions(Actions, State1),
-            {noreply, State2};
+            State = handle_queue_actions(Actions, State1),
+            {noreply, State};
         %% TODO handle as done in
         %% https://github.com/rabbitmq/rabbitmq-server/blob/9cf18e83f279408e20430b55428a2b19156c90d7/deps/rabbit/src/rabbit_channel.erl#L771-L783
         eol ->
@@ -125,8 +141,8 @@ code_change(_OldVsn, State, _Extra) ->
 %% https://github.com/rabbitmq/rabbitmq-server/blob/9cf18e83f279408e20430b55428a2b19156c90d7/deps/rabbit/src/rabbit_channel.erl#L2855-L2888
 handle_queue_actions(Actions, State0) ->
     lists:foldl(
-      fun ({deliver, CTag, AckRequired, Msgs}, S0) ->
-              S1 = handle_deliver(CTag, AckRequired, Msgs, S0),
+      fun ({deliver, Msgs}, S0) ->
+              S1 = handle_deliver(Msgs, S0),
               maybe_set_timer(S1);
           ({settled, QRef, MsgSeqs}, S0) ->
               S1 = handle_settled(QRef, MsgSeqs, S0),
@@ -137,12 +153,9 @@ handle_queue_actions(Actions, State0) ->
               S0
       end, State0, Actions).
 
-handle_deliver(CTag, _AckRequired = true, Msgs,
-               #state{consumer_tag = CTag,
-                      consumer_queue_ref = QRef
-                     } = State) when is_list(Msgs) ->
+handle_deliver(Msgs, #state{consumer_queue_ref = QRef} = State) when is_list(Msgs) ->
     {DLXRef, DLX, DLRKey} = lookup_dlx(QRef),
-    lists:foldl(fun({_QName, _QPid, MsgId, _Redelivered, #basic_message{content = Content}}, S) ->
+    lists:foldl(fun({_QRef, MsgId, #basic_message{content = Content}}, S) ->
                         deliver(Content, DLXRef, DLX, DLRKey, MsgId, 0, [], S)
                 end, State, Msgs).
 
@@ -217,10 +230,8 @@ handle_settled0(QRef, MsgSeq, Pendings) ->
                                [MsgSeq, rabbit_misc:rs(QRef), ?SETTLE_TIMEOUT])
     end.
 
-maybe_ack(#state{consumer_queue_ref = QRef,
-                 consumer_tag = CTag,
-                 queue_type_state = QTypeState0,
-                 pendings = Pendings0} = State0) ->
+maybe_ack(#state{pendings = Pendings0,
+                 dlx_client_state = DlxState0} = State0) ->
     Settled = maps:filter(fun(_OutSeq, #pending{unsettled = [], settled = [_|_]}) ->
                                   %% Ack because there is at least one target queue and all
                                   %% target queues settled (i.e. combining publisher confirm
@@ -234,13 +245,17 @@ maybe_ack(#state{consumer_queue_ref = QRef,
             %% nothing to ack
             State0;
         _ ->
-            SettledOutSeqs = maps:keys(Settled),
-            {ok, QTypeState1, Actions} = rabbit_queue_type:settle(QRef, complete, CTag,
-                                                                  SettledOutSeqs, QTypeState0),
-            Pendings1 = maps:without(SettledOutSeqs, Pendings0),
-            State1 = State0#state{queue_type_state = QTypeState1,
-                                  pendings = Pendings1},
-            handle_queue_actions(Actions, State1)
+            Ids = lists:map(fun(#pending{consumed_msg_id = Id}) -> Id end, maps:values(Settled)),
+            case rabbit_fifo_dlx_client:settle(Ids, DlxState0) of
+                {ok, DlxState} ->
+                    SettledOutSeqs = maps:keys(Settled),
+                    Pendings = maps:without(SettledOutSeqs, Pendings0),
+                    State0#state{pendings = Pendings,
+                                 dlx_client_state = DlxState};
+                {error, _Reason} ->
+                    %% Failed to ack. Ack will be retried in the next maybe_ack/1
+                    State0
+            end
     end.
 
 redeliver_timed_out_messsages(#state{pendings = Pendings,
@@ -285,8 +300,8 @@ redeliver_timed_out_messsages(#state{pendings = Pendings,
                       S
               end, State, Pendings).
 
-name({resource, Vhost, queue, Queue}) ->
-    <<"internal-dead-letter-", Vhost/binary, "-", Queue/binary>>.
+% name({resource, Vhost, queue, Queue}) ->
+    % <<"internal-dead-letter-", Vhost/binary, "-", Queue/binary>>.
 
 strings(QRefs) when is_list(QRefs) ->
     L0 = lists:map(fun rabbit_misc:rs/1, QRefs),
@@ -301,6 +316,8 @@ maybe_set_timer(#state{timer = inactive,
         0 ->
             State;
         _ ->
+            %%TODO send $gen_cast as done in
+            %% https://github.com/rabbitmq/rabbitmq-server/blob/7f0c1982a3a217cd7bd4f5d59ea396a0995335c5/deps/rabbit/src/rabbit_fifo_client.erl#L867
             TRef = erlang:send_after(?SETTLE_TIMEOUT, self(), settle_timeout),
             % rabbit_log:debug("set timer"),
             State#state{timer = TRef}
