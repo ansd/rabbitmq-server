@@ -53,7 +53,6 @@
           %% (if x-dead-letter-strategy at-least-once is used).
           %% Hence, there is a single queue we consume from.
           consumer_queue_ref :: rabbit_amqqueue:name(),
-          % consumer_tag :: rabbit_types:ctag(),
           dlx_client_state :: rabbit_fifo_dlx_client:state(),
           queue_type_state :: rabbit_queue_type:state(),
           %% Consumed messages for which we have not received all publisher confirms yet.
@@ -81,7 +80,6 @@ init(QRef) ->
     {_ClusterName, Node} = Leader = amqqueue:get_pid(Q),
     {ok, ConsumerState} = rabbit_fifo_dlx_client:checkout(QRef, Leader, ?CONSUMER_PREFETCH_COUNT),
     {ok, #state{consumer_queue_ref = QRef,
-                % consumer_tag = ConsumerTag,
                 dlx_client_state = ConsumerState,
                 queue_type_state = rabbit_queue_type:init()}}.
 
@@ -93,11 +91,11 @@ handle_call(Request, From, State) ->
     rabbit_log:warning("~s received unhandled call from ~p: ~p", [?MODULE, From, Request]),
     {noreply, State}.
 
-handle_cast({queue_event, QRef, {From, Evt} = E},
+handle_cast({queue_event, QRef, {From, Evt}},
             #state{consumer_queue_ref = QRef,
                    dlx_client_state = DlxState0} = State0) ->
     %% received dead-letter messsage from source queue
-    rabbit_log:debug("~s received queue event: ~p", [rabbit_misc:rs(QRef), E]),
+    % rabbit_log:debug("~s received queue event: ~p", [rabbit_misc:rs(QRef), E]),
     {ok, DlxState, Actions} = rabbit_fifo_dlx_client:handle_ra_event(From, Evt, DlxState0),
     State1 = State0#state{dlx_client_state = DlxState},
     State = handle_queue_actions(Actions, State1),
@@ -125,8 +123,6 @@ handle_cast(settle_timeout, State0) ->
     State3 = maybe_ack(State2),
     State4 = maybe_set_timer(State3),
     {noreply, State4};
-%%TODO handle
-%% {mandatory_received,1}
 handle_cast(Request, State) ->
     rabbit_log:warning("~s received unhandled cast ~p", [?MODULE, Request]),
     {noreply, State}.
@@ -163,7 +159,8 @@ deliver(Content, DLXRef, DLX, DLRKey, ConsumedMsgId, Count, Settled,
         #state{next_out_seq = OutSeq,
                pendings = Pendings} = State0) ->
     {ok, BasicMsg} = rabbit_basic:message(DLXRef, DLRKey, Content),
-    Delivery = rabbit_basic:delivery(true, true, BasicMsg, OutSeq),
+    %% Field 'mandatory' is set to false because our module checks on its own whether the message is routable.
+    Delivery = rabbit_basic:delivery(_Mandatory = false, _Confirm = true, BasicMsg, OutSeq),
     QNames = rabbit_exchange:route(DLX, Delivery),
     %% When this is a re-deliver, we won't send to queues for which we already received a publisher confirm.
     RouteToQNames = QNames -- Settled,
