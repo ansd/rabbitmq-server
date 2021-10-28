@@ -214,9 +214,8 @@ apply(Meta,
 apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
       #?MODULE{consumers = Cons0} = State0) ->
     case Cons0 of
-        #{ConsumerId := #consumer{checked_out = Checked0}} ->
-            Discarded = maps:with(MsgIds, Checked0),
-            {State, ok, Effects} = discard(Meta, ConsumerId, Discarded, [], State0),
+        #{ConsumerId := #consumer{checked_out = Checked}} ->
+            {State, ok, Effects} = discard(MsgIds, Meta, ConsumerId, Checked, [], State0),
             checkout(Meta, State0, State, Effects, false);
         _ ->
             {State0, ok}
@@ -1424,16 +1423,20 @@ maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
             {duplicate, State0, Effects0}
     end.
 
-discard(#{index := IncomingRaftIdx} = Meta, ConsumerId, Discarded,
-        Effects, State0) ->
-    State1 = maps:fold(
-               fun(MsgId, Msg, S0) ->
-                       discard_one(MsgId, Msg, ConsumerId, S0)
-               end, State0, Discarded),
+discard(MsgIds, #{index := IncomingRaftIdx} = Meta, ConsumerId, Checked, Effects, State0) ->
+    {State1, NumDiscarded} = lists:foldl(fun(MsgId, {S0, Sum}) ->
+                                                 case maps:find(MsgId, Checked) of
+                                                     {ok, Msg} ->
+                                                         S = discard_one(MsgId, Msg, ConsumerId, S0),
+                                                         {S, Sum+1};
+                                                     error ->
+                                                         {S0, Sum}
+                                                 end
+                                         end, {State0, 0}, MsgIds),
     State = case State1#?MODULE.consumers of
                 #{ConsumerId := Con0} ->
                     Con = Con0#consumer{credit = increase_credit(Con0,
-                                                                 map_size(Discarded))},
+                                                                 NumDiscarded)},
                     update_or_remove_sub(Meta, ConsumerId, Con, State1);
                 _ ->
                     State1
