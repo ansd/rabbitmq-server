@@ -13,7 +13,7 @@
 checkout(QResource, Leader, NumUnsettled) ->
     Cmd = rabbit_fifo_dlx:make_checkout(NumUnsettled),
     %% TODO
-    %% A message being discarded and thereafter acked has to be persisted in the Raftlog.
+    %% A message being discarded and thereafter acked has to be persisted in the Raft log.
     %% However, DLX worker subscription doesn't necessarily have to be persisted in the Raft log, does it?
     %% For normal consumers it makes sense because the new leader needs resume delivering messages
     %% where the old leader left off. So it needs to know the various consumer sates.

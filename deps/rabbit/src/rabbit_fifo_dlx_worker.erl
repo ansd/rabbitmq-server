@@ -66,7 +66,7 @@
           %% redelivering messages for which not all publisher confirms were received.
           %% If there are no pending messages, this timer will eventually be cancelled to allow
           %% this worker to hibernate.
-          timer = inactive :: reference() | inactive
+          timer :: reference()
          }).
 
 -type state() :: #state{}.
@@ -117,20 +117,20 @@ handle_cast({queue_event, QRef, Evt},
         {protocol_error, _Type, _Reason, _ReasonArgs} ->
             {noreply, State0}
     end;
-%%TODO handle
-%% {mandatory_received,1}
-handle_cast(Request, State) ->
-    rabbit_log:warning("~s received unhandled cast ~p", [?MODULE, Request]),
-    {noreply, State}.
-
-handle_info(settle_timeout, State0) ->
-    State1 = State0#state{timer = inactive},
+handle_cast(settle_timeout, State0) ->
+    State1 = State0#state{timer = undefined},
     State2 = redeliver_timed_out_messsages(State1),
     %% Routes could have been changed dynamically.
     %% If a publisher confirm timed out for a target queue to which we now don't route anymore, ack the message.
     State3 = maybe_ack(State2),
     State4 = maybe_set_timer(State3),
     {noreply, State4};
+%%TODO handle
+%% {mandatory_received,1}
+handle_cast(Request, State) ->
+    rabbit_log:warning("~s received unhandled cast ~p", [?MODULE, Request]),
+    {noreply, State}.
+
 handle_info(Info, State) ->
     rabbit_log:warning("~s received unhandled info ~p", [?MODULE, Info]),
     {noreply, State}.
@@ -267,7 +267,7 @@ redeliver_timed_out_messsages(#state{pendings = Pendings,
                                    count = Count,
                                    content = Content,
                                    unsettled = Unsettled,
-                                   settled = Settled}, S0) when LastPub + ?SETTLE_TIMEOUT < Now ->
+                                   settled = Settled}, S0) when LastPub + ?SETTLE_TIMEOUT =< Now ->
                       %% Publisher confirm timed out.
                       %%
                       %% Quorum queues maintain their own Raft sequene number mapping to the message sequence number (= Raft correlation ID).
@@ -310,31 +310,28 @@ strings(QRefs) when is_list(QRefs) ->
 
 res_arg(_PolVal, ArgVal) -> ArgVal.
 
-maybe_set_timer(#state{timer = inactive,
+maybe_set_timer(#state{timer = undefined,
                        pendings = Pendings} = State) ->
     case maps:size(Pendings) of
         0 ->
             State;
         _ ->
-            %%TODO send $gen_cast as done in
-            %% https://github.com/rabbitmq/rabbitmq-server/blob/7f0c1982a3a217cd7bd4f5d59ea396a0995335c5/deps/rabbit/src/rabbit_fifo_client.erl#L867
-            TRef = erlang:send_after(?SETTLE_TIMEOUT, self(), settle_timeout),
+            TRef = erlang:send_after(?SETTLE_TIMEOUT, self(), {'$gen_cast', settle_timeout}),
             % rabbit_log:debug("set timer"),
             State#state{timer = TRef}
     end;
 maybe_set_timer(#state{timer = TRef} = State) when is_reference(TRef) ->
     State.
 
-maybe_cancel_timer(#state{timer = inactive} = State) ->
+maybe_cancel_timer(#state{timer = undefined} = State) ->
     State;
 maybe_cancel_timer(#state{timer = TRef,
                           pendings = Pendings} = State) ->
     case maps:size(Pendings) of
         0 ->
-            ok = erlang:cancel_timer(TRef, [{async, true},
-                                            {info, false}]),
+            erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
             % rabbit_log:debug("cancelled timer"),
-            State#state{timer = inactive};
+            State#state{timer = undefined};
         _ ->
             State
     end.
