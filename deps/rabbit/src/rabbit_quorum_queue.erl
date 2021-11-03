@@ -310,13 +310,7 @@ become_leader(QName, Name) ->
                            || Node <- Nodes, Node =/= node()];
                       _ ->
                           ok
-                  end,
-                  %%TODO
-                  %% 1. Spawn leader companion process directly in Ra.
-                  %% 2. Supervise rabbit_fifo_dlx_worker (see rabbit_channel_sup for inspiration).
-                  %% 3. Spawn only if dead-letter-strategy at-least-once.
-                  {ok, Pid} = rabbit_fifo_dlx_worker:start_link(QName),
-                  rabbit_log:debug("Started rabbit_fifo_dlx_worker process ~p", [Pid])
+                  end
           end).
 
 -spec all_replica_states() -> {node(), #{atom() => atom()}}.
@@ -1561,11 +1555,19 @@ format_ra_event(ServerId, Evt, QRef) ->
 
 make_ra_conf(Q, ServerId, TickTimeout) ->
     QName = amqqueue:get_name(Q),
-    RaMachine = ra_machine(Q),
     [{ClusterName, _} | _] = Members = members(Q),
     UId = ra:new_uid(ra_lib:to_binary(ClusterName)),
     FName = rabbit_misc:rs(QName),
     Formatter = {?MODULE, format_ra_event, [QName]},
+    {_, _, #{dead_letter_handling := DLH}} = RaMachine = ra_machine(Q),
+    CompanionConfig = case DLH of
+                     {at_least_once, _} ->
+                         #{start => {rabbit_fifo_dlx_worker, start_link, [QName]},
+                           type => worker,
+                           modules => [rabbit_fifo_dlx_worker]};
+                     _ ->
+                         undefined
+                 end,
     #{cluster_name => ClusterName,
       id => ServerId,
       uid => UId,
@@ -1575,7 +1577,8 @@ make_ra_conf(Q, ServerId, TickTimeout) ->
       log_init_args => #{uid => UId},
       tick_timeout => TickTimeout,
       machine => RaMachine,
-      ra_event_formatter => Formatter}.
+      ra_event_formatter => Formatter,
+      leader_companion_config => CompanionConfig}.
 
 get_nodes(Q) when ?is_amqqueue(Q) ->
     #{nodes := Nodes} = amqqueue:get_type_state(Q),

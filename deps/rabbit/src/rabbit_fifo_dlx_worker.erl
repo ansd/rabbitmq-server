@@ -19,7 +19,9 @@
 
 -export([start_link/1]).
 %% gen_server2 callbacks
--export([init/1, terminate/2, handle_cast/2, handle_call/3, handle_info/2, code_change/3]).
+-export([init/1, terminate/2, handle_continue/2,
+         handle_cast/2, handle_call/3, handle_info/2,
+         code_change/3]).
 
 %%TODO make configurable or leave at 0 which means 2000 as in
 %% https://github.com/rabbitmq/rabbitmq-server/blob/1e7df8c436174735b1d167673afd3f1642da5cdc/deps/rabbit/src/rabbit_quorum_queue.erl#L726-L729
@@ -75,13 +77,15 @@ start_link(QRef) ->
 
 -spec init(rabbit_amqqueue:name()) -> {ok, state()}.
 init(QRef) ->
+    {ok, #state{}, {continue, QRef}}.
+
+handle_continue(QRef, State) ->
     {ok, Q} = rabbit_amqqueue:lookup(QRef),
-    Node = node(),
-    {_ClusterName, Node} = Leader = amqqueue:get_pid(Q),
-    {ok, ConsumerState} = rabbit_fifo_dlx_client:checkout(QRef, Leader, ?CONSUMER_PREFETCH_COUNT),
-    {ok, #state{consumer_queue_ref = QRef,
-                dlx_client_state = ConsumerState,
-                queue_type_state = rabbit_queue_type:init()}}.
+    {ClusterName, _MaybeOldLeaderNode} = amqqueue:get_pid(Q),
+    {ok, ConsumerState} = rabbit_fifo_dlx_client:checkout(QRef, {ClusterName, node()}, ?CONSUMER_PREFETCH_COUNT),
+    {noreply, State#state{consumer_queue_ref = QRef,
+                          dlx_client_state = ConsumerState,
+                          queue_type_state = rabbit_queue_type:init()}}.
 
 terminate(_Reason, _State) ->
     %% cancel subscription?
