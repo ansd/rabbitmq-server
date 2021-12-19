@@ -26,7 +26,6 @@
 -export([credit/4]).
 -export([purge/1]).
 -export([stateless_deliver/2, deliver/3, deliver/2]).
--export([dead_letter_publish/4]).
 -export([queue_name/1]).
 -export([cluster_state/1, status/2]).
 -export([update_consumer_handler/8, update_consumer/9]).
@@ -240,7 +239,7 @@ ra_machine_config(Q) when ?is_amqqueue(Q) ->
     MsgTTL = args_policy_lookup(<<"message-ttl">>, fun min/2, Q),
     #{name => Name,
       queue_resource => QName,
-      dead_letter_handler => dead_letter_handler(Q, Overflow),
+      dead_letter_strategy => dead_letter_strategy(Q, Overflow),
       become_leader_handler => {?MODULE, become_leader, [QName]},
       max_length => MaxLength,
       max_bytes => MaxBytes,
@@ -1265,57 +1264,36 @@ reclaim_memory(Vhost, QueueName) ->
     ra_log_wal:force_roll_over({?RA_WAL_NAME, Node}).
 
 %%----------------------------------------------------------------------------
-dead_letter_handler(Q, Overflow) ->
-    %% Queue arg continues to take precedence to not break existing configurations
-    %% for queues upgraded from <v3.10 to >=v3.10
+dead_letter_strategy(Q, Overflow) ->
     Exchange = args_policy_lookup(<<"dead-letter-exchange">>, fun queueArgHasPrecedence/2, Q),
     RoutingKey = args_policy_lookup(<<"dead-letter-routing-key">>, fun queueArgHasPrecedence/2, Q),
-    %% Policy takes precedence because it's a new key introduced in v3.10 and we want
-    %% users to use policies instead of queue args allowing dynamic reconfiguration.
-    %% TODO change to queueArgHasPrecedence for dead-letter-strategy
-    Strategy = args_policy_lookup(<<"dead-letter-strategy">>, fun policyHasPrecedence/2, Q),
+    Strategy = args_policy_lookup(<<"dead-letter-strategy">>, fun queueArgHasPrecedence/2, Q),
     QName = amqqueue:get_name(Q),
-    dlh(Exchange, RoutingKey, Strategy, Overflow, QName).
+    dls(Exchange, RoutingKey, Strategy, Overflow, QName).
 
-dlh(undefined, undefined, undefined, _, _) ->
-    undefined;
-dlh(undefined, RoutingKey, undefined, _, QName) ->
+dls(undefined, undefined, undefined, _, _) ->
+    rabbit_fifo_dlx_strategy_none;
+dls(undefined, RoutingKey, undefined, _, QName) ->
     rabbit_log:warning("Disabling dead-lettering for ~s despite configured dead-letter-routing-key '~s' "
                        "because dead-letter-exchange is not configured.",
                        [rabbit_misc:rs(QName), RoutingKey]),
-    undefined;
-dlh(undefined, _, Strategy, _, QName) ->
+    rabbit_fifo_dlx_strategy_none;
+dls(undefined, _, Strategy, _, QName) ->
     rabbit_log:warning("Disabling dead-lettering for ~s despite configured dead-letter-strategy '~s' "
                        "because dead-letter-exchange is not configured.",
                        [rabbit_misc:rs(QName), Strategy]),
-    undefined;
-dlh(_, _, <<"at-least-once">>, reject_publish, _) ->
-    at_least_once;
-dlh(Exchange, RoutingKey, <<"at-least-once">>, drop_head, QName) ->
+    rabbit_fifo_dlx_strategy_none;
+dls(_, _, <<"at-least-once">>, reject_publish, _) ->
+    rabbit_fifo_dlx_strategy_at_least_once;
+dls(_, _, <<"at-least-once">>, drop_head, QName) ->
     rabbit_log:warning("Falling back to dead-letter-strategy at-most-once for ~s "
                        "because configured dead-letter-strategy at-least-once is incompatible with "
                        "effective overflow strategy drop-head. To enable dead-letter-strategy "
                        "at-least-once, set overflow strategy to reject-publish.",
                        [rabbit_misc:rs(QName)]),
-    dlh_at_most_once(Exchange, RoutingKey, QName);
-dlh(Exchange, RoutingKey, _, _, QName) ->
-    dlh_at_most_once(Exchange, RoutingKey, QName).
-
-dlh_at_most_once(Exchange, RoutingKey, QName) ->
-    DLX = rabbit_misc:r(QName, exchange, Exchange),
-    MFA = {?MODULE, dead_letter_publish, [DLX, RoutingKey, QName]},
-    {at_most_once, MFA}.
-
-dead_letter_publish(undefined, _, _, _) ->
-    ok;
-dead_letter_publish(X, RK, QName, ReasonMsgs) ->
-    case rabbit_exchange:lookup(X) of
-        {ok, Exchange} ->
-            [rabbit_dead_letter:publish(Msg, Reason, Exchange, RK, QName)
-             || {Reason, Msg} <- ReasonMsgs];
-        {error, not_found} ->
-            ok
-    end.
+    rabbit_fifo_dlx_strategy_at_most_once;
+dls(_, _, _, _, _) ->
+    rabbit_fifo_dlx_strategy_at_most_once.
 
 find_quorum_queues(VHost) ->
     Node = node(),

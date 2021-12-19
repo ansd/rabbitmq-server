@@ -4,7 +4,7 @@
 %% Reason of prefix messages is [] because the message will not be
 %% actually delivered and storing 2 bytes in the persisted snapshot
 %% is less than the reason atom.
--type reason() :: 'expired' | 'rejected' | delivery_limit | ?NIL.
+-type reason() :: expired | rejected | delivery_limit | ?NIL.
 
 % See snapshot scenarios in rabbit_fifo_prop_SUITE. Add dlx dehydrate tests.
 -record(dlx_consumer,{
@@ -17,7 +17,7 @@
           next_msg_id = 0 :: msg_id() % part of snapshot data
          }).
 
--record(rabbit_fifo_dlx,{
+-record(rabbit_fifo_dlx_strategy_at_least_once,{
           consumer = undefined :: #dlx_consumer{} | undefined,
           %% Queue of dead-lettered messages.
           discards = lqueue:new() :: lqueue:lqueue({reason(), indexed_msg()}),

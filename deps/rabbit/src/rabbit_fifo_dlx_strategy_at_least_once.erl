@@ -1,37 +1,31 @@
--module(rabbit_fifo_dlx).
+-module(rabbit_fifo_dlx_strategy_at_least_once).
 
--include("rabbit_fifo_dlx.hrl").
+-include("rabbit_fifo_dlx_strategy_at_least_once.hrl").
 -include("rabbit_fifo.hrl").
 -compile({no_auto_import, [apply/3]}).
 
-% client API, e.g. for rabbit_fifo_dlx_client
--export([make_checkout/2,
-         make_settle/1]).
+-behaviour(rabbit_fifo_dlx_strategy).
 
-% called by rabbit_fifo delegating DLX handling to this module
--export([init/0,
-         apply/2,
+-export([
+         %% rabbit_fifo_dlx_client
+         make_checkout/2,
+         make_settle/1,
+         %% rabbit_fifo delegating DLX handling to this module
+         init/1,
+         apply/3,
          discard/3,
          overview/1,
          checkout/1,
-         state_enter/3,
-         ensure_worker_started/2,
-         cleanup/1,
+         state_enter/2,
+         handle_aux/4,
          purge/1,
-         local_alive_consumer_pid/1,
          dehydrate/1,
          normalize/1,
-         stat/1]).
-
-%% This module handles the dead letter (DLX) part of the rabbit_fifo state machine.
-%% This is a separate module to better unit test and provide separation of concerns.
-%% This module maintains its own state:
-%% a queue of DLX messages, a single node local DLX consumer, and some stats.
-%% The state of this module is included into rabbit_fifo state because there can only by one Ra state machine.
-%% The rabbit_fifo module forwards all DLX commands to this module where we then update the DLX specific state only:
-%% e.g. DLX consumer subscribed, adding / removing discarded messages, stats
-%%
-%% It also runs its own checkout logic sending DLX messages to the DLX consumer.
+         stat/1,
+         update_config/2,
+         switch_to/2,
+         switch_from/1
+        ]).
 
 -record(checkout,{
           consumer :: pid(),
@@ -39,33 +33,36 @@
          }).
 -record(settle, {msg_ids :: [msg_id()]}).
 -type command() :: #checkout{} | #settle{}.
--type protocol() :: {dlx, command()}.
+%% 'alo' stands for at-least-once.
+%% Keep it short since binary representation gets persisted.
+-type protocol() :: {dlx, {alo, command()}}.
 -type state() :: #?MODULE{}.
 -export_type([state/0,
               protocol/0,
               reason/0]).
 
--spec init() -> state().
-init() ->
-    #?MODULE{}.
+-spec init(rabbit_fifo:state()) ->
+    rabbit_fifo:state().
+init(State) ->
+    set(State, #?MODULE{}).
 
 make_checkout(Pid, NumUnsettled) ->
-    {dlx, #checkout{consumer = Pid,
-                    prefetch = NumUnsettled
-                   }}.
+    {dlx, {alo, #checkout{consumer = Pid,
+                          prefetch = NumUnsettled}}}.
 
 make_settle(MessageIds) when is_list(MessageIds) ->
-    {dlx, #settle{msg_ids = MessageIds}}.
+    {dlx, {alo, #settle{msg_ids = MessageIds}}}.
 
-overview(#?MODULE{consumer = undefined,
-                  msg_bytes = MsgBytes,
-                  msg_bytes_checkout = 0,
-                  discards = Discards}) ->
+-spec overview(rabbit_fifo:state()) -> map().
+overview(#rabbit_fifo{dlx = #?MODULE{consumer = undefined,
+                                     msg_bytes = MsgBytes,
+                                     msg_bytes_checkout = 0,
+                                     discards = Discards}}) ->
     overview0(Discards, #{}, MsgBytes, 0);
-overview(#?MODULE{consumer = #dlx_consumer{checked_out = Checked},
-                  msg_bytes = MsgBytes,
-                  msg_bytes_checkout = MsgBytesCheckout,
-                  discards = Discards}) ->
+overview(#rabbit_fifo{dlx = #?MODULE{consumer = #dlx_consumer{checked_out = Checked},
+                                     msg_bytes = MsgBytes,
+                                     msg_bytes_checkout = MsgBytesCheckout,
+                                     discards = Discards}}) ->
     overview0(Discards, Checked, MsgBytes, MsgBytesCheckout).
 
 overview0(Discards, Checked, MsgBytes, MsgBytesCheckout) ->
@@ -74,12 +71,12 @@ overview0(Discards, Checked, MsgBytes, MsgBytesCheckout) ->
       discard_message_bytes => MsgBytes,
       discard_checkout_message_bytes => MsgBytesCheckout}.
 
--spec stat(state()) ->
-    {non_neg_integer(), non_neg_integer()}.
-stat(#?MODULE{consumer = Con,
-              discards = Discards,
-              msg_bytes = MsgBytes,
-              msg_bytes_checkout = MsgBytesCheckout}) ->
+-spec stat(rabbit_fifo:state()) ->
+    {Num :: non_neg_integer(), Bytes :: non_neg_integer()}.
+stat(#rabbit_fifo{dlx = #?MODULE{consumer = Con,
+                                 discards = Discards,
+                                 msg_bytes = MsgBytes,
+                                 msg_bytes_checkout = MsgBytesCheckout}}) ->
     Num0 = lqueue:len(Discards),
     Num = case Con of
               undefined ->
@@ -90,20 +87,21 @@ stat(#?MODULE{consumer = Con,
     Bytes = MsgBytes + MsgBytesCheckout,
     {Num, Bytes}.
 
--spec apply(command(), state()) ->
-    {state(), ok | list()}. % TODO: refine return type
-apply(#checkout{consumer = Pid,
-                prefetch = Prefetch},
-      #?MODULE{consumer = undefined} = State0) ->
-    State = State0#?MODULE{consumer = #dlx_consumer{pid = Pid,
-                                                    prefetch = Prefetch}},
-    {State, ok};
-apply(#checkout{consumer = ConsumerPid,
-                prefetch = Prefetch},
-      #?MODULE{consumer = #dlx_consumer{checked_out = CheckedOutOldConsumer},
-               discards = Discards0,
-               msg_bytes = Bytes,
-               msg_bytes_checkout = BytesCheckout} = State0) ->
+-spec apply(ra_machine:command_meta_data(), rabbit_fifo:command(), rabbit_fifo:state()) ->
+    {rabbit_fifo:state(), ra_machine:effects()}.
+apply(Meta, {dlx, {alo, #checkout{consumer = Pid,
+                                  prefetch = Prefetch}}},
+      #rabbit_fifo{dlx = #?MODULE{consumer = undefined} = DlxState0} = State0) ->
+    DlxState = DlxState0#?MODULE{consumer = #dlx_consumer{pid = Pid,
+                                                          prefetch = Prefetch}},
+    State = set(State0, DlxState),
+    rabbit_fifo:checkout(Meta, State0, State, [], false);
+apply(Meta, {dlx, {alo, #checkout{consumer = ConsumerPid,
+                                  prefetch = Prefetch}}},
+      #rabbit_fifo{dlx = #?MODULE{consumer = #dlx_consumer{checked_out = CheckedOutOldConsumer},
+                                  discards = Discards0,
+                                  msg_bytes = Bytes,
+                                  msg_bytes_checkout = BytesCheckout} = DlxState0} = State0) ->
     %% Since we allow only a single consumer, the new consumer replaces the old consumer.
     %% All checked out messages to the old consumer need to be returned to the discards queue
     %% such that these messages can be (eventually) re-delivered to the new consumer.
@@ -115,15 +113,16 @@ apply(#checkout{consumer = ConsumerPid,
                                fun({_Id, {_Reason, IdxMsg} = Msg}, {D, B}) ->
                                        {lqueue:in_r(Msg, D), B + size_in_bytes(IdxMsg)}
                                end, {Discards0, 0}, Checked1),
-    State = State0#?MODULE{consumer = #dlx_consumer{pid = ConsumerPid,
-                                                    prefetch = Prefetch},
-                           discards = Discards,
-                           msg_bytes = Bytes + BytesMoved,
-                           msg_bytes_checkout = BytesCheckout - BytesMoved},
-    {State, ok};
-apply(#settle{msg_ids = MsgIds},
-      #?MODULE{consumer = #dlx_consumer{checked_out = Checked} = C,
-               msg_bytes_checkout = BytesCheckout} = State0) ->
+    DlxState = DlxState0#?MODULE{consumer = #dlx_consumer{pid = ConsumerPid,
+                                                          prefetch = Prefetch},
+                                 discards = Discards,
+                                 msg_bytes = Bytes + BytesMoved,
+                                 msg_bytes_checkout = BytesCheckout - BytesMoved},
+    State = set(State0, DlxState),
+    rabbit_fifo:checkout(Meta, State0, State, [], false);
+apply(#{index := IncomingRaftIdx} = Meta, {dlx, {alo, #settle{msg_ids = MsgIds}}},
+      #rabbit_fifo{dlx = #?MODULE{consumer = #dlx_consumer{checked_out = Checked} = C,
+                                  msg_bytes_checkout = BytesCheckout} = DlxState0} = State0) ->
     Acked = maps:with(MsgIds, Checked),
     AckedRsnMsgs = maps:values(Acked),
     AckedMsgs = lists:map(fun({_Reason, Msg}) -> Msg end, AckedRsnMsgs),
@@ -131,24 +130,38 @@ apply(#settle{msg_ids = MsgIds},
                                      Bytes + size_in_bytes(Msg)
                              end, 0, AckedMsgs),
     Unacked = maps:without(MsgIds, Checked),
-    State = State0#?MODULE{consumer = C#dlx_consumer{checked_out = Unacked},
-                           msg_bytes_checkout = BytesCheckout - AckedBytes},
-    {State, AckedMsgs}.
+    DlxState = DlxState0#?MODULE{consumer = C#dlx_consumer{checked_out = Unacked},
+                                 msg_bytes_checkout = BytesCheckout - AckedBytes},
+    State1 = set(State0, DlxState),
+    Total = rabbit_fifo:query_messages_total(State0) - length(AckedMsgs),
+    State2 = rabbit_fifo:subtract_in_memory(AckedMsgs, State1),
+    State3 = State2#rabbit_fifo{messages_total = Total},
+    State4 = rabbit_fifo:delete_indexes(AckedMsgs, State3),
+    {State, ok, Effects} = rabbit_fifo:checkout(Meta, State0, State4, [], false),
+    rabbit_fifo:update_smallest_raft_index(IncomingRaftIdx, State, Effects).
 
 %%TODO delete delivery_count header to save space?
 %% It's not needed anymore.
--spec discard(rabbit_fifo:indexed_msg(), term(), state()) -> state().
-discard(Msg, Reason, #?MODULE{discards = Discards0,
-                              msg_bytes = MsgBytes0} = State) ->
-    Discards = lqueue:in({Reason, Msg}, Discards0),
-    MsgBytes = MsgBytes0 + size_in_bytes(Msg),
-    State#?MODULE{discards = Discards,
-                  msg_bytes = MsgBytes}.
+-spec discard([msg()], rabbit_dead_letter:reason(), rabbit_fifo:state()) ->
+    {rabbit_fifo:state(), ra_machine:effects(), Delete :: boolean()}.
+discard(Msgs, Reason,
+        #rabbit_fifo{dlx = #?MODULE{discards = Discards0,
+                                    msg_bytes = MsgBytes0} = DlxState0} = State0)
+  when Reason =/= maxlen ->
+    {Discards, MsgBytes} = lists:foldl(fun (Msg, {D0, B0}) ->
+                                               D = lqueue:in({Reason, Msg}, D0),
+                                               B = B0 + size_in_bytes(Msg),
+                                               {D, B}
+                                       end, {Discards0, MsgBytes0}, Msgs),
+    DlxState = DlxState0#?MODULE{discards = Discards,
+                                 msg_bytes = MsgBytes},
+    State = set(State0, DlxState),
+    {State, [], false}.
 
--spec checkout(state()) ->
-    {state(), {list(), list()}}.
-checkout(#?MODULE{consumer = undefined,
-                  discards = Discards} = State) ->
+-spec checkout(rabbit_fifo:state()) ->
+    {rabbit_fifo:state(), ra_machine:effects()}.
+checkout(#rabbit_fifo{dlx = #?MODULE{consumer = undefined,
+                                     discards = Discards}} = State) ->
     case lqueue:is_empty(Discards) of
         true ->
             ok;
@@ -156,8 +169,10 @@ checkout(#?MODULE{consumer = undefined,
             rabbit_log:warning("there are dead-letter messages but no dead-letter consumer")
     end,
     {State, []};
-checkout(State) ->
-    checkout0(checkout_one(State), {[],[]}).
+checkout(#rabbit_fifo{dlx = DlxState0} = State0) ->
+    {DlxState, Effects} = checkout0(checkout_one(DlxState0), {[],[]}),
+    State = set(State0, DlxState),
+    {State, Effects}.
 
 checkout0({success, MsgId, {Reason, ?INDEX_MSG(RaftIdx, ?DISK_MSG(Header))}, State}, {InMemMsgs, LogMsgs})
   when is_integer(RaftIdx) ->
@@ -237,10 +252,15 @@ delivery_effects(CPid, {InMemMsgs, IdxMsgs0}) ->
               [{send_msg, CPid, {dlx_delivery, Msgs}, [ra_event]}]
       end}].
 
-state_enter(leader, QRef, State) ->
-    ensure_worker_started(QRef, State);
-state_enter(_, _, State) ->
-    ensure_worker_terminated(State).
+-spec state_enter(ra_server:ra_state(), rabbit_fifo:state()) ->
+    ra_machine:effects().
+state_enter(leader, #rabbit_fifo{cfg = #cfg{resource = QRef},
+                                 dlx = DlxState}) ->
+    ensure_worker_started(QRef, DlxState),
+    [];
+state_enter(_, #rabbit_fifo{dlx = DlxState}) ->
+    ensure_worker_terminated(DlxState),
+    [].
 
 ensure_worker_started(QRef, #?MODULE{consumer = undefined}) ->
     start_worker(QRef);
@@ -274,70 +294,15 @@ ensure_worker_terminated(#?MODULE{consumer = #dlx_consumer{pid = Pid}}) ->
             ok
     end.
 
-%% called when switching from at-least-once to at-most-once
-cleanup(#?MODULE{consumer = Consumer,
-                 discards = Discards} = State) ->
-    ensure_worker_terminated(State),
-    %% Return messages in the order they got discarded originally
-    %% for the final at-most-once dead-lettering.
-    CheckedReasonMsgs = case Consumer of
-                            #dlx_consumer{checked_out = Checked} when is_map(Checked) ->
-                                L0 = maps:to_list(Checked),
-                                L1 = lists:keysort(1, L0),
-                                {_, L2} = lists:unzip(L1),
-                                L2;
-                            _ ->
-                                []
-                        end,
-    DiscardReasonMsgs = lqueue:to_list(Discards),
-    CheckedReasonMsgs ++ DiscardReasonMsgs.
-
-purge(#?MODULE{consumer = Con0,
-               discards = Discards} = State0) ->
-    {Con, CheckedMsgs} = case Con0 of
-                             #dlx_consumer{checked_out = Checked} when is_map(Checked) ->
-                                 L = maps:to_list(Checked),
-                                 {_, CheckedReasonMsgs} = lists:unzip(L),
-                                 {_, Msgs} = lists:unzip(CheckedReasonMsgs),
-                                 C = Con0#dlx_consumer{checked_out = #{}},
-                                 {C, Msgs};
-                             _ ->
-                                 {Con0, []}
-                         end,
-    DiscardReasonMsgs = lqueue:to_list(Discards),
-    {_, DiscardMsgs} = lists:unzip(DiscardReasonMsgs),
-    PurgedMsgs = CheckedMsgs ++ DiscardMsgs,
-    State = State0#?MODULE{consumer = Con,
-                           discards = lqueue:new(),
-                           msg_bytes = 0,
-                           msg_bytes_checkout = 0
-                          },
-    {State, PurgedMsgs}.
-
-%% TODO Consider alternative to not dehydrate at all
-%% by putting messages to disk before enqueueing them in discards queue.
-dehydrate(#?MODULE{discards = Discards,
-                   consumer = Con} = State) ->
-    State#?MODULE{discards = dehydrate_messages(Discards),
-                  consumer = dehydrate_consumer(Con)}.
-
-dehydrate_messages(Discards) ->
-    L0 = lqueue:to_list(Discards),
-    L1 = lists:map(fun({_Reason, Msg}) ->
-                           {?NIL, rabbit_fifo:dehydrate_message(Msg)}
-                   end, L0),
-    lqueue:from_list(L1).
-
-dehydrate_consumer(#dlx_consumer{checked_out = Checked0} = Con) ->
-    Checked = maps:map(fun (_, {_, Msg}) ->
-                               {?NIL, rabbit_fifo:dehydrate_message(Msg)}
-                       end, Checked0),
-    Con#dlx_consumer{checked_out = Checked};
-dehydrate_consumer(undefined) ->
-    undefined.
-
-normalize(#?MODULE{discards = Discards} = State) ->
-    State#?MODULE{discards = lqueue:from_list(lqueue:to_list(Discards))}.
+-spec update_config(config(), rabbit_fifo:state()) ->
+    {rabbit_fifo:state(), ra_machine:effects()}.
+update_config(_, #rabbit_fifo{dlx = DlxState} = State) ->
+    case local_alive_consumer_pid(DlxState) of
+        undefined ->
+            {State, []};
+        Pid ->
+            {State, [{send_msg, Pid, lookup_topology, ra_event}]}
+    end.
 
 local_alive_consumer_pid(#?MODULE{consumer = undefined}) ->
     undefined;
@@ -354,3 +319,111 @@ is_local_and_alive(Pid)
     is_process_alive(Pid);
 is_local_and_alive(_) ->
     false.
+
+-spec handle_aux(ra_server:ra_state(), Cmd :: term(), term(), rabbit_fifo:state()) ->
+    term().
+handle_aux(leader, setup, Aux, #rabbit_fifo{cfg = #cfg{resource = QRef},
+                                            dlx = DlxState}) ->
+    ensure_worker_started(QRef, DlxState),
+    Aux;
+handle_aux(_, _, Aux, _) ->
+    Aux.
+
+%% switch from some other strategy to at-least-once
+-spec switch_to(rabbit_fifo:state(), ra_machine:effects()) ->
+    {rabbit_fifo:state(), ra_machine:effects()}.
+switch_to(#rabbit_fifo{cfg = #cfg{dead_letter_strategy = ?MODULE}} = State,
+          Effects0) ->
+    %% Dlx worker needs to be started on the leader.
+    %% The cleanest way to determine the Ra state of this node is delegtation to handle_aux.
+    Effects = [{aux, {dlx, setup}} | Effects0],
+    {State, Effects}.
+
+%% switch from at-least-once to some other strategy
+-spec switch_from(rabbit_fifo:state()) ->
+    {rabbit_fifo:state(), ra_machine:effects()}.
+switch_from(#rabbit_fifo{cfg = #cfg{dead_letter_strategy = ?MODULE},
+                         dlx = DlxState} = State0) ->
+    ensure_worker_terminated(DlxState),
+    ReasonMsgs = messages(DlxState),
+    Len = length(ReasonMsgs),
+    rabbit_log:debug("Deleting ~b dead-lettered messages", [Len]),
+    {_, Msgs} = lists:unzip(ReasonMsgs),
+    State1 = rabbit_fifo:delete_indexes(Msgs, State0),
+    State2 = rabbit_fifo:subtract_in_memory(Msgs, State1),
+    Total = rabbit_fifo:query_messages_total(State0),
+    State3 = State2#rabbit_fifo{messages_total = Total - Len},
+    {State3, []}.
+
+%% Returns messages in the order they got discarded originally.
+%% TODO No need to sort anymore since they won't be at-most-once dead-lettered anymore
+%% and no need to return reasons.
+messages(#?MODULE{consumer = Consumer, discards = Discards}) ->
+    CheckedReasonMsgs = case Consumer of
+                            #dlx_consumer{checked_out = Checked} when is_map(Checked) ->
+                                L0 = maps:to_list(Checked),
+                                L1 = lists:keysort(1, L0),
+                                {_, L2} = lists:unzip(L1),
+                                L2;
+                            _ ->
+                                []
+                        end,
+    DiscardReasonMsgs = lqueue:to_list(Discards),
+    CheckedReasonMsgs ++ DiscardReasonMsgs.
+
+-spec purge(rabbit_fifo:state()) ->
+    {rabbit_fifo:state(), [msg()]}.
+purge(#rabbit_fifo{dlx = #?MODULE{consumer = Con0,
+                                  discards = Discards} = DlxState0} = State0) ->
+    {Con, CheckedMsgs} = case Con0 of
+                             #dlx_consumer{checked_out = Checked} when is_map(Checked) ->
+                                 L = maps:to_list(Checked),
+                                 {_, CheckedReasonMsgs} = lists:unzip(L),
+                                 {_, Msgs} = lists:unzip(CheckedReasonMsgs),
+                                 C = Con0#dlx_consumer{checked_out = #{}},
+                                 {C, Msgs};
+                             _ ->
+                                 {Con0, []}
+                         end,
+    DiscardReasonMsgs = lqueue:to_list(Discards),
+    {_, DiscardMsgs} = lists:unzip(DiscardReasonMsgs),
+    PurgedMsgs = CheckedMsgs ++ DiscardMsgs,
+    DlxState = DlxState0#?MODULE{consumer = Con,
+                                 discards = lqueue:new(),
+                                 msg_bytes = 0,
+                                 msg_bytes_checkout = 0
+                                },
+    State = set(State0, DlxState),
+    {State, PurgedMsgs}.
+
+%% TODO Consider alternative to not dehydrate at all
+%% by putting messages to disk before enqueueing them in discards queue.
+-spec dehydrate(rabbit_fifo:state()) ->
+    rabbit_fifo:state().
+dehydrate(#rabbit_fifo{dlx = #?MODULE{discards = Discards,
+                                      consumer = Con} = DlxState} = State) ->
+    set(State, DlxState#?MODULE{discards = dehydrate_messages(Discards),
+                                consumer = dehydrate_consumer(Con)}).
+
+dehydrate_messages(Discards) ->
+    L0 = lqueue:to_list(Discards),
+    L1 = lists:map(fun({_Reason, Msg}) ->
+                           {?NIL, rabbit_fifo:dehydrate_message(Msg)}
+                   end, L0),
+    lqueue:from_list(L1).
+
+dehydrate_consumer(#dlx_consumer{checked_out = Checked0} = Con) ->
+    Checked = maps:map(fun (_, {_, Msg}) ->
+                               {?NIL, rabbit_fifo:dehydrate_message(Msg)}
+                       end, Checked0),
+    Con#dlx_consumer{checked_out = Checked};
+dehydrate_consumer(undefined) ->
+    undefined.
+
+-spec normalize(rabbit_fifo:state()) ->
+    rabbit_fifo:state().
+normalize(#rabbit_fifo{dlx = #?MODULE{discards = Discards} = DlxState} = State) ->
+    set(State, DlxState#?MODULE{discards = lqueue:from_list(lqueue:to_list(Discards))}).
+
+set(State, #?MODULE{} = DlxState) ->
+    State#rabbit_fifo{dlx = DlxState}.

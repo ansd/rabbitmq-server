@@ -1,8 +1,9 @@
 -module(rabbit_fifo_dlx_integration_SUITE).
 
-%% Integration tests for at-least-once dead-lettering comprising mainly
-%% rabbit_fifo_dlx, rabbit_fifo_dlx_worker, rabbit_fifo_dlx_client
-%% rabbit_quorum_queue, rabbit_fifo.
+%% Integration tests for at-least-once dead-lettering comprising
+%% rabbit_quorum_queue, rabbit_fifo, rabbit_fifo_dlx_strategy,
+%% rabbit_fifo_dlx_strategy_at_least_once, rabbit_fifo_dlx_worker
+%% rabbit_fifo_dlx_client
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").

@@ -39,7 +39,7 @@
           content :: rabbit_types:decoded_content(),
           %% TODO Reason is already stored in first x-death header of #content.properties.#'P_basic'.headers
           %% So, we could remove this convenience field and lookup the 1st header when redelivering.
-          reason :: rabbit_fifo_dlx:reason(),
+          reason :: rabbit_fifo_dlx_strategy_at_least_once:reason(),
           %%
           %%TODO instead of using 'unsettled' and 'settled' fields, use rabbit_confirms because it handles many to one logic
           %% in a generic way. Its API might need to be modified though if it is targeted only towards channel.
@@ -201,8 +201,12 @@ code_change(_OldVsn, State, _Extra) ->
 
 lookup_topology(#state{queue_ref = {resource, Vhost, queue, _} = QRef} = State) ->
     {ok, Q} = rabbit_amqqueue:lookup(QRef),
-    DLRKey = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-routing-key">>, fun(_Pol, QArg) -> QArg end, Q),
-    DLX = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-exchange">>, fun(_Pol, QArg) -> QArg end, Q),
+    DLRKey = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-routing-key">>,
+                                                       fun(_Pol, QArg) -> QArg end,
+                                                       Q),
+    DLX = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-exchange">>,
+                                                    fun(_Pol, QArg) -> QArg end,
+                                                    Q),
     DLXRef = rabbit_misc:r(Vhost, exchange, DLX),
     State#state{exchange_ref = DLXRef,
                 routing_key = DLRKey}.

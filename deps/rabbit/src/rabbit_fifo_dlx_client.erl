@@ -1,4 +1,5 @@
 -module(rabbit_fifo_dlx_client).
+%%TODO rename to rabbit_fifo_dlx_strategy_at_least_once_client?
 
 -export([checkout/3, settle/2, handle_ra_event/3,
          overview/1]).
@@ -13,12 +14,12 @@
 
 settle(MsgIds, #state{leader = Leader} = State)
   when is_list(MsgIds) ->
-    Cmd = rabbit_fifo_dlx:make_settle(MsgIds),
+    Cmd = rabbit_fifo_dlx_strategy_at_least_once:make_settle(MsgIds),
     ra:pipeline_command(Leader, Cmd),
     {ok, State}.
 
 checkout(QResource, Leader, NumUnsettled) ->
-    Cmd = rabbit_fifo_dlx:make_checkout(self(), NumUnsettled),
+    Cmd = rabbit_fifo_dlx_strategy_at_least_once:make_checkout(self(), NumUnsettled),
     State = #state{queue_resource = QResource,
                    leader = Leader,
                    last_msg_id = -1},

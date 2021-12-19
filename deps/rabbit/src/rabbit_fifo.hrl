@@ -125,6 +125,10 @@
 
 -type consumer_strategy() :: competing | single_active.
 
+-type dead_letter_strategy() :: rabbit_fifo_dlx_strategy_none |
+                                rabbit_fifo_dlx_strategy_at_most_once |
+                                rabbit_fifo_dlx_strategy_at_least_once.
+
 -type milliseconds() :: non_neg_integer().
 
 -record(enqueuer,
@@ -144,7 +148,7 @@
         {name :: atom(),
          resource :: rabbit_types:r('queue'),
          release_cursor_interval :: option({non_neg_integer(), non_neg_integer()}),
-         dead_letter_handler :: option({at_most_once, applied_mfa()} | at_least_once),
+         dead_letter_strategy :: dead_letter_strategy(),
          become_leader_handler :: option(applied_mfa()),
          overflow_strategy = drop_head :: drop_head | reject_publish,
          max_length :: option(non_neg_integer()),
@@ -214,7 +218,8 @@
          %% TODO Remove this field and store prefix messages in-place. This will
          %% simplify the checkout logic.
          prefix_msgs = {0, [], 0, []} :: prefix_msgs(),
-         dlx = rabbit_fifo_dlx:init() :: rabbit_fifo_dlx:state(),
+         %% state of rabbit_fifo.cfg.dead_letter_strategy
+         dlx :: term(),
          msg_bytes_enqueue = 0 :: non_neg_integer(),
          msg_bytes_checkout = 0 :: non_neg_integer(),
          %% waiting consumers, one is picked active consumer is cancelled or dies
@@ -229,7 +234,7 @@
 
 -type config() :: #{name := atom(),
                     queue_resource := rabbit_types:r('queue'),
-                    dead_letter_handler => option({at_most_once, applied_mfa()} | at_least_once),
+                    dead_letter_strategy => dead_letter_strategy(),
                     become_leader_handler => applied_mfa(),
                     release_cursor_interval => non_neg_integer(),
                     max_length => non_neg_integer(),
