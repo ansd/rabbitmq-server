@@ -144,10 +144,11 @@
 -spec init(config()) -> state().
 init(#{name := Name,
        queue_resource := Resource} = Conf) ->
-    update_config(Conf, #?MODULE{cfg = #cfg{name = Name,
-                                            resource = Resource}}).
+    update_config(Conf, #?MODULE{rare = #rare{cfg = #cfg{name = Name,
+                                                         resource = Resource}}}).
 
-update_config(Conf, State) ->
+
+update_config(Conf, #?MODULE{rare = #rare{cfg = Cfg} = Rare} = State) ->
     DLH = maps:get(dead_letter_handler, Conf, undefined),
     BLH = maps:get(become_leader_handler, Conf, undefined),
     RCI = maps:get(release_cursor_interval, Conf, ?RELEASE_CURSOR_EVERY),
@@ -165,24 +166,23 @@ update_config(Conf, State) ->
                            false ->
                                competing
                        end,
-    Cfg = State#?MODULE.cfg,
     RCISpec = {RCI, RCI},
 
     LastActive = maps:get(created, Conf, undefined),
     MaxMemoryBytes = maps:get(max_in_memory_bytes, Conf, undefined),
-    State#?MODULE{cfg = Cfg#cfg{release_cursor_interval = RCISpec,
-                                dead_letter_handler = DLH,
-                                become_leader_handler = BLH,
-                                overflow_strategy = Overflow,
-                                max_length = MaxLength,
-                                max_bytes = MaxBytes,
-                                max_in_memory_length = MaxMemoryLength,
-                                max_in_memory_bytes = MaxMemoryBytes,
-                                consumer_strategy = ConsumerStrategy,
-                                delivery_limit = DeliveryLimit,
-                                expires = Expires,
-                                msg_ttl = MsgTTL},
-                  last_active = LastActive}.
+    State#?MODULE{rare = Rare#rare{cfg = Cfg#cfg{release_cursor_interval = RCISpec,
+                                                 dead_letter_handler = DLH,
+                                                 become_leader_handler = BLH,
+                                                 overflow_strategy = Overflow,
+                                                 max_length = MaxLength,
+                                                 max_bytes = MaxBytes,
+                                                 max_in_memory_length = MaxMemoryLength,
+                                                 max_in_memory_bytes = MaxMemoryBytes,
+                                                 consumer_strategy = ConsumerStrategy,
+                                                 delivery_limit = DeliveryLimit,
+                                                 expires = Expires,
+                                                 msg_ttl = MsgTTL},
+                                   last_active = LastActive}}.
 
 zero(_) ->
     0.
@@ -197,7 +197,7 @@ apply(Meta, #enqueue{pid = From, seq = Seq,
     apply_enqueue(Meta, From, Seq, RawMsg, State00);
 apply(_Meta, #register_enqueuer{pid = Pid},
       #?MODULE{enqueuers = Enqueuers0,
-               cfg = #cfg{overflow_strategy = Overflow}} = State0) ->
+               rare = #rare{cfg = #cfg{overflow_strategy = Overflow}}} = State0) ->
 
     State = case maps:is_key(Pid, Enqueuers0) of
                 true ->
@@ -227,7 +227,7 @@ apply(Meta,
 apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
       #?MODULE{consumers = Cons,
                dlx = DlxState0,
-               cfg = #cfg{dead_letter_handler = DLH}} = State0) ->
+               rare = #rare{cfg = #cfg{dead_letter_handler = DLH}}} = State0) ->
     case Cons of
         #{ConsumerId := #consumer{checked_out = Checked} = Con} ->
             % Publishing to dead-letter exchange must maintain same order as messages got rejected.
@@ -304,7 +304,8 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
                     drain = Drain, consumer_id = ConsumerId},
       #?MODULE{consumers = Cons0,
                service_queue = ServiceQueue0,
-               waiting_consumers = Waiting0} = State0) ->
+               rare = #rare{
+                         waiting_consumers = Waiting0} = Rare} = State0) ->
     case Cons0 of
         #{ConsumerId := #consumer{delivery_count = DelCnt} = Con0} ->
             %% this can go below 0 when credit is reduced
@@ -350,8 +351,8 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
                     %% grant the credit
                     C = max(0, RemoteDelCnt + NewCredit - DelCnt),
                     Con = Con0#consumer{credit = C},
-                    State = State0#?MODULE{waiting_consumers =
-                                           [{ConsumerId, Con} | Waiting]},
+                    State = State0#?MODULE{rare = Rare#rare{waiting_consumers =
+                                                             [{ConsumerId, Con} | Waiting]}},
                     {State, {send_credit_reply, messages_ready(State)}};
                 false ->
                     {State0, ok}
@@ -361,16 +362,17 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
             {State0, ok}
     end;
 apply(_, #checkout{spec = {dequeue, _}},
-      #?MODULE{cfg = #cfg{consumer_strategy = single_active}} = State0) ->
+      #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = single_active}}} = State0) ->
     {State0, {error, {unsupported, single_active_consumer}}};
 apply(#{index := Index,
         system_time := Ts,
         from := From} = Meta, #checkout{spec = {dequeue, Settlement},
                                         meta = ConsumerMeta,
                                         consumer_id = ConsumerId},
-      #?MODULE{consumers = Consumers} = State00) ->
+      #?MODULE{consumers = Consumers,
+               rare = Rare} = State00) ->
     %% dequeue always updates last_active
-    State0 = State00#?MODULE{last_active = Ts},
+    State0 = State00#?MODULE{rare = Rare#rare{last_active = Ts}},
     %% all dequeue operations result in keeping the queue from expiring
     Exists = maps:is_key(ConsumerId, Consumers),
     case messages_ready(State0) of
@@ -429,10 +431,10 @@ apply(Meta, #checkout{spec = Spec, meta = ConsumerMeta,
     checkout(Meta, State0, State1, [{monitor, process, Pid}]);
 apply(#{index := Index}, #purge{},
       #?MODULE{messages_total = Tot,
-               returns = Returns,
                messages = Messages,
                ra_indexes = Indexes0,
-               dlx = DlxState} = State0) ->
+               dlx = DlxState,
+               rare = #rare{returns = Returns} = Rare} = State0) ->
     NumReady = messages_ready(State0),
     Indexes1 = lists:foldl(fun (?INDEX_MSG(I, ?MSG(_, _)), Acc0) when is_integer(I) ->
                                    rabbit_fifo_index:delete(I, Acc0);
@@ -449,11 +451,11 @@ apply(#{index := Index}, #purge{},
                             dlx = rabbit_fifo_dlx:purge(DlxState),
                             messages = lqueue:new(),
                             messages_total = Tot - NumReady,
-                            returns = lqueue:new(),
                             msg_bytes_enqueue = 0,
-                            prefix_msgs = {0, [], 0, []},
-                            msg_bytes_in_memory = 0,
-                            msgs_ready_in_memory = 0},
+                            rare = Rare#rare{returns = lqueue:new(),
+                                             prefix_msgs = {0, [], 0, []},
+                                             msg_bytes_in_memory = 0,
+                                             msgs_ready_in_memory = 0}},
     Effects0 = [garbage_collection],
     Reply = {purge, NumReady + NumDlx},
     {State, _, Effects} = evaluate_limit(Index, false, State0,
@@ -466,9 +468,10 @@ apply(#{system_time := Ts} = Meta, {timeout, expire_msgs}, State0) ->
     checkout(Meta, State, State, Effects, false);
 apply(#{system_time := Ts} = Meta, {down, Pid, noconnection},
       #?MODULE{consumers = Cons0,
-               cfg = #cfg{consumer_strategy = single_active},
-               waiting_consumers = Waiting0,
-               enqueuers = Enqs0} = State0) ->
+               enqueuers = Enqs0,
+               rare = #rare{cfg = #cfg{consumer_strategy = single_active},
+                            waiting_consumers = Waiting0
+                           } = Rare} = State0) ->
     Node = node(Pid),
     %% if the pid refers to an active or cancelled consumer,
     %% mark it as suspected and return it to the waiting queue
@@ -481,8 +484,8 @@ apply(#{system_time := Ts} = Meta, {down, Pid, noconnection},
                                    S0, Cid, C0, false, suspected_down, E0),
                           Checked = C0#consumer.checked_out,
                           Credit = increase_credit(C0, maps:size(Checked)),
-                          {St, Effs1} = return_all(Meta, S0, Effs,
-                                                   Cid, C0#consumer{credit = Credit}),
+                          {#?MODULE{rare = R} = St, Effs1} = return_all(Meta, S0, Effs, Cid,
+                                                                        C0#consumer{credit = Credit}),
                           %% if the consumer was cancelled there is a chance it got
                           %% removed when returning hence we need to be defensive here
                           Waiting = case St#?MODULE.consumers of
@@ -492,8 +495,9 @@ apply(#{system_time := Ts} = Meta, {down, Pid, noconnection},
                                             Waiting0
                                     end,
                           {St#?MODULE{consumers = maps:remove(Cid, St#?MODULE.consumers),
-                                      waiting_consumers = Waiting,
-                                      last_active = Ts},
+                                      rare = R#rare{
+                                               waiting_consumers = Waiting,
+                                               last_active = Ts}},
                            Effs1};
                      (_, _, S) ->
                           S
@@ -502,7 +506,7 @@ apply(#{system_time := Ts} = Meta, {down, Pid, noconnection},
                                                       suspected_down),
 
     %% select a new consumer from the waiting queue and run a checkout
-    State2 = State1#?MODULE{waiting_consumers = WaitingConsumers},
+    State2 = State1#?MODULE{rare = Rare#rare{waiting_consumers = WaitingConsumers}},
     {State, Effects1} = activate_next_consumer(State2, Effects0),
 
     %% mark any enquers as suspected
@@ -525,21 +529,21 @@ apply(#{system_time := Ts} = Meta, {down, Pid, noconnection},
     %% the one we got the `down' command for
     Node = node(Pid),
 
-    {State, Effects1} =
-        maps:fold(
-          fun({_, P} = Cid, #consumer{checked_out = Checked0,
-                                      status = up} = C0,
-              {St0, Eff}) when node(P) =:= Node ->
-                  Credit = increase_credit(C0, map_size(Checked0)),
-                  C = C0#consumer{status = suspected_down,
-                                  credit = Credit},
-                  {St, Eff0} = return_all(Meta, St0, Eff, Cid, C),
-                  Eff1 = consumer_update_active_effects(St, Cid, C, false,
-                                                        suspected_down, Eff0),
-                  {St, Eff1};
-             (_, _, {St, Eff}) ->
-                  {St, Eff}
-          end, {State0, []}, Cons0),
+    {#?MODULE{rare = Rare} = State, Effects1} =
+    maps:fold(
+      fun({_, P} = Cid, #consumer{checked_out = Checked0,
+                                  status = up} = C0,
+          {St0, Eff}) when node(P) =:= Node ->
+              Credit = increase_credit(C0, map_size(Checked0)),
+              C = C0#consumer{status = suspected_down,
+                              credit = Credit},
+              {St, Eff0} = return_all(Meta, St0, Eff, Cid, C),
+              Eff1 = consumer_update_active_effects(St, Cid, C, false,
+                                                    suspected_down, Eff0),
+              {St, Eff1};
+         (_, _, {St, Eff}) ->
+              {St, Eff}
+      end, {State0, []}, Cons0),
     Enqs = maps:map(fun(P, E) when node(P) =:= Node ->
                             E#enqueuer{status = suspected_down};
                        (_, E) -> E
@@ -556,7 +560,7 @@ apply(#{system_time := Ts} = Meta, {down, Pid, noconnection},
                       [{monitor, node, Node}]
               end ++ Effects1,
     checkout(Meta, State0, State#?MODULE{enqueuers = Enqs,
-                                         last_active = Ts}, Effects);
+                                         rare = Rare#rare{last_active = Ts}}, Effects);
 apply(Meta, {down, Pid, _Info}, State0) ->
     {State, Effects} = handle_down(Meta, Pid, State0),
     checkout(Meta, State0, State, Effects);
@@ -576,7 +580,7 @@ apply(Meta, {nodeup, Node}, #?MODULE{consumers = Cons0,
                      end, Enqs0),
     ConsumerUpdateActiveFun = consumer_active_flag_update_function(State0),
     %% mark all consumers as up
-    {State1, Effects1} =
+    {#?MODULE{rare = Rare} = State1, Effects1} =
         maps:fold(fun({_, P} = ConsumerId, C, {SAcc, EAcc})
                         when (node(P) =:= Node) and
                              (C#consumer.status =/= cancelled) ->
@@ -590,8 +594,8 @@ apply(Meta, {nodeup, Node}, #?MODULE{consumers = Cons0,
                   end, {State0, Monitors}, Cons0),
     Waiting = update_waiting_consumer_status(Node, State1, up),
     State2 = State1#?MODULE{
-                            enqueuers = Enqs1,
-                            waiting_consumers = Waiting},
+                       enqueuers = Enqs1,
+                       rare = Rare#rare{waiting_consumers = Waiting}},
     {State, Effects} = activate_next_consumer(State2, Effects1),
     checkout(Meta, State0, State, Effects);
 apply(_, {nodedown, _Node}, State) ->
@@ -603,8 +607,8 @@ apply(#{index := Idx} = Meta, #purge_nodes{nodes = Nodes}, State0) ->
     update_smallest_raft_index(Idx, ok, State, Effects);
 apply(#{index := Idx} = Meta,
       #update_config{config = #{dead_letter_handler := NewDLH} = Conf},
-      #?MODULE{cfg = #cfg{dead_letter_handler = OldDLH,
-                          resource = QRes},
+      #?MODULE{rare = #rare{cfg = #cfg{dead_letter_handler = OldDLH,
+                                       resource = QRes}},
                dlx = DlxState0} = State0) ->
     {DlxState, Effects0} = rabbit_fifo_dlx:update_config(OldDLH, NewDLH, QRes, DlxState0),
     State1 = update_config(Conf, State0#?MODULE{dlx = DlxState}),
@@ -614,7 +618,7 @@ apply(_Meta, {machine_version, FromVersion, ToVersion}, V0State) ->
     State = convert(FromVersion, ToVersion, V0State),
     {State, ok, [{aux, {dlx, setup}}]};
 apply(#{index := IncomingRaftIdx} = Meta, {dlx, _} = Cmd,
-      #?MODULE{cfg = #cfg{dead_letter_handler = DLH},
+      #?MODULE{rare = #rare{cfg = #cfg{dead_letter_handler = DLH}},
                dlx = DlxState0} = State0) ->
     {DlxState, Effects0} = rabbit_fifo_dlx:apply(Meta, Cmd, DLH, DlxState0),
     State1 = State0#?MODULE{dlx = DlxState},
@@ -695,23 +699,25 @@ convert_v1_to_v2(V1State) ->
               },
 
     #?MODULE{
-        cfg = Cfg,
         messages = MessagesV2,
         messages_total = rabbit_fifo_v1:query_messages_total(V1State),
-        returns = ReturnsV2,
         enqueue_count = rabbit_fifo_v1:get_field(enqueue_count, V1State),
         enqueuers = rabbit_fifo_v1:get_field(enqueuers, V1State),
         ra_indexes = IndexesV1,
-        release_cursors = rabbit_fifo_v1:get_field(release_cursors, V1State),
         consumers = ConsumersV2,
         service_queue = rabbit_fifo_v1:get_field(service_queue, V1State),
-        prefix_msgs = rabbit_fifo_v1:get_field(prefix_msgs, V1State),
         msg_bytes_enqueue = rabbit_fifo_v1:get_field(msg_bytes_enqueue, V1State),
         msg_bytes_checkout = rabbit_fifo_v1:get_field(msg_bytes_checkout, V1State),
-        waiting_consumers = rabbit_fifo_v1:get_field(waiting_consumers, V1State),
-        msg_bytes_in_memory = rabbit_fifo_v1:get_field(msg_bytes_in_memory, V1State),
-        msgs_ready_in_memory = rabbit_fifo_v1:get_field(msgs_ready_in_memory, V1State),
-        last_active = rabbit_fifo_v1:get_field(last_active, V1State)
+        rare = #rare{
+                  cfg = Cfg,
+                  returns = ReturnsV2,
+                  release_cursors = rabbit_fifo_v1:get_field(release_cursors, V1State),
+                  prefix_msgs = rabbit_fifo_v1:get_field(prefix_msgs, V1State),
+                  waiting_consumers = rabbit_fifo_v1:get_field(waiting_consumers, V1State),
+                  msg_bytes_in_memory = rabbit_fifo_v1:get_field(msg_bytes_in_memory, V1State),
+                  msgs_ready_in_memory = rabbit_fifo_v1:get_field(msgs_ready_in_memory, V1State),
+                  last_active = rabbit_fifo_v1:get_field(last_active, V1State)
+                 }
        }.
 
 purge_node(Meta, Node, State, Effects) ->
@@ -734,26 +740,26 @@ handle_down(Meta, Pid, #?MODULE{consumers = Cons0,
                         cancel_consumer(Meta, ConsumerId, S, E, down)
                 end, {State2, Effects1}, DownConsumers).
 
-consumer_active_flag_update_function(#?MODULE{cfg = #cfg{consumer_strategy = competing}}) ->
+consumer_active_flag_update_function(#?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = competing}}}) ->
     fun(State, ConsumerId, Consumer, Active, ActivityStatus, Effects) ->
-        consumer_update_active_effects(State, ConsumerId, Consumer, Active,
-                                       ActivityStatus, Effects)
+            consumer_update_active_effects(State, ConsumerId, Consumer, Active,
+                                           ActivityStatus, Effects)
     end;
-consumer_active_flag_update_function(#?MODULE{cfg = #cfg{consumer_strategy = single_active}}) ->
+consumer_active_flag_update_function(#?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = single_active}}}) ->
     fun(_, _, _, _, _, Effects) ->
         Effects
     end.
 
 handle_waiting_consumer_down(_Pid,
-                             #?MODULE{cfg = #cfg{consumer_strategy = competing}} = State) ->
+                             #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = competing}}} = State) ->
     {[], State};
 handle_waiting_consumer_down(_Pid,
-                             #?MODULE{cfg = #cfg{consumer_strategy = single_active},
-                                      waiting_consumers = []} = State) ->
+                             #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = single_active},
+                                                   waiting_consumers = []}} = State) ->
     {[], State};
 handle_waiting_consumer_down(Pid,
-                             #?MODULE{cfg = #cfg{consumer_strategy = single_active},
-                                      waiting_consumers = WaitingConsumers0} = State0) ->
+                             #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = single_active},
+                                                   waiting_consumers = WaitingConsumers0} = Rare} = State0) ->
     % get cancel effects for down waiting consumers
     Down = lists:filter(fun({{_, P}, _}) -> P =:= Pid end,
                         WaitingConsumers0),
@@ -764,11 +770,11 @@ handle_waiting_consumer_down(Pid,
     % update state to have only up waiting consumers
     StillUp = lists:filter(fun({{_, P}, _}) -> P =/= Pid end,
                            WaitingConsumers0),
-    State = State0#?MODULE{waiting_consumers = StillUp},
+    State = State0#?MODULE{rare = Rare#rare{waiting_consumers = StillUp}},
     {Effects, State}.
 
 update_waiting_consumer_status(Node,
-                               #?MODULE{waiting_consumers = WaitingConsumers},
+                               #?MODULE{rare = #rare{waiting_consumers = WaitingConsumers}},
                                Status) ->
     [begin
          case node(Pid) of
@@ -782,20 +788,21 @@ update_waiting_consumer_status(Node,
 
 -spec state_enter(ra_server:ra_state() | eol, state()) ->
     ra_machine:effects().
-state_enter(RaState, #?MODULE{cfg = #cfg{dead_letter_handler = DLH,
-                                         resource = QRes},
+state_enter(RaState, #?MODULE{rare = #rare{cfg = #cfg{dead_letter_handler = DLH,
+                                                      resource = QRes}},
                               dlx = DlxState} = State) ->
     Effects = rabbit_fifo_dlx:state_enter(RaState, QRes, DLH, DlxState),
     state_enter0(RaState, State, Effects).
 
 state_enter0(leader, #?MODULE{consumers = Cons,
                               enqueuers = Enqs,
-                              waiting_consumers = WaitingConsumers,
-                              cfg = #cfg{name = Name,
-                                         resource = Resource,
-                                         become_leader_handler = BLH},
-                              prefix_msgs = {0, [], 0, []}
-                             } = State,
+                              rare = #rare{
+                                        waiting_consumers = WaitingConsumers,
+                                        cfg = #cfg{name = Name,
+                                                   resource = Resource,
+                                                   become_leader_handler = BLH},
+                                        prefix_msgs = {0, [], 0, []}
+                                       }} = State,
              Effects0) ->
     TimerEffs = timer_effect(erlang:system_time(millisecond), State, Effects0),
     % return effects to monitor all current consumers and enqueuers
@@ -815,7 +822,7 @@ state_enter0(leader, #?MODULE{consumers = Cons,
     end;
 state_enter0(eol, #?MODULE{enqueuers = Enqs,
                            consumers = Custs0,
-                           waiting_consumers = WaitingConsumers0},
+                           rare = #rare{waiting_consumers = WaitingConsumers0}},
              Effects) ->
     Custs = maps:fold(fun({_, P}, V, S) -> S#{P => V} end, #{}, Custs0),
     WaitingConsumers1 = lists:foldl(fun({{_, P}, V}, Acc) -> Acc#{P => V} end,
@@ -825,7 +832,7 @@ state_enter0(eol, #?MODULE{enqueuers = Enqs,
      || P <- maps:keys(maps:merge(Enqs, AllConsumers))] ++
     [{aux, eol},
      {mod_call, rabbit_quorum_queue, file_handle_release_reservation, []} | Effects];
-state_enter0(State, #?MODULE{cfg = #cfg{resource = _Resource}}, Effects)
+state_enter0(State, #?MODULE{rare = #rare{cfg = #cfg{resource = _Resource}}}, Effects)
   when State =/= leader ->
     FHReservation = {mod_call, rabbit_quorum_queue, file_handle_other_reservation, []},
     [FHReservation | Effects];
@@ -834,8 +841,8 @@ state_enter0(_, _, Effects) ->
     Effects.
 
 -spec tick(non_neg_integer(), state()) -> ra_machine:effects().
-tick(Ts, #?MODULE{cfg = #cfg{name = Name,
-                             resource = QName},
+tick(Ts, #?MODULE{rare = #rare{cfg = #cfg{name = Name,
+                                          resource = QName}},
                   msg_bytes_enqueue = EnqueueBytes,
                   msg_bytes_checkout = CheckoutBytes,
                   dlx = DlxState} = State) ->
@@ -857,15 +864,17 @@ tick(Ts, #?MODULE{cfg = #cfg{name = Name,
     end.
 
 -spec overview(state()) -> map().
-overview(#?MODULE{consumers = Cons,
+overview(#?MODULE{rare = #rare{
+                            release_cursors = Cursors,
+                            msgs_ready_in_memory = InMemReady,
+                            msg_bytes_in_memory = InMemBytes,
+                            cfg = Cfg
+                           },
+                  consumers = Cons,
                   enqueuers = Enqs,
-                  release_cursors = Cursors,
                   enqueue_count = EnqCount,
-                  msgs_ready_in_memory = InMemReady,
-                  msg_bytes_in_memory = InMemBytes,
                   msg_bytes_enqueue = EnqueueBytes,
                   msg_bytes_checkout = CheckoutBytes,
-                  cfg = Cfg,
                   dlx = DlxState} = State) ->
     Conf = #{name => Cfg#cfg.name,
              resource => Cfg#cfg.resource,
@@ -953,7 +962,7 @@ handle_aux(follower, _, garbage_collection, Aux, Log, MacState) ->
     {no_reply, force_eval_gc(Log, MacState, Aux), Log};
 handle_aux(leader, cast, {#return{msg_ids = MsgIds,
                                   consumer_id = ConsumerId}, Corr, Pid},
-           Aux0, Log0, #?MODULE{cfg = #cfg{delivery_limit = undefined},
+           Aux0, Log0, #?MODULE{rare = #rare{cfg = #cfg{delivery_limit = undefined}},
                                 consumers = Consumers,
                                 ra_indexes = _Indexes}) ->
     case Consumers of
@@ -1042,12 +1051,12 @@ handle_aux(_RaState, {call, _From}, {peek, Pos}, Aux0,
     end;
 handle_aux(RaState, _, {dlx, _} = Cmd, Aux0, Log,
            #?MODULE{dlx = DlxState,
-                    cfg = #cfg{dead_letter_handler = DLH,
-                               resource = QRes}}) ->
+                    rare =#rare{cfg = #cfg{dead_letter_handler = DLH,
+                                           resource = QRes}}}) ->
     Aux = rabbit_fifo_dlx:handle_aux(RaState, Cmd, Aux0, QRes, DLH, DlxState),
     {no_reply, Aux, Log}.
 
-eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}} = MacState,
+eval_gc(Log, #?MODULE{rare = #rare{cfg = #cfg{resource = QR}}} = MacState,
         #?AUX{gc = #aux_gc{last_raft_idx = LastGcIdx} = Gc} = AuxState) ->
     {Idx, _} = ra_log:last_index_term(Log),
     {memory, Mem} = erlang:process_info(self(), memory),
@@ -1064,7 +1073,7 @@ eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}} = MacState,
             AuxState
     end.
 
-force_eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}},
+force_eval_gc(Log, #?MODULE{rare = #rare{cfg = #cfg{resource = QR}}},
               #?AUX{gc = #aux_gc{last_raft_idx = LastGcIdx} = Gc} = AuxState) ->
     {Idx, _} = ra_log:last_index_term(Log),
     {memory, Mem} = erlang:process_info(self(), memory),
@@ -1102,15 +1111,16 @@ query_ra_indexes(#?MODULE{ra_indexes = RaIndexes}) ->
     RaIndexes.
 
 query_consumer_count(#?MODULE{consumers = Consumers,
-                              waiting_consumers = WaitingConsumers}) ->
+                              rare = #rare{waiting_consumers = WaitingConsumers}}) ->
     Up = maps:filter(fun(_ConsumerId, #consumer{status = Status}) ->
                              Status =/= suspected_down
                      end, Consumers),
     maps:size(Up) + length(WaitingConsumers).
 
 query_consumers(#?MODULE{consumers = Consumers,
-                         waiting_consumers = WaitingConsumers,
-                         cfg = #cfg{consumer_strategy = ConsumerStrategy}} = State) ->
+                         rare = #rare{
+                                   waiting_consumers = WaitingConsumers,
+                                   cfg = #cfg{consumer_strategy = ConsumerStrategy}}} = State) ->
     ActiveActivityStatusFun =
         case ConsumerStrategy of
             competing ->
@@ -1169,7 +1179,7 @@ query_consumers(#?MODULE{consumers = Consumers,
     maps:merge(FromConsumers, FromWaitingConsumers).
 
 
-query_single_active_consumer(#?MODULE{cfg = #cfg{consumer_strategy = single_active},
+query_single_active_consumer(#?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = single_active}},
                                       consumers = Consumers}) ->
     case maps:size(Consumers) of
         0 ->
@@ -1186,8 +1196,8 @@ query_single_active_consumer(_) ->
 query_stat(#?MODULE{consumers = Consumers} = State) ->
     {messages_ready(State), maps:size(Consumers)}.
 
-query_in_memory_usage(#?MODULE{msg_bytes_in_memory = Bytes,
-                               msgs_ready_in_memory = Length}) ->
+query_in_memory_usage(#?MODULE{rare = #rare{msg_bytes_in_memory = Bytes,
+                                            msgs_ready_in_memory = Length}}) ->
     {Length, Bytes}.
 
 query_stat_dlx(#?MODULE{dlx = DlxState}) ->
@@ -1231,14 +1241,13 @@ usage(Name) when is_atom(Name) ->
 %%% Internal
 
 messages_ready(#?MODULE{messages = M,
-                        prefix_msgs = {RCnt, _R, PCnt, _P},
-                        returns = R}) ->
+                        rare = #rare{prefix_msgs = {RCnt, _R, PCnt, _P},
+                                     returns = R}}) ->
     lqueue:len(M) + lqueue:len(R) + RCnt + PCnt.
 
 messages_total(#?MODULE{messages = _M,
                         messages_total = Total,
                         ra_indexes = _Indexes,
-                        prefix_msgs = _,
                         dlx = DlxState}) ->
     % lqueue:len(M) + rabbit_fifo_index:size(Indexes) + RCnt + PCnt.
     {DlxTotal, _} = rabbit_fifo_dlx:stat(DlxState),
@@ -1287,19 +1296,20 @@ num_checked_out(#?MODULE{consumers = Cons}) ->
               end, 0, Cons).
 
 cancel_consumer(Meta, ConsumerId,
-                #?MODULE{cfg = #cfg{consumer_strategy = competing}} = State,
+                #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = competing}}} = State,
                 Effects, Reason) ->
     cancel_consumer0(Meta, ConsumerId, State, Effects, Reason);
 cancel_consumer(Meta, ConsumerId,
-                #?MODULE{cfg = #cfg{consumer_strategy = single_active},
-                         waiting_consumers = []} = State,
+                #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = single_active},
+                                      waiting_consumers = []}} = State,
                 Effects, Reason) ->
     %% single active consumer on, no consumers are waiting
     cancel_consumer0(Meta, ConsumerId, State, Effects, Reason);
 cancel_consumer(Meta, ConsumerId,
                 #?MODULE{consumers = Cons0,
-                         cfg = #cfg{consumer_strategy = single_active},
-                         waiting_consumers = Waiting0} = State0,
+                         rare = #rare{
+                                   cfg = #cfg{consumer_strategy = single_active},
+                                   waiting_consumers = Waiting0} = Rare} = State0,
                Effects0, Reason) ->
     %% single active consumer on, consumers are waiting
     case maps:is_key(ConsumerId, Cons0) of
@@ -1315,10 +1325,10 @@ cancel_consumer(Meta, ConsumerId,
             Effects = cancel_consumer_effects(ConsumerId, State0, Effects0),
             % A waiting consumer isn't supposed to have any checked out messages,
             % so nothing special to do here
-            {State0#?MODULE{waiting_consumers = Waiting}, Effects}
+            {State0#?MODULE{rare = Rare#rare{waiting_consumers = Waiting}}, Effects}
     end.
 
-consumer_update_active_effects(#?MODULE{cfg = #cfg{resource = QName}},
+consumer_update_active_effects(#?MODULE{rare = #rare{cfg = #cfg{resource = QName}}},
                                ConsumerId, #consumer{meta = Meta},
                                Active, ActivityStatus,
                                Effects) ->
@@ -1354,7 +1364,7 @@ cancel_consumer0(Meta, ConsumerId,
     end.
 
 activate_next_consumer(#?MODULE{consumers = Cons,
-                                waiting_consumers = Waiting0} = State0,
+                                rare = #rare{waiting_consumers = Waiting0} = Rare} = State0,
                        Effects0) ->
     case maps:filter(fun (_, #consumer{status = S}) -> S == up end, Cons) of
         Up when map_size(Up) == 0 ->
@@ -1371,7 +1381,7 @@ activate_next_consumer(#?MODULE{consumers = Cons,
                                                          ServiceQueue),
                     State = State0#?MODULE{consumers = Cons#{NextConsumerId => NextConsumer},
                                            service_queue = ServiceQueue1,
-                                           waiting_consumers = Remaining},
+                                           rare = Rare#rare{waiting_consumers = Remaining}},
                     Effects = consumer_update_active_effects(State, NextConsumerId,
                                                              NextConsumer, true,
                                                              single_active, Effects0),
@@ -1394,9 +1404,9 @@ maybe_return_all(#{system_time := Ts} = Meta, ConsumerId, Consumer, S0, Effects0
                                                     status = cancelled},
                                   S0), Effects0};
         down ->
-            {S1, Effects1} = return_all(Meta, S0, Effects0, ConsumerId, Consumer),
+            {#?MODULE{rare = Rare} = S1, Effects1} = return_all(Meta, S0, Effects0, ConsumerId, Consumer),
             {S1#?MODULE{consumers = maps:remove(ConsumerId, S1#?MODULE.consumers),
-                        last_active = Ts},
+                        rare = Rare#rare{last_active = Ts}},
              Effects1}
     end.
 
@@ -1432,7 +1442,7 @@ drop_head(#?MODULE{ra_indexes = Indexes0} = State0, Effects) ->
             Indexes = rabbit_fifo_index:delete(Idx, Indexes0),
             State2 = State1#?MODULE{ra_indexes = Indexes},
             State3 = decr_total(add_bytes_drop(Header, State2)),
-            #?MODULE{cfg = #cfg{dead_letter_handler = DLH},
+            #?MODULE{rare = #rare{cfg = #cfg{dead_letter_handler = DLH}},
                      dlx = DlxState} = State = case Msg of
                                                    ?DISK_MSG(_) -> State3;
                                                    _ ->
@@ -1464,15 +1474,15 @@ enqueue(RaftIdx, Ts, RawMsg, #?MODULE{messages = Messages} = State0) ->
 
 maybe_set_msg_ttl(#basic_message{content = #content{properties = none}},
                   _, Header,
-                  #?MODULE{cfg = #cfg{msg_ttl = undefined}}) ->
+                  #?MODULE{rare = #rare{cfg = #cfg{msg_ttl = undefined}}}) ->
     Header;
 maybe_set_msg_ttl(#basic_message{content = #content{properties = none}},
                   RaCmdTs, Header,
-                  #?MODULE{cfg = #cfg{msg_ttl = PerQueueMsgTTL}}) ->
+                  #?MODULE{rare = #rare{cfg = #cfg{msg_ttl = PerQueueMsgTTL}}}) ->
     update_expiry_header(RaCmdTs, PerQueueMsgTTL, Header);
 maybe_set_msg_ttl(#basic_message{content = #content{properties = Props}},
                   RaCmdTs, Header,
-                  #?MODULE{cfg = #cfg{msg_ttl = PerQueueMsgTTL}}) ->
+                  #?MODULE{rare = #rare{cfg = #cfg{msg_ttl = PerQueueMsgTTL}}}) ->
     %% rabbit_quorum_queue will leave the properties decoded if and only if
     %% per message message TTL is set.
     %% We already check in the channel that expiration must be valid.
@@ -1480,7 +1490,7 @@ maybe_set_msg_ttl(#basic_message{content = #content{properties = Props}},
     TTL = min(PerMsgMsgTTL, PerQueueMsgTTL),
     update_expiry_header(RaCmdTs, TTL, Header);
 maybe_set_msg_ttl(_, _, Header,
-                  #?MODULE{cfg = #cfg{}}) ->
+                  #?MODULE{rare = #rare{cfg = #cfg{}}}) ->
     Header.
 
 update_expiry_header(_, undefined, Header) ->
@@ -1499,8 +1509,8 @@ update_expiry_header(ExpiryTs, Header) ->
     update_header(expiry, fun(Ts) -> Ts end, ExpiryTs, Header).
 
 incr_enqueue_count(#?MODULE{enqueue_count = EC,
-                            cfg = #cfg{release_cursor_interval = {_Base, C}}
-                            } = State0) when EC >= C ->
+                            rare = #rare{cfg = #cfg{release_cursor_interval = {_Base, C}}}
+                           } = State0) when EC >= C ->
     %% this will trigger a dehydrated version of the state to be stored
     %% at this raft index for potential future snapshot generation
     %% Q: Why don't we just stash the release cursor here?
@@ -1511,12 +1521,12 @@ incr_enqueue_count(#?MODULE{enqueue_count = C} = State) ->
     State#?MODULE{enqueue_count = C + 1}.
 
 maybe_store_dehydrated_state(RaftIdx,
-                             #?MODULE{cfg =
-                                      #cfg{release_cursor_interval = {Base, _}}
-                                      = Cfg,
-                                      ra_indexes = _Indexes,
+                             #?MODULE{ra_indexes = _Indexes,
                                       enqueue_count = 0,
-                                      release_cursors = Cursors0} = State0) ->
+                                      rare = #rare{cfg =
+                                                   #cfg{release_cursor_interval = {Base, _}}
+                                                   = Cfg,
+                                                   release_cursors = Cursors0} = Rare0} = State0) ->
     case messages_total(State0) of
         0 ->
             %% message must have been immediately dropped
@@ -1527,12 +1537,13 @@ maybe_store_dehydrated_state(RaftIdx,
                            _ ->
                                min(max(Total, Base), ?RELEASE_CURSOR_EVERY_MAX)
                        end,
-            State = State0#?MODULE{cfg = Cfg#cfg{release_cursor_interval =
-                                                 {Base, Interval}}},
+            #?MODULE{rare = Rare} = State =
+            State0#?MODULE{rare = Rare0#rare{cfg = Cfg#cfg{release_cursor_interval =
+                                                           {Base, Interval}}}},
             Dehydrated = dehydrate_state(State),
             Cursor = {release_cursor, RaftIdx, Dehydrated},
             Cursors = lqueue:in(Cursor, Cursors0),
-            State#?MODULE{release_cursors = Cursors}
+            State#?MODULE{rare = Rare#rare{release_cursors = Cursors}}
     end;
 maybe_store_dehydrated_state(_RaftIdx, State) ->
     State.
@@ -1631,7 +1642,7 @@ complete_and_checkout(#{index := IncomingRaftIdx} = Meta, MsgIds, ConsumerId,
     update_smallest_raft_index(IncomingRaftIdx, State, Effects).
 
 cancel_consumer_effects(ConsumerId,
-                        #?MODULE{cfg = #cfg{resource = QName}} = State, Effects) ->
+                        #?MODULE{rare = #rare{cfg = #cfg{resource = QName}}} = State, Effects) ->
     [{mod_call, rabbit_quorum_queue,
       cancel_consumer_handler, [QName, ConsumerId]},
      notify_decorators_effect(State) | Effects].
@@ -1640,8 +1651,8 @@ update_smallest_raft_index(Idx, State, Effects) ->
     update_smallest_raft_index(Idx, ok, State, Effects).
 
 update_smallest_raft_index(IncomingRaftIdx, Reply,
-                           #?MODULE{cfg = Cfg,
-                                    release_cursors = Cursors0} = State0,
+                           #?MODULE{rare = #rare{cfg = Cfg,
+                                                 release_cursors = Cursors0} = Rare} = State0,
                            Effects) ->
     Total = messages_total(State0),
     %% TODO: optimise
@@ -1653,9 +1664,9 @@ update_smallest_raft_index(IncomingRaftIdx, Reply,
             %% reset the release cursor interval
             #cfg{release_cursor_interval = {Base, _}} = Cfg,
             RCI = {Base, Base},
-            State = State0#?MODULE{cfg = Cfg#cfg{release_cursor_interval = RCI},
-                                   release_cursors = lqueue:new(),
-                                   enqueue_count = 0},
+            State = State0#?MODULE{enqueue_count = 0,
+                                   rare = Rare#rare{cfg = Cfg#cfg{release_cursor_interval = RCI},
+                                                    release_cursors = lqueue:new()}},
             {State, Reply, Effects ++ [{release_cursor, IncomingRaftIdx, State}]};
         undefined ->
             {State0, Reply, Effects};
@@ -1666,7 +1677,7 @@ update_smallest_raft_index(IncomingRaftIdx, Reply,
                 {Cursor, Cursors} ->
                     %% we can emit a release cursor when we've passed the smallest
                     %% release cursor available.
-                    {State0#?MODULE{release_cursors = Cursors}, Reply,
+                    {State0#?MODULE{rare = Rare#rare{release_cursors = Cursors}}, Reply,
                      Effects ++ [Cursor]}
             end
     end.
@@ -1721,11 +1732,10 @@ get_header(Key, Header) when is_map(Header) ->
     maps:get(Key, Header, undefined).
 
 return_one(Meta, MsgId, Msg0,
-           #?MODULE{returns = Returns,
-                    consumers = Consumers,
+           #?MODULE{consumers = Consumers,
                     dlx = DlxState0,
-                    cfg = #cfg{delivery_limit = DeliveryLimit,
-                               dead_letter_handler = DLH}} = State0,
+                    rare = #rare{cfg = #cfg{delivery_limit = DeliveryLimit,
+                                            dead_letter_handler = DLH}}} = State0,
            Effects0, ConsumerId) ->
     #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
     Msg = update_msg_header(delivery_count, fun incr/1, 1, Msg0),
@@ -1740,21 +1750,22 @@ return_one(Meta, MsgId, Msg0,
         _ ->
             Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
 
-            {RtnMsg, State1} = case is_disk_msg(Msg) of
-                                   true ->
-                                       {Msg, State0};
-                                   false ->
-                                       case evaluate_memory_limit(Header, State0) of
-                                           true ->
-                                               {to_disk_msg(Msg), State0};
-                                           false ->
-                                               {Msg, add_in_memory_counts(Header, State0)}
-                                       end
-                               end,
+            {RtnMsg, #?MODULE{rare = #rare{returns = Returns} = Rare} = State1} =
+            case is_disk_msg(Msg) of
+                true ->
+                    {Msg, State0};
+                false ->
+                    case evaluate_memory_limit(Header, State0) of
+                        true ->
+                            {to_disk_msg(Msg), State0};
+                        false ->
+                            {Msg, add_in_memory_counts(Header, State0)}
+                    end
+            end,
             {add_bytes_return(
                Header,
                State1#?MODULE{consumers = Consumers#{ConsumerId => Con},
-                              returns = lqueue:in(RtnMsg, Returns)}),
+                              rare = Rare#rare{returns = lqueue:in(RtnMsg, Returns)}}),
              Effects0}
     end.
 
@@ -1784,9 +1795,9 @@ checkout(Meta, OldState, State, Effects) ->
     checkout(Meta, OldState, State, Effects, true).
 
 checkout(#{index := Index} = Meta,
-         #?MODULE{cfg = #cfg{resource = QName}} = OldState,
+         #?MODULE{rare = #rare{cfg = #cfg{resource = QName}}} = OldState,
          State0, Effects0, HandleConsumerChanges) ->
-    {#?MODULE{cfg = #cfg{dead_letter_handler = DLH},
+    {#?MODULE{rare = #rare{cfg = #cfg{dead_letter_handler = DLH}},
               dlx = DlxState0} = State1, _Result, Effects1} =
     checkout0(Meta, checkout_one(Meta, State0, Effects0), #{}),
     {DlxState, DlxDeliveryEffects} = rabbit_fifo_dlx:checkout(DLH, DlxState0),
@@ -1849,12 +1860,12 @@ checkout0(_Meta, {Activity, State0, Effects0}, SendAcc) ->
     {State0, ok, lists:reverse(Effects1)}.
 
 evaluate_limit(_Index, Result, _BeforeState,
-               #?MODULE{cfg = #cfg{max_length = undefined,
-                                   max_bytes = undefined}} = State,
+               #?MODULE{rare = #rare{cfg = #cfg{max_length = undefined,
+                                                max_bytes = undefined}}} = State,
                Effects) ->
     {State, Result, Effects};
 evaluate_limit(Index, Result, BeforeState,
-               #?MODULE{cfg = #cfg{overflow_strategy = Strategy},
+               #?MODULE{rare = #rare{cfg = #cfg{overflow_strategy = Strategy}},
                         enqueuers = Enqs0} = State0,
                Effects0) ->
     case is_over_limit(State0) of
@@ -1901,16 +1912,16 @@ evaluate_limit(Index, Result, BeforeState,
     end.
 
 evaluate_memory_limit(_Header,
-                      #?MODULE{cfg = #cfg{max_in_memory_length = undefined,
-                                          max_in_memory_bytes = undefined}}) ->
+                      #?MODULE{rare = #rare{cfg = #cfg{max_in_memory_length = undefined,
+                                                       max_in_memory_bytes = undefined}}}) ->
     false;
 evaluate_memory_limit(#{size := Size}, State) ->
     evaluate_memory_limit(Size, State);
 evaluate_memory_limit(Header,
-                      #?MODULE{cfg = #cfg{max_in_memory_length = MaxLength,
-                                          max_in_memory_bytes = MaxBytes},
-                               msg_bytes_in_memory = Bytes,
-                               msgs_ready_in_memory = Length}) ->
+                      #?MODULE{rare = #rare{cfg = #cfg{max_in_memory_length = MaxLength,
+                                                       max_in_memory_bytes = MaxBytes},
+                                            msg_bytes_in_memory = Bytes,
+                                            msgs_ready_in_memory = Length}}) ->
     Size = get_header(size, Header),
     (Length >= MaxLength) orelse ((Bytes + Size) > MaxBytes).
 
@@ -1932,17 +1943,19 @@ append_delivery_effects(Effects0, AccMap) ->
 %%
 %% When we return it is always done to the current return queue
 %% for both prefix messages and current messages
-take_next_msg(#?MODULE{prefix_msgs = {NumR, [Msg | Rem],
-                                      NumP, P}} = State) ->
+take_next_msg(#?MODULE{rare = #rare{prefix_msgs = {NumR, [Msg | Rem],
+                                                   NumP, P}} = Rare} = State) ->
     %% there are prefix returns, these should be served first
-    {Msg, State#?MODULE{prefix_msgs = {NumR-1, Rem, NumP, P}}};
-take_next_msg(#?MODULE{returns = Returns0,
+    {Msg, State#?MODULE{rare = Rare#rare{prefix_msgs = {NumR-1, Rem, NumP, P}}}};
+take_next_msg(#?MODULE{rare = #rare{
+                                 returns = Returns0,
+                                 prefix_msgs = {NumR, R, NumP, P}} = Rare,
                        messages = Messages0,
-                       ra_indexes = Indexes0,
-                       prefix_msgs = {NumR, R, NumP, P}} = State) ->
+                       ra_indexes = Indexes0
+                      } = State) ->
     case lqueue:out(Returns0) of
         {{value, NextMsg}, Returns} ->
-            {NextMsg, State#?MODULE{returns = Returns}};
+            {NextMsg, State#?MODULE{rare = Rare#rare{returns = Returns}}};
         {empty, _} when P == [] ->
             case lqueue:out(Messages0) of
                 {empty, _} ->
@@ -1956,19 +1969,20 @@ take_next_msg(#?MODULE{returns = Returns0,
         {empty, _} ->
             case P of
                 [?PREFIX_MEM_MSG(_Header) = Msg | Rem] ->
-                    {Msg, State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}};
+                    {Msg, State#?MODULE{rare = Rare#rare{prefix_msgs = {NumR, R, NumP-1, Rem}}}};
                 [?DISK_MSG(_Header) = Msg | Rem] ->
-                    {Msg, State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}}
+                    {Msg, State#?MODULE{rare = Rare#rare{prefix_msgs = {NumR, R, NumP-1, Rem}}}}
             end
     end.
 
-peek_next_msg(#?MODULE{prefix_msgs = {_NumR, [Msg | _],
-                                      _NumP, _P}}) ->
+peek_next_msg(#?MODULE{rare = #rare{prefix_msgs = {_NumR, [Msg | _],
+                                                   _NumP, _P}}}) ->
     %% there are prefix returns, these should be served first
     {value, Msg};
-peek_next_msg(#?MODULE{returns = Returns0,
-                       messages = Messages0,
-                       prefix_msgs = {_NumR, _R, _NumP, P}}) ->
+peek_next_msg(#?MODULE{messages = Messages0,
+                       rare = #rare{
+                                 returns = Returns0,
+                                 prefix_msgs = {_NumR, _R, _NumP, P}}}) ->
     case lqueue:peek(Returns0) of
         {value, _} = Msg ->
             Msg;
@@ -2103,7 +2117,7 @@ expire_msgs(RaCmdTs, State, Effects) ->
 
 expire(RaCmdTs, Header, State0, Effects) ->
     {Msg, State1} = take_next_msg(State0),
-    #?MODULE{cfg = #cfg{dead_letter_handler = DLH},
+    #?MODULE{rare = #rare{cfg = #cfg{dead_letter_handler = DLH}},
              dlx = DlxState0,
              ra_indexes = Indexes0} = State2 = add_bytes_drop(Header, State1),
     {DlxState, DlxEffects} = rabbit_fifo_dlx:discard([Msg], expired, DLH, DlxState0),
@@ -2153,12 +2167,13 @@ update_or_remove_sub(#{system_time := Ts},
                      ConsumerId, #consumer{lifetime = once,
                                            checked_out = Checked,
                                            credit = 0} = Con,
-                     #?MODULE{consumers = Cons} = State) ->
+                     #?MODULE{consumers = Cons,
+                              rare = Rare} = State) ->
     case maps:size(Checked) of
         0 ->
             % we're done with this consumer
             State#?MODULE{consumers = maps:remove(ConsumerId, Cons),
-                          last_active = Ts};
+                          rare = Rare#rare{last_active = Ts}};
         _ ->
             % there are unsettled items so need to keep around
             State#?MODULE{consumers = maps:put(ConsumerId, Con, Cons)}
@@ -2180,27 +2195,27 @@ uniq_queue_in(Key, #consumer{priority = P}, Queue) ->
     end.
 
 update_consumer(ConsumerId, Meta, Spec, Priority,
-                #?MODULE{cfg = #cfg{consumer_strategy = competing}} = State0) ->
+                #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = competing}}} = State0) ->
     %% general case, single active consumer off
     update_consumer0(ConsumerId, Meta, Spec, Priority, State0);
 update_consumer(ConsumerId, Meta, Spec, Priority,
                 #?MODULE{consumers = Cons0,
-                         cfg = #cfg{consumer_strategy = single_active}} = State0)
+                         rare = #rare{cfg = #cfg{consumer_strategy = single_active}}} = State0)
   when map_size(Cons0) == 0 orelse
        is_map_key(ConsumerId, Cons0) ->
     %% single active consumer on, no one is consuming yet or
     %% the currently active consumer is the same
     update_consumer0(ConsumerId, Meta, Spec, Priority, State0);
 update_consumer(ConsumerId, Meta, {Life, Credit, Mode}, Priority,
-                #?MODULE{cfg = #cfg{consumer_strategy = single_active},
-                         waiting_consumers = WaitingConsumers0} = State0) ->
+                #?MODULE{rare = #rare{cfg = #cfg{consumer_strategy = single_active},
+                                      waiting_consumers = WaitingConsumers0} = Rare} = State0) ->
     %% single active consumer on and one active consumer already
     %% adding the new consumer to the waiting list
     Consumer = #consumer{lifetime = Life, meta = Meta,
                          priority = Priority,
                          credit = Credit, credit_mode = Mode},
     WaitingConsumers1 = WaitingConsumers0 ++ [{ConsumerId, Consumer}],
-    State0#?MODULE{waiting_consumers = WaitingConsumers1}.
+    State0#?MODULE{rare = Rare#rare{waiting_consumers = WaitingConsumers1}}.
 
 update_consumer0(ConsumerId, Meta, {Life, Credit, Mode}, Priority,
                  #?MODULE{consumers = Cons0,
@@ -2233,24 +2248,25 @@ maybe_queue_consumer(ConsumerId, #consumer{credit = Credit} = Con,
 
 %% creates a dehydrated version of the current state to be cached and
 %% potentially used to for a snaphot at a later point
-dehydrate_state(#?MODULE{msg_bytes_in_memory = 0,
-                         cfg = #cfg{max_in_memory_length = 0},
+dehydrate_state(#?MODULE{rare = #rare{msg_bytes_in_memory = 0,
+                                      cfg = #cfg{max_in_memory_length = 0}} = Rare,
                          consumers = Consumers,
                          dlx = DlxState} = State) ->
     % no messages are kept in memory, no need to
     % overly mutate the current state apart from removing indexes and cursors
     State#?MODULE{
+             rare = Rare#rare{release_cursors = lqueue:new()},
              ra_indexes = rabbit_fifo_index:empty(),
              consumers = maps:map(fun (_, C) ->
                                           dehydrate_consumer(C)
                                   end, Consumers),
-             release_cursors = lqueue:new(),
              dlx = rabbit_fifo_dlx:dehydrate(DlxState)};
-dehydrate_state(#?MODULE{messages = Messages,
+dehydrate_state(#?MODULE{rare = #rare{returns = Returns,
+                                      prefix_msgs = {PRCnt, PrefRet0, PPCnt, PrefMsg0},
+                                      waiting_consumers = Waiting0
+                                     } = Rare,
+                         messages = Messages,
                          consumers = Consumers,
-                         returns = Returns,
-                         prefix_msgs = {PRCnt, PrefRet0, PPCnt, PrefMsg0},
-                         waiting_consumers = Waiting0,
                          dlx = DlxState} = State) ->
     RCnt = lqueue:len(Returns),
     %% TODO: optimise this function as far as possible
@@ -2263,16 +2279,18 @@ dehydrate_state(#?MODULE{messages = Messages,
     %% recovering from a snapshot
     PrefMsgs = PrefMsg0 ++ PrefMsgsSuff,
     Waiting = [{Cid, dehydrate_consumer(C)} || {Cid, C} <- Waiting0],
-    State#?MODULE{messages = lqueue:new(),
+    State#?MODULE{rare = Rare#rare{
+                           release_cursors = lqueue:new(),
+                           returns = lqueue:new(),
+                           prefix_msgs = {PRCnt + RCnt, PrefRet,
+                                          PPCnt + lqueue:len(Messages), PrefMsgs},
+                           waiting_consumers = Waiting
+                          },
+                  messages = lqueue:new(),
                   ra_indexes = rabbit_fifo_index:empty(),
-                  release_cursors = lqueue:new(),
                   consumers = maps:map(fun (_, C) ->
                                                dehydrate_consumer(C)
                                        end, Consumers),
-                  returns = lqueue:new(),
-                  prefix_msgs = {PRCnt + RCnt, PrefRet,
-                                 PPCnt + lqueue:len(Messages), PrefMsgs},
-                  waiting_consumers = Waiting,
                   dlx = rabbit_fifo_dlx:dehydrate(DlxState)}.
 
 dehydrate_messages(Msgs0)  ->
@@ -2302,29 +2320,31 @@ dehydrate_message(?INDEX_MSG(Idx, ?MSG(Header, _))) when is_integer(Idx) ->
     ?PREFIX_MEM_MSG(Header).
 
 %% make the state suitable for equality comparison
-normalize(#?MODULE{ra_indexes = _Indexes,
-                   returns = Returns,
+normalize(#?MODULE{rare = #rare{returns = Returns,
+                                release_cursors = Cursors
+                               } = Rare,
+                   ra_indexes = _Indexes,
                    messages = Messages,
-                   release_cursors = Cursors,
                    dlx = DlxState} = State) ->
-    State#?MODULE{returns = lqueue:from_list(lqueue:to_list(Returns)),
+    State#?MODULE{rare = Rare#rare{returns = lqueue:from_list(lqueue:to_list(Returns)),
+                                   release_cursors = lqueue:from_list(lqueue:to_list(Cursors))
+                                  },
                   messages = lqueue:from_list(lqueue:to_list(Messages)),
-                  release_cursors = lqueue:from_list(lqueue:to_list(Cursors)),
                   dlx = rabbit_fifo_dlx:normalize(DlxState)}.
 
-is_over_limit(#?MODULE{cfg = #cfg{max_length = undefined,
-                                  max_bytes = undefined}}) ->
+is_over_limit(#?MODULE{rare = #rare{cfg = #cfg{max_length = undefined,
+                                               max_bytes = undefined}}}) ->
     false;
-is_over_limit(#?MODULE{cfg = #cfg{max_length = MaxLength,
-                                  max_bytes = MaxBytes},
+is_over_limit(#?MODULE{rare = #rare{cfg = #cfg{max_length = MaxLength,
+                                               max_bytes = MaxBytes}},
                        msg_bytes_enqueue = BytesEnq} = State) ->
     messages_ready(State) > MaxLength orelse (BytesEnq > MaxBytes).
 
-is_below_soft_limit(#?MODULE{cfg = #cfg{max_length = undefined,
-                                        max_bytes = undefined}}) ->
+is_below_soft_limit(#?MODULE{rare = #rare{cfg = #cfg{max_length = undefined,
+                                                     max_bytes = undefined}}}) ->
     false;
-is_below_soft_limit(#?MODULE{cfg = #cfg{max_length = MaxLength,
-                                        max_bytes = MaxBytes},
+is_below_soft_limit(#?MODULE{rare = #rare{cfg = #cfg{max_length = MaxLength,
+                                                     max_bytes = MaxBytes}},
                             msg_bytes_enqueue = BytesEnq} = State) ->
     is_below(MaxLength, messages_ready(State)) andalso
     is_below(MaxBytes, BytesEnq).
@@ -2413,18 +2433,18 @@ add_bytes_return(Header,
                   msg_bytes_enqueue = Enqueue + Size}.
 
 add_in_memory_counts(Header,
-                     #?MODULE{msg_bytes_in_memory = InMemoryBytes,
-                              msgs_ready_in_memory = InMemoryCount} = State) ->
+                     #?MODULE{rare = #rare{msg_bytes_in_memory = InMemoryBytes,
+                                           msgs_ready_in_memory = InMemoryCount} = Rare} = State) ->
     Size = get_header(size, Header),
-    State#?MODULE{msg_bytes_in_memory = InMemoryBytes + Size,
-                  msgs_ready_in_memory = InMemoryCount + 1}.
+    State#?MODULE{rare = Rare#rare{msg_bytes_in_memory = InMemoryBytes + Size,
+                                   msgs_ready_in_memory = InMemoryCount + 1}}.
 
 subtract_in_memory_counts(Header,
-                          #?MODULE{msg_bytes_in_memory = InMemoryBytes,
-                                   msgs_ready_in_memory = InMemoryCount} = State) ->
+                          #?MODULE{rare = #rare{msg_bytes_in_memory = InMemoryBytes,
+                                                msgs_ready_in_memory = InMemoryCount} = Rare} = State) ->
     Size = get_header(size, Header),
-    State#?MODULE{msg_bytes_in_memory = InMemoryBytes - Size,
-                  msgs_ready_in_memory = InMemoryCount - 1}.
+    State#?MODULE{rare = Rare#rare{msg_bytes_in_memory = InMemoryBytes - Size,
+                                   msgs_ready_in_memory = InMemoryCount - 1}}.
 
 message_size(#basic_message{content = Content}) ->
     #content{payload_fragments_rev = PFR} = Content,
@@ -2442,7 +2462,7 @@ message_size(Msg) ->
 
 all_nodes(#?MODULE{consumers = Cons0,
                    enqueuers = Enqs0,
-                   waiting_consumers = WaitingConsumers0}) ->
+                   rare = #rare{waiting_consumers = WaitingConsumers0}}) ->
     Nodes0 = maps:fold(fun({_, P}, _, Acc) ->
                                Acc#{node(P) => ok}
                        end, #{}, Cons0),
@@ -2456,7 +2476,7 @@ all_nodes(#?MODULE{consumers = Cons0,
 
 all_pids_for(Node, #?MODULE{consumers = Cons0,
                             enqueuers = Enqs0,
-                            waiting_consumers = WaitingConsumers0}) ->
+                            rare = #rare{waiting_consumers = WaitingConsumers0}}) ->
     Cons = maps:fold(fun({_, P}, _, Acc)
                            when node(P) =:= Node ->
                              [P | Acc];
@@ -2475,7 +2495,7 @@ all_pids_for(Node, #?MODULE{consumers = Cons0,
 
 suspected_pids_for(Node, #?MODULE{consumers = Cons0,
                                   enqueuers = Enqs0,
-                                  waiting_consumers = WaitingConsumers0}) ->
+                                  rare = #rare{waiting_consumers = WaitingConsumers0}}) ->
     Cons = maps:fold(fun({_, P}, #consumer{status = suspected_down}, Acc)
                            when node(P) =:= Node ->
                              [P | Acc];
@@ -2493,8 +2513,8 @@ suspected_pids_for(Node, #?MODULE{consumers = Cons0,
                    (_, Acc) -> Acc
                 end, Enqs, WaitingConsumers0).
 
-is_expired(Ts, #?MODULE{cfg = #cfg{expires = Expires},
-                        last_active = LastActive,
+is_expired(Ts, #?MODULE{rare = #rare{cfg = #cfg{expires = Expires},
+                                     last_active = LastActive},
                         consumers = Consumers})
   when is_number(LastActive) andalso is_number(Expires) ->
     %% TODO: should it be active consumers?
@@ -2522,7 +2542,7 @@ maybe_notify_decorators(_, false) ->
 maybe_notify_decorators(State, _) ->
     {true, query_notify_decorators_info(State)}.
 
-notify_decorators_effect(#?MODULE{cfg = #cfg{resource = QName}} = State) ->
+notify_decorators_effect(#?MODULE{rare = #rare{cfg = #cfg{resource = QName}}} = State) ->
     {MaxActivePriority, IsEmpty} = query_notify_decorators_info(State),
     notify_decorators_effect(QName, MaxActivePriority, IsEmpty).
 

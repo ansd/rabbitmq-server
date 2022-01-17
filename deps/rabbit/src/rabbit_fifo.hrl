@@ -167,27 +167,14 @@
                        {non_neg_integer(), list(),
                         non_neg_integer(), list()}.
 
--record(rabbit_fifo,
-        {cfg :: #cfg{},
-         % unassigned messages
-         messages = lqueue:new() :: lqueue:lqueue(indexed_msg()),
-         % defines the next message id
-         messages_total = 0 :: non_neg_integer(),
+%% Fields that are less frequently updated compared to top level rabbit_fifo fields.
+%% This reduces number of page faults because updating one tuple's field will copy
+%% the pointers of all the other tuple's fields. Hence, we want to avoid having large tuples.
+-record(rare,
+        {
+         cfg :: #cfg{},
          % queue of returned msg_in_ids - when checking out it picks from
          returns = lqueue:new() :: lqueue:lqueue(term()),
-         % a counter of enqueues - used to trigger shadow copy points
-         % reset to 0 when release_cursor gets stored
-         enqueue_count = 0 :: non_neg_integer(),
-         % a map containing all the live processes that have ever enqueued
-         % a message to this queue as well as a cached value of the smallest
-         % ra_index of all pending enqueues
-         enqueuers = #{} :: #{pid() => #enqueuer{}},
-         % master index of all enqueue raft indexes including pending
-         % enqueues
-         % rabbit_fifo_index can be slow when calculating the smallest
-         % index when there are large gaps but should be faster than gb_trees
-         % for normal appending operations as it's backed by a map
-         ra_indexes = rabbit_fifo_index:empty() :: rabbit_fifo_index:state(),
          %% A release cursor is essentially a snapshot without message bodies
          %% (aka. "dehydrated state") taken at time T in order to truncate
          %% the log at some point in the future when all messages that were enqueued
@@ -197,13 +184,7 @@
          %% Working assumption: Messages are consumed in a FIFO-ish order because
          %% the log is truncated only until the oldest message.
          release_cursors = lqueue:new() :: lqueue:lqueue({release_cursor,
-                                                          ra:index(), #rabbit_fifo{}}),
-         % consumers need to reflect consumer state at time of snapshot
-         % needs to be part of snapshot
-         consumers = #{} :: #{consumer_id() => consumer()},
-         % consumers that require further service are queued here
-         % needs to be part of snapshot
-         service_queue = priority_queue:new() :: priority_queue:q(),
+                                                          ra:index(), tuple()}),
          %% This is a special field that is only used for snapshots
          %% It represents the queued messages at the time the
          %% dehydrated snapshot state was cached.
@@ -216,10 +197,6 @@
          %% TODO Remove this field and store prefix messages in-place. This will
          %% simplify the checkout logic.
          prefix_msgs = {0, [], 0, []} :: prefix_msgs(),
-         %% state for at-least-once dead-lettering
-         dlx = rabbit_fifo_dlx:init() :: rabbit_fifo_dlx:state(),
-         msg_bytes_enqueue = 0 :: non_neg_integer(),
-         msg_bytes_checkout = 0 :: non_neg_integer(),
          %% waiting consumers, one is picked active consumer is cancelled or dies
          %% used only when single active consumer is on
          waiting_consumers = [] :: [{consumer_id(), consumer()}],
@@ -228,6 +205,38 @@
          last_active :: undefined | non_neg_integer(),
          unused_1,
          unused_2
+        }).
+
+-record(rabbit_fifo,
+        {
+         rare = #rare{},
+         % unassigned messages
+         messages = lqueue:new() :: lqueue:lqueue(indexed_msg()),
+         % defines the next message id
+         messages_total = 0 :: non_neg_integer(),
+         % a counter of enqueues - used to trigger shadow copy points
+         % reset to 0 when release_cursor gets stored
+         enqueue_count = 0 :: non_neg_integer(),
+         % a map containing all the live processes that have ever enqueued
+         % a message to this queue as well as a cached value of the smallest
+         % ra_index of all pending enqueues
+         enqueuers = #{} :: #{pid() => #enqueuer{}},
+         % consumers need to reflect consumer state at time of snapshot
+         % needs to be part of snapshot
+         consumers = #{} :: #{consumer_id() => consumer()},
+         % consumers that require further service are queued here
+         % needs to be part of snapshot
+         service_queue = priority_queue:new() :: priority_queue:q(),
+         %% state for at-least-once dead-lettering
+         dlx = rabbit_fifo_dlx:init() :: rabbit_fifo_dlx:state(),
+         % master index of all enqueue raft indexes including pending
+         % enqueues
+         % rabbit_fifo_index can be slow when calculating the smallest
+         % index when there are large gaps but should be faster than gb_trees
+         % for normal appending operations as it's backed by a map
+         ra_indexes = rabbit_fifo_index:empty() :: rabbit_fifo_index:state(),
+         msg_bytes_enqueue = 0 :: non_neg_integer(),
+         msg_bytes_checkout = 0 :: non_neg_integer()
         }).
 
 -type config() :: #{name := atom(),
