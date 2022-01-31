@@ -30,26 +30,25 @@ groups() ->
 %% Testsuite setup/teardown
 %% -------------------------------------------------------------------
 
-init_per_suite(Config) ->
+init_per_suite(Config0) ->
     rabbit_ct_helpers:log_environment(),
-    rabbit_ct_helpers:run_setup_steps(Config).
+    Config1 = rabbit_ct_helpers:run_setup_steps(Config0),
+    Config2 = rabbit_ct_helpers:set_config(Config1, [{rmq_nodes_count, 1}]),
+    Config = rabbit_ct_helpers:run_steps(Config2,
+                                         rabbit_ct_broker_helpers:setup_steps() ++
+                                         rabbit_ct_client_helpers:setup_steps()),
+    NodeName = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    {ok, [NodeName]} = ct_cover:add_nodes([NodeName]),
+    Config.
 
-end_per_suite(Config) ->
-    rabbit_ct_helpers:run_teardown_steps(Config).
-
-init_per_group(Group, Config) ->
-    Config1 = rabbit_ct_helpers:set_config(Config, [
-        {rmq_nodename_suffix, Group},
-        {rmq_nodes_count, 1}
-      ]),
-    rabbit_ct_helpers:run_steps(Config1,
-      rabbit_ct_broker_helpers:setup_steps() ++
-      rabbit_ct_client_helpers:setup_steps()).
-
-end_per_group(_Group, Config) ->
-    rabbit_ct_helpers:run_steps(Config,
-      rabbit_ct_client_helpers:teardown_steps() ++
-      rabbit_ct_broker_helpers:teardown_steps()).
+end_per_suite(Config0) ->
+    Config1 = rabbit_ct_helpers:set_config(Config0, [
+                                                     {rmq_nodes_count, 1}
+                                                    ]),
+    Config2 = rabbit_ct_helpers:run_steps(Config1,
+                                          rabbit_ct_broker_helpers:setup_steps() ++
+                                          rabbit_ct_client_helpers:setup_steps()),
+    rabbit_ct_helpers:run_teardown_steps(Config2).
 
 init_per_testcase(Testcase, Config) ->
     rabbit_ct_helpers:testcase_started(Config, Testcase).
