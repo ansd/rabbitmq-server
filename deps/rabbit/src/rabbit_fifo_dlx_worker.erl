@@ -336,6 +336,8 @@ forward(ConsumedMsg, ConsumedMsgId, ConsumedQRef, DLX, Reason,
     state().
 deliver_to_queues(#delivery{msg_seq_no = SeqNo} = Delivery, Qs, #state{queue_type_state = QTypeState0,
                                                                        pendings = Pendings} = State0) ->
+    rabbit_log:debug("zzz ~s:~s SeqNo=~p",
+                     [?MODULE, ?FUNCTION_NAME, SeqNo]),
     {State, Actions} = case rabbit_queue_type:deliver(Qs, Delivery, QTypeState0) of
                            {ok, QTypeState, Actions0} ->
                                {State0#state{queue_type_state = QTypeState}, Actions0};
@@ -358,6 +360,8 @@ handle_settled(QRef, MsgSeqs, State) ->
 
 handle_settled0(QRef, MsgSeq, #state{pendings = Pendings,
                                      settled_ids = SettledIds} = State) ->
+    rabbit_log:debug("zzz ~s:~s MsgSeq=~p",
+                     [?MODULE, ?FUNCTION_NAME, MsgSeq]),
     case maps:find(MsgSeq, Pendings) of
         {ok, #pending{unsettled = [QRef],
                       rejected = [],
@@ -481,6 +485,8 @@ redeliver0(#pending{delivery = #delivery{message = BasicMsg} = Delivery0,
                                          %% Any target queue that rejected previously and still need
                                          %% to be routed to is moved back to 'unsettled'.
                                          rejected = []},
+                    rabbit_log:debug("zzz ~s:~s Pend=~p",
+                                     [?MODULE, ?FUNCTION_NAME, Pend]),
                     State = State0#state{pendings = maps:update(OutSeq, Pend, Pendings)},
                     deliver_to_queues(Delivery, rabbit_amqqueue:lookup(RouteToQs), State)
             end

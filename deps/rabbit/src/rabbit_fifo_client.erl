@@ -145,10 +145,14 @@ enqueue(Correlation, Msg,
     case rpc:call(Node, ra_machine, version, [{machine, rabbit_fifo, #{}}]) of
         0 ->
             %% the leader is running the old version
+            rabbit_log:debug("zzz ~s:~s ra_machine version=0 Correlation=~p Node=~p",
+                             [?MODULE, ?FUNCTION_NAME, Correlation, Node]),
             enqueue(Correlation, Msg, State0#state{queue_status = go});
         N when is_integer(N) ->
             %% were running the new version on the leader do sync initialisation
             %% of enqueuer session
+            rabbit_log:debug("zzz ~s:~s ra_machine version=~p Correlation=~p Node=~p",
+                             [?MODULE, ?FUNCTION_NAME, N, Correlation, Node]),
             Reg = rabbit_fifo:make_register_enqueuer(self()),
             case ra:process_command(Servers, Reg, Timeout) of
                 {ok, reject_publish, Leader} ->
@@ -183,7 +187,8 @@ enqueue(Correlation, Msg,
                next_seq = Seq,
                next_enqueue_seq = EnqueueSeq,
                cfg = #cfg{soft_limit = SftLmt,
-                          block_handler = BlockFun}} = State0) ->
+                          block_handler = BlockFun},
+               leader = Leader} = State0) ->
     Server = pick_server(State0),
     % by default there is no correlation id
     Cmd = rabbit_fifo:make_enqueue(self(), EnqueueSeq, Msg),
@@ -196,6 +201,8 @@ enqueue(Correlation, Msg,
                          next_seq = Seq + 1,
                          next_enqueue_seq = EnqueueSeq + 1,
                          slow = Tag == slow},
+    rabbit_log:debug("zzz ~s:~s Correlation=~p Seq=~p, EnqueueSeq=~p, map_size(Pending)=~p, Leader=~p Tag=~p",
+                     [?MODULE, ?FUNCTION_NAME, Correlation, Seq, EnqueueSeq, map_size(Pending), Leader, Tag]),
     case Tag of
         slow when not Slow ->
             BlockFun(),
@@ -556,6 +563,8 @@ handle_ra_event(From, {applied, Seqs},
                       [{settled, QRef, Corrs}
                        | lists:reverse(Actions0)]
               end,
+    rabbit_log:debug("zzz ~s:~s applied From=~p, Seqs=~p Corrs=~p",
+                     [?MODULE, ?FUNCTION_NAME, From, Seqs, Corrs]),
     case maps:size(State1#state.pending) < SftLmt of
         true when State1#state.slow == true ->
             % we have exited soft limit state
@@ -565,6 +574,8 @@ handle_ra_event(From, {applied, Seqs},
             % channel is interacting with)
             % but the fact the queue has just applied suggests
             % it's ok to cancel here anyway
+            rabbit_log:debug("zzz ~s:~s From=~p, Seqs=~p maps:size(Pending)=~p cancelling timer...",
+                             [?MODULE, ?FUNCTION_NAME, From, Seqs, map_size(State1#state.pending)]),
             State2 = cancel_timer(State1#state{slow = false,
                                                unsent_commands = #{}}),
             % build up a list of commands to issue
@@ -590,6 +601,8 @@ handle_ra_event(From, {machine, {delivery, _ConsumerTag, _} = Del}, State0) ->
     handle_delivery(From, Del, State0);
 handle_ra_event(_, {machine, {queue_status, Status}},
                 #state{} = State) ->
+    rabbit_log:debug("zzz ~s:~s queue_status Status=~p",
+                     [?MODULE, ?FUNCTION_NAME, Status]),
     %% just set the queue status
     {ok, State#state{queue_status = Status}, []};
 handle_ra_event(Leader, {machine, leader_change},
@@ -602,6 +615,8 @@ handle_ra_event(Leader, {machine, leader_change},
     {ok, State, []};
 handle_ra_event(_From, {rejected, {not_leader, Leader, _Seq}},
                 #state{leader = Leader} = State) ->
+    rabbit_log:debug("zzz ~s:~s not leader Leader=~p",
+                     [?MODULE, ?FUNCTION_NAME, Leader]),
     {ok, State, []};
 handle_ra_event(_From, {rejected, {not_leader, Leader, _Seq}},
                 #state{leader = OldLeader} = State0) ->
@@ -609,19 +624,27 @@ handle_ra_event(_From, {rejected, {not_leader, Leader, _Seq}},
                      [?MODULE, OldLeader, Leader]),
     State = resend_all_pending(State0#state{leader = Leader}),
     {ok, cancel_timer(State), []};
-handle_ra_event(_From, {rejected, {not_leader, _UndefinedMaybe, _Seq}}, State0) ->
+handle_ra_event(_From, {rejected, {not_leader, UndefinedMaybe, Seq}}, State0) ->
     % TODO: how should these be handled? re-sent on timer or try random
+    rabbit_log:debug("zzz ~s:~s rejected not_leader UndefinedMaybe=~p Seq=~p",
+                     [?MODULE, ?FUNCTION_NAME, UndefinedMaybe, Seq]),
     {ok, State0, []};
 handle_ra_event(_, timeout, #state{cfg = #cfg{servers = Servers}} = State0) ->
     case find_leader(Servers) of
         undefined ->
             %% still no leader, set the timer again
+            rabbit_log:debug("zzz ~s:~s timeout, Servers=~p setting_timer...",
+                             [?MODULE, ?FUNCTION_NAME, Servers]),
             {ok, set_timer(State0), []};
         Leader ->
+            rabbit_log:debug("zzz ~s:~s timeout, Servers=~p resending all pending...",
+                             [?MODULE, ?FUNCTION_NAME, Servers]),
             State = resend_all_pending(State0#state{leader = Leader}),
             {ok, State, []}
     end;
 handle_ra_event(_Leader, {machine, eol}, _State0) ->
+    rabbit_log:debug("zzz ~s:~s eol",
+                     [?MODULE, ?FUNCTION_NAME]),
     eol.
 
 %% @doc Attempts to enqueue a message using cast semantics. This provides no
@@ -680,6 +703,8 @@ maybe_add_action(ok, Acc, State) ->
 maybe_add_action(not_enqueued, Acc, State) ->
     {Acc, State};
 maybe_add_action({multi, Actions}, Acc0, State0) ->
+    rabbit_log:debug("zzz ~s:~s multi Actions=~p",
+                     [?MODULE, ?FUNCTION_NAME, Actions]),
     lists:foldl(fun (Act, {Acc, State}) ->
                         maybe_add_action(Act, Acc, State)
                 end, {Acc0, State0}, Actions);
@@ -704,9 +729,13 @@ maybe_add_action(Action, Acc, State) ->
 resend(OldSeq, #state{pending = Pending0, leader = Leader} = State) ->
     case maps:take(OldSeq, Pending0) of
         {{Corr, Cmd}, Pending} ->
+            rabbit_log:debug("zzz ~s:~s Corr=~p, Cmd=~p, OldSeq=~p Leader=~p",
+                             [?MODULE, ?FUNCTION_NAME, Corr, element(1, Cmd), OldSeq, Leader]),
             %% resends aren't subject to flow control here
             resend_command(Leader, Corr, Cmd, State#state{pending = Pending});
         error ->
+            rabbit_log:debug("zzz ~s:~s cannot resend OldSeq=~p Pending0=~p",
+                             [?MODULE, ?FUNCTION_NAME, OldSeq, Pending0]),
             State
     end.
 
@@ -900,11 +929,17 @@ set_timer(#state{leader = Leader0,
     Ref = erlang:send_after(?TIMER_TIME, self(),
                             {'$gen_cast',
                              {queue_event, QName, {Leader, timeout}}}),
+    rabbit_log:debug("zzz ~s:~s Leader0=~p Server=~p",
+                     [?MODULE, ?FUNCTION_NAME, Leader0, Server]),
     State#state{timer_state = Ref}.
 
 cancel_timer(#state{timer_state = undefined} = State) ->
+    rabbit_log:debug("zzz ~s:~s timer undefined",
+                     [?MODULE, ?FUNCTION_NAME]),
     State;
 cancel_timer(#state{timer_state = Ref} = State) ->
+    rabbit_log:debug("zzz ~s:~s",
+                     [?MODULE, ?FUNCTION_NAME]),
     erlang:cancel_timer(Ref, [{async, true}, {info, false}]),
     State#state{timer_state = undefined}.
 

@@ -1461,9 +1461,15 @@ apply_enqueue(#{index := RaftIdx,
             {State, ok, Effects} = checkout(Meta, State0, State1, Effects1),
             {maybe_store_release_cursor(RaftIdx, State), ok, Effects};
         {out_of_sequence, State, Effects} ->
-            {State, not_enqueued, Effects};
+            Log = {mod_call, rabbit_log, debug,
+                   ["zzz ~s:~s out_of_sequence From=~p Seq=~p State0=~p",
+                    [?MODULE, ?FUNCTION_NAME, From, Seq, State0]]},
+            {State, not_enqueued, [Log|Effects]};
         {duplicate, State, Effects} ->
-            {State, ok, Effects}
+            Log = {mod_call, rabbit_log, debug,
+                   ["zzz ~s:~s duplicate From=~p Seq=~p State0=~p",
+                    [?MODULE, ?FUNCTION_NAME, From, Seq, State0]]},
+            {State, ok, [Log|Effects]}
     end.
 
 decr_total(#?MODULE{messages_total = Tot} = State) ->
