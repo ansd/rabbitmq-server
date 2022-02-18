@@ -12,7 +12,8 @@
 -export([init/1,
          close/1,
          update/2,
-         handle_event/2]).
+         handle_event/2,
+         tick/1]).
 -export([is_recoverable/1,
          recover/2,
          stop/1,
@@ -1693,6 +1694,11 @@ notify_decorators(QName, F, A) ->
         {error, not_found} ->
             ok
     end.
+
+-spec tick(rabbit_fifo_client:state()) ->
+    rabbit_fifo_client:state().
+tick(QState) ->
+    rabbit_fifo_client:tick(QState).
 
 %% remove any data that a quorum queue doesn't need
 prepare_content(#content{properties = none} = Content) ->

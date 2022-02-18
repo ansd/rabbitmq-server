@@ -145,8 +145,11 @@ handle_cast({queue_event, QRef, Evt},
         {protocol_error, _Type, _Reason, _Args} ->
             {noreply, State0}
     end;
-handle_cast(settle_timeout, State0) ->
-    State = State0#state{timer = undefined},
+handle_cast(settle_timeout, #state{queue_type = QTypeState0} = State0) ->
+    %% resend pending rabbit_fifo_client messages
+    QTypeState = rabbit_queue_type:tick(QTypeState0),
+    State = State0#state{timer = undefined,
+                         queue_type_state = QTypeState},
     redeliver_and_ack(State);
 handle_cast(Request, State) ->
     rabbit_log:info("~s received unhandled cast ~p", [?MODULE, Request]),

@@ -35,7 +35,8 @@
          find_name_from_pid/2,
          is_policy_applicable/2,
          is_server_named_allowed/1,
-         notify_decorators/1
+         notify_decorators/1,
+         tick/1
          ]).
 
 -type queue_name() :: rabbit_types:r(queue).
@@ -80,7 +81,7 @@
               state :: queue_state()}).
 
 
--record(?STATE, {ctxs = #{} :: #{queue_ref() => #ctx{} | queue_ref()},
+-record(?STATE, {ctxs = #{} :: #{queue_ref() => #ctx{}},
                  monitor_registry = #{} :: #{pid() => queue_ref()}
                 }).
 
@@ -202,6 +203,11 @@
 
 -callback notify_decorators(amqqueue:amqqueue()) ->
     ok.
+
+-callback tick(queue_state()) ->
+    queue_state().
+
+-optional_callbacks([tick/1]).
 
 %% TODO: this should be controlled by a registry that is populated on boot
 discover(<<"quorum">>) ->
@@ -535,6 +541,22 @@ dequeue(Q, NoAck, LimiterPid, CTag, Ctxs) ->
         {protocol_error, _, _, _} = Err ->
             Err
     end.
+
+-spec tick(state()) ->
+    state().
+tick(#?STATE{ctxs = Ctxs0} = State) ->
+    Ctxs = maps:map(
+             fun (_, #ctx{module = Mod,
+                          state = S0} = Ctx) ->
+                     case erlang:function_exported(Mod, ?FUNCTION_NAME, 1) of
+                         true ->
+                             S = Mod:?FUNCTION_NAME(S0),
+                             Ctx#ctx{state = S};
+                         false ->
+                             Ctx
+                     end
+             end, Ctxs0),
+    State#?STATE{ctxs = Ctxs}.
 
 get_ctx(QOrQref, State) ->
     get_ctx_with(QOrQref, State, undefined).

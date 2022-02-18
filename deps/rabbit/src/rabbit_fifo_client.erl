@@ -32,14 +32,15 @@
          pending_size/1,
          stat/1,
          stat/2,
-         query_single_active_consumer/1
+         query_single_active_consumer/1,
+         tick/1
          ]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
 -define(SOFT_LIMIT, 32).
--define(TIMER_TIME, 10000).
--define(COMMAND_TIMEOUT, 30000).
+-define(TIMER_TIME, 10_000).
+-define(COMMAND_TIMEOUT, 30_000).
 
 -type seq() :: non_neg_integer().
 -type action() :: {send_credit_reply, Available :: non_neg_integer()} |
@@ -74,7 +75,9 @@
                                    {term(), rabbit_fifo:command()}},
                 consumer_deliveries = #{} :: #{rabbit_fifo:consumer_tag() =>
                                                #consumer{}},
-                timer_state :: term()
+                timer_state :: term(),
+                %% the last time we interacted successfully with the leader
+                leader_last_time :: integer()
                }).
 
 -opaque state() :: #state{}.
@@ -153,9 +156,11 @@ enqueue(Correlation, Msg,
             case ra:process_command(Servers, Reg, Timeout) of
                 {ok, reject_publish, Leader} ->
                     {reject_publish, State0#state{leader = Leader,
+                                                  leader_last_time = erlang:monotonic_time(),
                                                   queue_status = reject_publish}};
                 {ok, ok, Leader} ->
                     enqueue(Correlation, Msg, State0#state{leader = Leader,
+                                                           leader_last_time = erlang:monotonic_time(),
                                                            queue_status = go});
                 {error, {no_more_servers_to_try, _Errs}} ->
                     %% if we are not able to process the register command
@@ -247,7 +252,8 @@ dequeue(ConsumerTag, Settlement,
                                                       #{}),
                             Timeout) of
         {ok, {dequeue, empty}, Leader} ->
-            {empty, State0#state{leader = Leader}};
+            {empty, State0#state{leader = Leader,
+                                 leader_last_time = erlang:monotonic_time()}};
         {ok, {dequeue, {MsgId, {MsgHeader, Msg0}}, MsgsReady}, Leader} ->
             Count = case MsgHeader of
                         #{delivery_count := C} -> C;
@@ -257,7 +263,8 @@ dequeue(ConsumerTag, Settlement,
             Msg = add_delivery_count_header(Msg0, Count),
             {ok, MsgsReady,
              {QName, qref(Leader), MsgId, IsDelivered, Msg},
-             State0#state{leader = Leader}};
+             State0#state{leader = Leader,
+                          leader_last_time = erlang:monotonic_time()}};
         {ok, {error, _} = Err, _Leader} ->
             Err;
         Err ->
@@ -567,7 +574,8 @@ handle_ra_event(From, {applied, Seqs},
             % but the fact the queue has just applied suggests
             % it's ok to cancel here anyway
             State2 = cancel_timer(State1#state{slow = false,
-                                               unsent_commands = #{}}),
+                                               unsent_commands = #{},
+                                               leader_last_time = erlang:monotonic_time()}),
             % build up a list of commands to issue
             Commands = maps:fold(
                          fun (Cid, {Settled, Returns, Discards}, Acc) ->
@@ -585,17 +593,20 @@ handle_ra_event(From, {applied, Seqs},
             UnblockFun(),
             {ok, State, Actions};
         _ ->
-            {ok, State1, Actions}
+            State = update_leader_last_time(State0),
+            {ok, State, Actions}
     end;
 handle_ra_event(From, {machine, {delivery, _ConsumerTag, _} = Del}, State0) ->
-    handle_delivery(From, Del, State0);
+    State = update_leader_last_time(State0),
+    handle_delivery(From, Del, State);
 handle_ra_event(_, {machine, {queue_status, Status}},
                 #state{} = State) ->
     %% just set the queue status
     {ok, State#state{queue_status = Status}, []};
 handle_ra_event(Leader, {machine, leader_change},
-                #state{leader = Leader} = State) ->
+                #state{leader = Leader} = State0) ->
     %% leader already known
+    State = update_leader_last_time(State0),
     {ok, State, []};
 handle_ra_event(Leader, {machine, leader_change},
                 #state{leader = OldLeader} = State0) ->
@@ -603,7 +614,8 @@ handle_ra_event(Leader, {machine, leader_change},
     %% and resend any pending commands
     rabbit_log:debug("~s: Detected QQ leader change from ~w to ~w",
                      [?MODULE, OldLeader, Leader]),
-    State = resend_all_pending(State0#state{leader = Leader}),
+    State = resend_all_pending(State0#state{leader = Leader,
+                                            leader_last_time = erlang:monotonic_time()}),
     {ok, State, []};
 handle_ra_event(_From, {rejected, {not_leader, Leader, _Seq}},
                 #state{leader = Leader} = State) ->
@@ -623,11 +635,35 @@ handle_ra_event(_, timeout, #state{cfg = #cfg{servers = Servers}} = State0) ->
             %% still no leader, set the timer again
             {ok, set_timer(State0), []};
         Leader ->
-            State = resend_all_pending(State0#state{leader = Leader}),
+            State = resend_all_pending(State0#state{leader = Leader,
+                                                    leader_last_time = erlang:monotonic_time()}),
             {ok, State, []}
     end;
 handle_ra_event(_Leader, {machine, eol}, _State0) ->
     eol.
+
+-spec tick(state()) ->
+    state().
+tick(#state{pending = Pending,
+            leader_last_time = LastTime,
+            cfg = #cfg{servers = Servers}} = State0)
+  when map_size(Pending) > 0 ->
+    case erlang:convert_time_unit(erlang:monotonic_time() - LastTime,
+                                  native, millisecond) of
+        ElapsedMillis when ElapsedMillis > ?TIMER_TIME + 2000 ->
+            case find_leader(Servers) of
+                undefined ->
+                    %% still no leader, nothing we can do, retry on next tick
+                    State0;
+                Leader ->
+                    resend_all_pending(State0#state{leader = Leader,
+                                                    leader_last_time = erlang:monotonic_time()})
+            end;
+        _ ->
+            State0
+    end;
+tick(State) ->
+    State.
 
 %% @doc Attempts to enqueue a message using cast semantics. This provides no
 %% guarantees or retries if the message fails to achieve consensus or if the
@@ -647,8 +683,7 @@ handle_ra_event(_Leader, {machine, eol}, _State0) ->
     ok.
 untracked_enqueue([Node | _], Msg) ->
     Cmd = rabbit_fifo:make_enqueue(undefined, undefined, Msg),
-    ok = ra:pipeline_command(Node, Cmd),
-    ok.
+    ok = ra:pipeline_command(Node, Cmd).
 
 %% Internal
 
@@ -656,7 +691,8 @@ try_process_command([Server | Rem], Cmd,
                     #state{cfg = #cfg{timeout = Timeout}} = State) ->
     case ra:process_command(Server, Cmd, Timeout) of
         {ok, _, Leader} ->
-            {ok, State#state{leader = Leader}};
+            {ok, State#state{leader = Leader,
+                             leader_last_time = erlang:monotonic_time()}};
         Err when length(Rem) =:= 0 ->
             Err;
         _ ->
@@ -929,3 +965,6 @@ find_leader([Server | Servers]) ->
 
 qref({Ref, _}) -> Ref;
 qref(Ref) -> Ref.
+
+update_leader_last_time(State) ->
+    State#state{leader_last_time = erlang:monotonic_time()}.

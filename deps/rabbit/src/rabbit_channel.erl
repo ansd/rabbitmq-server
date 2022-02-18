@@ -842,13 +842,15 @@ handle_info({{Ref, Node}, LateAnswer},
         [Channel, LateAnswer, Node]),
     noreply(State);
 
-handle_info(tick, State0 = #ch{queue_states = QueueStates0}) ->
+handle_info(tick, State0) ->
     case get(permission_cache_can_expire) of
-      true  -> ok = clear_permission_cache();
-      _     -> ok
+        true  -> ok = clear_permission_cache();
+        _     -> ok
     end,
-    case evaluate_consumer_timeout(State0#ch{queue_states = QueueStates0}) of
-        {noreply, State} ->
+    case evaluate_consumer_timeout(State0) of
+        {noreply, State1 = #ch{queue_states = QueueStates0}} ->
+            QueueStates = rabbit_queue_type:tick(QueueStates0),
+            State = State1#ch{queue_states = QueueStates},
             noreply(init_tick_timer(reset_tick_timer(State)));
         Return ->
             Return
