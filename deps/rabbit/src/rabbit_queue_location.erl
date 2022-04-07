@@ -13,27 +13,27 @@
 
 select_leader_and_followers(Q, Size)
   when (?amqqueue_is_quorum(Q) orelse ?amqqueue_is_stream(Q)) andalso is_integer(Size) ->
-    QueueType = amqqueue:get_type(Q),
-    GetQueues0 = get_queues_for_type(QueueType),
     {AllNodes, _DiscNodes, RunningNodes} = rabbit_mnesia:cluster_nodes(status),
-    {Replicas, GetQueues} = select_replicas(Size, AllNodes, RunningNodes, GetQueues0),
+    GetQueueNames0 = fun() -> rabbit_amqqueue:list_names() end,
+    QueueType = amqqueue:get_type(Q),
+    {Replicas, GetQueueNames} = select_replicas(Size, AllNodes, RunningNodes, GetQueueNames0, QueueType),
     LeaderLocator = leader_locator(
                       rabbit_queue_type_util:args_policy_lookup(
                         <<"queue-leader-locator">>,
                         fun (PolVal, _ArgVal) ->
                                 PolVal
                         end, Q)),
-    Leader = leader_node(LeaderLocator, Replicas, RunningNodes, GetQueues),
+    Leader = leader_node(LeaderLocator, Replicas, RunningNodes, GetQueueNames, QueueType),
     Followers = lists:delete(Leader, Replicas),
     {Leader, Followers}.
 
-select_replicas(Size, AllNodes, _, Fun)
+select_replicas(Size, AllNodes, _, Fun, _)
   when length(AllNodes) =< Size ->
     {AllNodes, Fun};
-select_replicas(Size, _, RunningNodes, Fun)
+select_replicas(Size, _, RunningNodes, Fun, _)
   when length(RunningNodes) =:= Size ->
     {RunningNodes, Fun};
-select_replicas(Size, AllNodes, RunningNodes, GetQueues) ->
+select_replicas(Size, AllNodes, RunningNodes, GetQueueNames, QueueType) ->
     %% Select nodes in the following order:
     %% 1. local node (to have data locality for declaring client)
     %% 2. running nodes
@@ -42,16 +42,23 @@ select_replicas(Size, AllNodes, RunningNodes, GetQueues) ->
     true = lists:member(Local, AllNodes),
     true = lists:member(Local, RunningNodes),
     Counters0 = maps:from_list([{Node, 0} || Node <- lists:delete(Local, AllNodes)]),
-    Queues = GetQueues(),
-    Counters = lists:foldl(fun(Q, Acc) ->
-                                   #{nodes := Nodes} = amqqueue:get_type_state(Q),
-                                   lists:foldl(fun(N, A)
-                                                     when is_map_key(N, A) ->
-                                                       maps:update_with(N, fun(C) -> C+1 end, A);
-                                                  (_, A) ->
-                                                       A
-                                               end, Acc, Nodes)
-                           end, Counters0, Queues),
+    QueueNames = GetQueueNames(),
+    Counters = lists:foldl(fun(QueueResource, Acc) ->
+                                   case rabbit_amqqueue:lookup(QueueResource) of
+                                       {ok, Q}
+                                         when ?is_amqqueue_v2(Q) andalso
+                                              ?amqqueue_v2_field_type(Q) =:= QueueType ->
+                                           #{nodes := Nodes} = amqqueue:get_type_state(Q),
+                                           lists:foldl(fun(N, A)
+                                                             when is_map_key(N, A) ->
+                                                               maps:update_with(N, fun(C) -> C+1 end, A);
+                                                          (_, A) ->
+                                                               A
+                                                       end, Acc, Nodes);
+                                       _ ->
+                                           Acc
+                                   end
+                           end, Counters0, QueueNames),
     L0 = maps:to_list(Counters),
     L1 = lists:sort(fun({N0, C0}, {N1, C1}) ->
                             case {lists:member(N0, RunningNodes),
@@ -66,32 +73,43 @@ select_replicas(Size, AllNodes, RunningNodes, GetQueues) ->
                     end, L0),
     {L2, _} = lists:split(Size - 1, L1),
     L = lists:map(fun({N, _}) -> N end, L2),
-    {[Local | L], fun() -> Queues end}.
+    {[Local | L], fun() -> QueueNames end}.
 
 leader_locator(undefined) -> <<"client-local">>;
 leader_locator(Val) -> Val.
 
-leader_node(<<"client-local">>, _, _, _) ->
+leader_node(<<"client-local">>, _, _, _, _) ->
     node();
-leader_node(<<"random">>, Nodes0, RunningNodes, _) ->
+leader_node(<<"random">>, Nodes0, RunningNodes, _, _) ->
     Nodes = potential_leaders(Nodes0, RunningNodes),
     lists:nth(rand:uniform(length(Nodes)), Nodes);
-leader_node(<<"least-leaders">>, Nodes0, RunningNodes, GetQueues)
-  when is_function(GetQueues, 0) ->
+leader_node(<<"least-leaders">>, Nodes0, RunningNodes, GetQueueNames, QueueType)
+  when is_function(GetQueueNames, 0) ->
     Nodes = potential_leaders(Nodes0, RunningNodes),
     Counters0 = maps:from_list([{N, 0} || N <- Nodes]),
-    Counters = lists:foldl(fun(Q, Acc) ->
-                                   case amqqueue:get_pid(Q) of
-                                       {RaName, LeaderNode}
-                                         when is_atom(RaName), is_atom(LeaderNode), is_map_key(LeaderNode, Acc) ->
-                                           maps:update_with(LeaderNode, fun(C) -> C+1 end, Acc);
-                                       StreamLeaderPid
-                                         when is_pid(StreamLeaderPid), is_map_key(node(StreamLeaderPid), Acc) ->
-                                           maps:update_with(node(StreamLeaderPid), fun(C) -> C+1 end, Acc);
+    Counters = lists:foldl(fun(QueueResource, Acc) ->
+                                   case rabbit_amqqueue:lookup(QueueResource) of
+                                       {ok, Q}
+                                         when ?is_amqqueue_v2(Q) andalso
+                                              ?amqqueue_v2_field_type(Q) =:= QueueType ->
+                                           case amqqueue:get_pid(Q) of
+                                               {RaName, LeaderNode}
+                                                 when ?amqqueue_v2_field_type(Q) =:= rabbit_quorum_queue,
+                                                      is_atom(RaName), is_atom(LeaderNode),
+                                                      is_map_key(LeaderNode, Acc) ->
+                                                   maps:update_with(LeaderNode, fun(C) -> C+1 end, Acc);
+                                               StreamLeaderPid
+                                                 when ?amqqueue_v2_field_type(Q) =:= rabbit_stream_queue,
+                                                      is_pid(StreamLeaderPid),
+                                                      is_map_key(node(StreamLeaderPid), Acc) ->
+                                                   maps:update_with(node(StreamLeaderPid), fun(C) -> C+1 end, Acc);
+                                               _ ->
+                                                   Acc
+                                           end;
                                        _ ->
                                            Acc
                                    end
-                           end, Counters0, GetQueues()),
+                           end, Counters0, GetQueueNames()),
     {Node, _} = hd(lists:keysort(2, maps:to_list(Counters))),
     Node.
 
@@ -106,14 +124,4 @@ potential_leaders(Nodes, AllRunningNodes) ->
             RunningNodes;
         Filtered ->
             Filtered
-    end.
-
-%% Return a function so that queues are fetched lazily (i.e. only when needed,
-%% and at most once when no amqqueue migration is going on).
-get_queues_for_type(QueueType) ->
-    fun() -> rabbit_amqqueue:list_with_possible_retry(
-               fun() ->
-                       mnesia:dirty_match_object(rabbit_queue,
-                                                 amqqueue:pattern_match_on_type(QueueType))
-               end)
     end.
