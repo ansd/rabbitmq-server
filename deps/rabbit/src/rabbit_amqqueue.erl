@@ -13,7 +13,8 @@
          delete_immediately/1, delete_exclusive/2, delete/4, purge/1,
          forget_all_durable/1]).
 -export([pseudo_queue/2, pseudo_queue/3, immutable/1]).
--export([lookup/1, lookup_many/1, not_found_or_absent/1, not_found_or_absent_dirty/1,
+-export([exists/1, lookup/1, lookup_many/1, lookup_element/2,
+         not_found_or_absent/1, not_found_or_absent_dirty/1,
          with/2, with/3, with_or_die/2,
          assert_equivalence/5,
          check_exclusive_access/2, with_exclusive_access_or_die/3,
@@ -397,6 +398,28 @@ lookup(Name) ->
 
 lookup_many(Names) when is_list(Names) ->
     lookup(Names).
+
+%% Instead of rabbit_amqqueue:lookup/1, use rabbit_amqqueue:lookup_element/2
+%% whenever on the hot path where a single element is needed.
+%% The latter copies less, and therefore requires less CPU and memory.
+-spec lookup_element(name(), pos_integer()) ->
+    {ok, term()} | {error, not_found}.
+lookup_element(QueueName, Pos)
+  when is_integer(Pos), Pos >= 3, Pos =< 19 ->
+    %% Prefer try-catch block over checking key existence with ets:member/2.
+    %% The latter reduces throughput by a few thousand messages per second because
+    %% of function db_member_hash in file erl_db_hash.c.
+    %% We optimise for the happy path, that is the queue is present.
+    try
+        {ok, ets:lookup_element(rabbit_queue, QueueName, Pos)}
+    catch
+        error:badarg ->
+            {error, not_found}
+    end.
+
+-spec exists(name()) -> boolean().
+exists(Name) ->
+    ets:member(rabbit_queue, Name).
 
 -spec not_found_or_absent(name()) -> not_found_or_absent().
 

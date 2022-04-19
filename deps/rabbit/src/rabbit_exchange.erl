@@ -10,7 +10,7 @@
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
 
 -export([recover/1, policy_changed/2, callback/4, declare/7,
-         assert_equivalence/6, assert_args_equivalence/2, check_type/1,
+         assert_equivalence/6, assert_args_equivalence/2, check_type/1, exists/1,
          lookup/1, lookup_many/1, lookup_or_die/1, list/0, list/1, lookup_scratch/2,
          update_scratch/3, update_decorators/1, immutable/1,
          info_keys/0, info/1, info/2, info_all/1, info_all/2, info_all/4,
@@ -220,6 +220,10 @@ assert_args_equivalence(#exchange{ name = Name, arguments = Args },
     rabbit_misc:assert_args_equivalence(Args, RequiredArgs, Name,
                                         [<<"alternate-exchange">>]).
 
+-spec exists(name()) -> boolean().
+exists(Name) ->
+    ets:member(rabbit_exchange, Name).
+
 -spec lookup
         (name()) -> rabbit_types:ok(rabbit_types:exchange()) |
                     rabbit_types:error('not_found').
@@ -419,34 +423,35 @@ route(#exchange{name = #resource{virtual_host = VHost, name = RName} = XName,
                      Decs = rabbit_exchange_decorator:select(route, Decorators),
                      lists:usort(route1(Delivery, Decs, {[X], XName, []}))
              end,
-    Qs = rabbit_amqqueue:lookup(QNames),
-    ExtraBccQNames = infer_extra_bcc(Qs),
-    ExtraBccQNames ++ QNames.
+    infer_extra_bcc(QNames) ++ QNames.
 
 virtual_reply_queue(<<"amq.rabbitmq.reply-to.", _/binary>>) -> true;
 virtual_reply_queue(_)                                      -> false.
 
--spec infer_extra_bcc([amqqueue:amqqueue()]) -> [rabbit_amqqueue:name()].
+-define(AMQQUEUE_INDEX_OPTIONS, 19).
+
+-spec infer_extra_bcc([rabbit_amqqueue:name()]) ->
+    [rabbit_amqqueue:name()].
 infer_extra_bcc([]) ->
     [];
-infer_extra_bcc([Q]) ->
-    case amqqueue:get_options(Q) of
-        #{extra_bcc := BCC} ->
-            #resource{virtual_host = VHost} = amqqueue:get_name(Q),
+infer_extra_bcc([#resource{virtual_host = VHost} = QName]) ->
+    case rabbit_amqqueue:lookup_element(QName, ?AMQQUEUE_INDEX_OPTIONS) of
+        {ok, #{extra_bcc := BCC}} ->
             [rabbit_misc:r(VHost, queue, BCC)];
-        _                   ->
+        _  ->
             []
     end;
-infer_extra_bcc(Qs) ->
-    lists:foldl(fun(Q, Acc) ->
-                        case amqqueue:get_options(Q) of
-                            #{extra_bcc := BCC} ->
-                                #resource{virtual_host = VHost} = amqqueue:get_name(Q),
-                                [rabbit_misc:r(VHost, queue, BCC) | Acc];
-                            _                   ->
-                                Acc
-                        end
-                end, [], Qs).
+infer_extra_bcc(QNames) ->
+    lists:filtermap(
+      fun(#resource{virtual_host = VHost} = QName) ->
+              case rabbit_amqqueue:lookup_element(
+                     QName, ?AMQQUEUE_INDEX_OPTIONS) of
+                  {ok, #{extra_bcc := BCC}} ->
+                      {true, rabbit_misc:r(VHost, queue, BCC)};
+                  _ ->
+                      false
+              end
+      end, QNames).
 
 route1(_, _, {[], _, QNames}) ->
     QNames;
@@ -576,7 +581,7 @@ internal_delete(X = #exchange{name = XName}, OnlyDurable, RemoveBindingsForSourc
     ok = mnesia:delete({rabbit_exchange_serial, XName}),
     mnesia:delete({rabbit_durable_exchange, XName}),
     Bindings = case RemoveBindingsForSource of
-        true  -> rabbit_binding:remove_for_source(XName);
+        true  -> rabbit_binding:remove_for_source(X);
         false -> []
     end,
     {deleted, X, Bindings, rabbit_binding:remove_for_destination(
