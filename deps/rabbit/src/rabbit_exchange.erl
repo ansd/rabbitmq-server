@@ -423,34 +423,35 @@ route(#exchange{name = #resource{virtual_host = VHost, name = RName} = XName,
                      Decs = rabbit_exchange_decorator:select(route, Decorators),
                      lists:usort(route1(Delivery, Decs, {[X], XName, []}))
              end,
-    Qs = rabbit_amqqueue:lookup(QNames),
-    ExtraBccQNames = infer_extra_bcc(Qs),
-    ExtraBccQNames ++ QNames.
+    infer_extra_bcc(QNames) ++ QNames.
 
 virtual_reply_queue(<<"amq.rabbitmq.reply-to.", _/binary>>) -> true;
 virtual_reply_queue(_)                                      -> false.
 
--spec infer_extra_bcc([amqqueue:amqqueue()]) -> [rabbit_amqqueue:name()].
+-define(AMQQUEUE_INDEX_OPTIONS, 19).
+
+-spec infer_extra_bcc([amqqueue:amqqueue()]) ->
+    [rabbit_amqqueue:name()].
 infer_extra_bcc([]) ->
     [];
-infer_extra_bcc([Q]) ->
-    case amqqueue:get_options(Q) of
-        #{extra_bcc := BCC} ->
-            #resource{virtual_host = VHost} = amqqueue:get_name(Q),
+infer_extra_bcc([#resource{virtual_host = VHost} = QName]) ->
+    case rabbit_amqqueue:lookup_element(QName, ?AMQQUEUE_INDEX_OPTIONS) of
+        {ok, #{extra_bcc := BCC}} ->
             [rabbit_misc:r(VHost, queue, BCC)];
-        _                   ->
+        _  ->
             []
     end;
-infer_extra_bcc(Qs) ->
-    lists:foldl(fun(Q, Acc) ->
-                        case amqqueue:get_options(Q) of
-                            #{extra_bcc := BCC} ->
-                                #resource{virtual_host = VHost} = amqqueue:get_name(Q),
-                                [rabbit_misc:r(VHost, queue, BCC) | Acc];
-                            _                   ->
-                                Acc
-                        end
-                end, [], Qs).
+infer_extra_bcc(QNames) ->
+    lists:filtermap(
+      fun(#resource{virtual_host = VHost} = QName) ->
+              case rabbit_amqqueue:lookup_element(
+                     QName, ?AMQQUEUE_INDEX_OPTIONS) of
+                  {ok, #{extra_bcc := BCC}} ->
+                      {true, rabbit_misc:r(VHost, queue, BCC)};
+                  _ ->
+                      false
+              end
+      end, QNames).
 
 route1(_, _, {[], _, QNames}) ->
     QNames;
