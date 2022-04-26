@@ -9,7 +9,7 @@
 -include_lib("stdlib/include/qlc.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--export([match_bindings/2, match_routing_key/2, route/2]).
+-export([match_bindings/2, match_routing_key/2]).
 
 %%----------------------------------------------------------------------------
 
@@ -21,7 +21,7 @@
 %%----------------------------------------------------------------------------
 
 -spec match_bindings(rabbit_types:binding_source(),
-                     fun ((rabbit_types:binding()) -> boolean())) ->
+                           fun ((rabbit_types:binding()) -> boolean())) ->
     match_result().
 
 match_bindings(SrcName, Match) ->
@@ -29,7 +29,7 @@ match_bindings(SrcName, Match) ->
                                           _           = '_'}},
     Routes = ets:select(rabbit_route, [{MatchHead, [], [['$_']]}]),
     [Dest || [#route{binding = Binding = #binding{destination = Dest}}] <-
-             Routes, Match(Binding)].
+        Routes, Match(Binding)].
 
 -spec match_routing_key(rabbit_types:binding_source(),
                         [routing_key(), ...] | ['_']) ->
@@ -47,7 +47,9 @@ match_routing_key(SrcName, [_|_] = RoutingKeys) ->
                                           key         = '$2',
                                           _           = '_'}},
                 [list_to_tuple(['orelse' | [{'=:=', '$2', RKey} ||
-                                            RKey <- RoutingKeys]])]).
+                                               RKey <- RoutingKeys]])]).
+
+%%--------------------------------------------------------------------
 
 %% Normally we'd call mnesia:dirty_select/2 here, but that is quite
 %% expensive for the same reasons as above, and, additionally, due to
@@ -62,35 +64,3 @@ match_routing_key(SrcName, [_|_] = RoutingKeys) ->
 %% rabbit_route is.
 find_routes(MatchHead, Conditions) ->
     ets:select(rabbit_route, [{MatchHead, Conditions, ['$1']}]).
-
-%% rabbit_router:match_bindings/2 and rabbit_router:match_routing_key/2 use
-%% ets:select/2 to get destinations. ets:select/2 is expensive because it needs
-%% to compile the match spec every time and lookup does not happen by a hash key.
-%%
-%% In contrast, rabbit_router:route/2 increases end-to-end message
-%% sending throughput (i.e. from RabbitMQ client to the queue process)
-%% by up to 35% by using ets:lookup_element/3.
-%% This function is currently only used by the direct exchange type because
-%% only the direct exchange type uses the rabbit_index_route table to store its
-%% bindings by key {source_exchange, routing_key}.
--spec route(rabbit_types:binding_source(), [routing_key(), ...]) ->
-    match_result().
-route(SrcName, [RoutingKey]) ->
-    %% optimization
-    destinations(SrcName, RoutingKey);
-route(SrcName, [_|_] = RoutingKeys) ->
-    lists:flatmap(fun(Key) ->
-                          destinations(SrcName, Key)
-                  end, RoutingKeys).
-
-destinations(SrcName, RoutingKey) ->
-    %% Prefer try-catch block over checking Key existence with ets:member/2.
-    %% The latter reduces throughput by a few thousand messages per second because
-    %% of function db_member_hash in file erl_db_hash.c.
-    %% We optimise for the happy path, that is the binding / table key is present.
-    try
-        ets:lookup_element(rabbit_index_route, {SrcName, RoutingKey}, 3)
-    catch
-        error:badarg ->
-            []
-    end.
