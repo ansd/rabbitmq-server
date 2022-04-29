@@ -145,6 +145,9 @@ maintenance_mode_status(Config) ->
         fun () -> rabbit_ct_broker_helpers:is_being_drained_local_read(Config, B) end,
         10000),
 
+    %% Restarting nodes should not lose the database information that node B is being drained.
+    rabbit_ct_broker_helpers:restart_node(Config, A),
+    rabbit_ct_broker_helpers:restart_node(Config, C),
     [begin
          ?assert(rabbit_ct_broker_helpers:is_being_drained_consistent_read(Config, TargetNode, B))
      end || TargetNode <- Nodes],

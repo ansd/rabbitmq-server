@@ -165,14 +165,21 @@ maintenance_mode_status_migration(FeatureName, _FeatureProps, enable) ->
         _ = rabbit_table:create(
               TableName,
               rabbit_maintenance:status_table_definition()),
-        _ = rabbit_table:ensure_table_copy(TableName, node())
+        _ = rabbit_table:ensure_table_copy(TableName, node(), disc_copies)
     catch throw:Reason  ->
         rabbit_log:error(
           "Failed to create maintenance status table: ~p",
           [Reason])
     end;
 maintenance_mode_status_migration(_FeatureName, _FeatureProps, is_enabled) ->
-    rabbit_table:exists(rabbit_maintenance:status_table_name()).
+    TableName = rabbit_maintenance:status_table_name(),
+    case rabbit_table:exists(TableName) of
+        true ->
+            _ = rabbit_table:ensure_table_copy(TableName, node(), disc_copies),
+            true;
+        false ->
+            false
+    end.
 
 %% -------------------------------------------------------------------
 %% User limits.

@@ -56,7 +56,8 @@ status_table_name() ->
 status_table_definition() ->
     maps:to_list(#{
         record_name => node_maintenance_state,
-        attributes  => record_info(fields, node_maintenance_state)
+        attributes  => record_info(fields, node_maintenance_state),
+        disc_copies => [node()]
     }).
 
 -spec is_enabled() -> boolean().
