@@ -57,7 +57,8 @@ status_table_definition() ->
     maps:to_list(#{
         record_name => node_maintenance_state,
         attributes  => record_info(fields, node_maintenance_state),
-        disc_copies => [node()]
+        %%TODO Do we still allow RAM nodes?
+        disc_copies => rabbit_nodes:all()
     }).
 
 -spec is_enabled() -> boolean().
