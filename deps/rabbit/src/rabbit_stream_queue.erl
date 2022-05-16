@@ -46,6 +46,7 @@
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("amqqueue.hrl").
+-include("tmp.hrl").
 
 -define(INFO_KEYS, [name, durable, auto_delete, arguments, leader, members, online, state,
                     messages, messages_ready, messages_unacknowledged, committed_offset,
@@ -56,25 +57,6 @@
 
 -type msg_id() :: non_neg_integer().
 -type msg() :: term(). %% TODO: refine
-
--record(stream, {name :: rabbit_types:r('queue'),
-                 credit :: integer(),
-                 max :: non_neg_integer(),
-                 start_offset = 0 :: non_neg_integer(),
-                 listening_offset = 0 :: non_neg_integer(),
-                 log :: undefined | osiris_log:state()}).
-
--record(stream_client, {stream_id :: string(),
-                        name :: term(),
-                        leader :: pid(),
-                        local_pid :: undefined | pid(),
-                        next_seq = 1 :: non_neg_integer(),
-                        correlation = #{} :: #{appender_seq() => {msg_id(), msg()}},
-                        soft_limit :: non_neg_integer(),
-                        slow = false :: boolean(),
-                        readers = #{} :: #{term() => #stream{}},
-                        writer_id :: binary()
-                       }).
 
 -import(rabbit_queue_type_util, [args_policy_lookup/3]).
 
@@ -351,8 +333,17 @@ deliver(_Confirm, #delivery{message = Msg, msg_seq_no = MsgId},
                       next_seq = Seq,
                       correlation = Correlation0,
                       soft_limit = SftLmt,
-                      slow = Slow0} = State) ->
-    ok = osiris:write(LeaderPid, WriterId, Seq, msg_to_iodata(Msg)),
+                      slow = Slow0,
+                      debug = Debug} = State) ->
+
+    M = case Debug of
+            true ->
+                {Seq, debug};
+            _ ->
+                Seq
+        end,
+
+    ok = osiris:write(LeaderPid, WriterId, M, msg_to_iodata(Msg)),
     Correlation = case MsgId of
                       undefined ->
                           Correlation0;
@@ -366,6 +357,15 @@ deliver(_Confirm, #delivery{message = Msg, msg_seq_no = MsgId},
                Bool ->
                    Bool
            end,
+
+    case Debug of
+        true ->
+            rabbit_log:debug(
+              "~s delivered ~p", [?MODULE, MsgId]);
+        _ ->
+            ok
+    end,
+
     State#stream_client{next_seq = Seq + 1,
                         correlation = Correlation,
                         slow = Slow}.
@@ -379,7 +379,17 @@ handle_event({osiris_written, From, _WriterId, Corrs},
              State = #stream_client{correlation = Correlation0,
                                     soft_limit = SftLmt,
                                     slow = Slow0,
-                                    name = Name}) ->
+                                    name = Name,
+                                    debug = Debug}) ->
+
+    case Debug of
+        true ->
+            rabbit_log:debug(
+              "~s osiris_written ~p", [?MODULE, Corrs]);
+        _ ->
+            ok
+    end,
+
     MsgIds = lists:sort(maps:fold(
                           fun (_Seq, {I, _M}, Acc) ->
                                   [I | Acc]

@@ -7,6 +7,7 @@
 
 -module(rabbit_queue_type).
 -include("amqqueue.hrl").
+-include("tmp.hrl").
 -include_lib("rabbit_common/include/resource.hrl").
 
 -export([
@@ -81,24 +82,24 @@
     {down, pid(), Info :: term()} |
     term().
 
--record(ctx, {module :: module(),
-              name :: queue_name(),
-              %% "publisher confirm queue accounting"
-              %% queue type implementation should emit a:
-              %% {settle, Success :: boolean(), msg_tag()}
-              %% to either settle or reject the delivery of a
-              %% message to the queue instance
-              %% The queue type module will then emit a {confirm | reject, [msg_tag()}
-              %% action to the channel or channel like process when a msg_tag
-              %% has reached its conclusion
-              state :: queue_state()}).
+% -record(ctx, {module :: module(),
+%               name :: queue_name(),
+%               %% "publisher confirm queue accounting"
+%               %% queue type implementation should emit a:
+%               %% {settle, Success :: boolean(), msg_tag()}
+%               %% to either settle or reject the delivery of a
+%               %% message to the queue instance
+%               %% The queue type module will then emit a {confirm | reject, [msg_tag()}
+%               %% action to the channel or channel like process when a msg_tag
+%               %% has reached its conclusion
+%               state :: queue_state()}).
 
 
--record(?STATE, {ctxs = #{} :: #{queue_ref() => #ctx{}},
-                 monitor_registry = #{} :: #{pid() => queue_ref()}
-                }).
+% -record(?STATE, {ctxs = #{} :: #{queue_ref() => #ctx{}},
+%                  monitor_registry = #{} :: #{pid() => queue_ref()}
+%                 }).
 
--opaque state() :: #?STATE{}.
+-type state() :: #?STATE{}.
 
 -type consume_spec() :: #{no_ack := boolean(),
                           channel_pid := pid(),

@@ -35,7 +35,7 @@
          send_command_sync/2, send_command_sync/3,
          send_command_and_notify/4, send_command_and_notify/5,
          send_command_flow/2, send_command_flow/3,
-         flush/1]).
+         flush/1, debug/1]).
 -export([internal_send_command/4, internal_send_command/6]).
 -export([msg_size/1, maybe_gc_large_msg/1, maybe_gc_large_msg/2]).
 
@@ -59,7 +59,8 @@
     %% flushes)
     pending,
     %% defines how ofter gc will be executed
-    writer_gc_threshold
+    writer_gc_threshold,
+    debug
 }).
 
 -define(HIBERNATE_AFTER, 5000).
@@ -253,6 +254,10 @@ handle_message({'$gen_call', From, flush}, State) ->
     State1 = internal_flush(State),
     gen_server:reply(From, ok),
     State1;
+handle_message({'$gen_call', From, debug}, State) ->
+    State1 = State#wstate{debug = true},
+    gen_server:reply(From, ok),
+    State1;
 handle_message({send_command_and_notify, QPid, ChPid, MethodRecord}, State) ->
     State1 = internal_send_command_async(MethodRecord, State),
     rabbit_amqqueue_common:notify_sent(QPid, ChPid),
@@ -310,6 +315,8 @@ send_command_and_notify(W, Q, ChPid, MethodRecord, Content) ->
     ok.
 
 flush(W) -> call(W, flush).
+
+debug(W) -> call(W, debug).
 
 %%---------------------------------------------------------------------------
 
@@ -381,8 +388,20 @@ maybe_flush(State = #wstate{pending = Pending}) ->
 
 internal_flush(State = #wstate{pending = []}) ->
     State;
-internal_flush(State = #wstate{sock = Sock, pending = Pending}) ->
+internal_flush(State = #wstate{sock = Sock, pending = Pending, debug = Debug}) ->
+    case Debug of
+        true ->
+            rabbit_log:debug("writer sending ~p", [Pending]);
+        _ ->
+            ok
+    end,
     ok = port_cmd(Sock, lists:reverse(Pending)),
+    case Debug of
+        true ->
+            rabbit_log:debug("writer sent", []);
+        _ ->
+            ok
+    end,
     State#wstate{pending = []}.
 
 %% gen_tcp:send/2 does a selective receive of {inet_reply, Sock,

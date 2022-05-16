@@ -41,6 +41,7 @@
 -include_lib("rabbit_common/include/rabbit_misc.hrl").
 
 -include("amqqueue.hrl").
+-include("tmp.hrl").
 
 -behaviour(gen_server2).
 
@@ -68,6 +69,7 @@
 
 %% Mgmt HTTP API refactor
 -export([handle_method/6]).
+-export([debug/1]).
 
 -record(conf, {
           %% starting | running | flow | closing
@@ -169,7 +171,8 @@
              interceptor_state,
              queue_states,
              tick_timer,
-             publishing_mode = false :: boolean()
+             publishing_mode = false :: boolean(),
+             debug
             }).
 
 -define(QUEUE, lqueue).
@@ -598,6 +601,23 @@ handle_call(flush, _From, State) ->
 handle_call({info, Deadline}, _From, State) ->
     try
         reply({ok, infos(?INFO_KEYS, Deadline, State)}, State)
+    catch
+        Error ->
+            reply({error, Error}, State)
+    end;
+
+handle_call(debug, _From, State = #ch{cfg = #conf{writer_pid = WriterPid},
+                                      queue_states = QueueStates0}) ->
+    try
+        ok = rabbit_writer:debug(WriterPid),
+
+        %% assumes single stream for now
+        #rabbit_queue_type{ctxs = Ctxs0} = QueueStates0,
+        Ctxs = maps:map(fun(_K, #ctx{state = S} = C) -> C#ctx{state = S#stream_client{debug = true}} end, Ctxs0),
+        QueueStates = QueueStates0#rabbit_queue_type{ctxs = Ctxs},
+
+        reply({ok, ok1}, State#ch{debug = true,
+                                  queue_states = QueueStates})
     catch
         Error ->
             reply({error, Error}, State)
@@ -1290,7 +1310,8 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
                                               },
                                    tx               = Tx,
                                    confirm_enabled  = ConfirmEnabled,
-                                   delivery_flow    = Flow
+                                   delivery_flow    = Flow,
+                                   debug = Debug
                                    }) ->
     State0 = maybe_increase_global_publishers(State),
     rabbit_global_counters:messages_received(amqp091, 1),
@@ -1309,12 +1330,18 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
     check_expiration_header(Props),
     DoConfirm = Tx =/= none orelse ConfirmEnabled,
     {MsgSeqNo, State1} =
-        case DoConfirm of
-            false -> {undefined, State0};
-            true  -> rabbit_global_counters:messages_received_confirm(amqp091, 1),
-                     SeqNo = State0#ch.publish_seqno,
-                     {SeqNo, State0#ch{publish_seqno = SeqNo + 1}}
-        end,
+    case DoConfirm of
+        false -> {undefined, State0};
+        true  -> rabbit_global_counters:messages_received_confirm(amqp091, 1),
+                 SeqNo = State0#ch.publish_seqno,
+                 {SeqNo, State0#ch{publish_seqno = SeqNo + 1}}
+    end,
+    case Debug of
+        true ->
+            rabbit_log:debug("channel chose seqno ~p", [MsgSeqNo]);
+        _ ->
+            ok
+    end,
     case rabbit_basic:message(ExchangeName, RoutingKey, DecodedContent) of
         {ok, Message} ->
             Delivery = rabbit_basic:delivery(
@@ -2260,10 +2287,20 @@ process_routing_confirm(false, _, _, _, State) ->
     State;
 process_routing_confirm(true, [], MsgSeqNo, XName, State) ->
     record_confirms([{MsgSeqNo, XName}], State);
+process_routing_confirm(true, QRefs, MsgSeqNo, XName, #ch{debug = true} = State) ->
+    rabbit_log:debug(
+      "rabbit_confirms:insert ~p", [MsgSeqNo]),
+    State#ch{unconfirmed =
+        rabbit_confirms:insert(MsgSeqNo, QRefs, XName, State#ch.unconfirmed)};
 process_routing_confirm(true, QRefs, MsgSeqNo, XName, State) ->
     State#ch{unconfirmed =
         rabbit_confirms:insert(MsgSeqNo, QRefs, XName, State#ch.unconfirmed)}.
 
+confirm(MsgSeqNos, QRef, State = #ch{unconfirmed = UC,
+                                     debug = true}) ->
+    rabbit_log:debug("rabbit_confirms:confirm ~p", [MsgSeqNos]),
+    {ConfirmMXs, UC1} = rabbit_confirms:confirm(MsgSeqNos, QRef, UC),
+    record_confirms(ConfirmMXs, State#ch{unconfirmed = UC1});
 confirm(MsgSeqNos, QRef, State = #ch{unconfirmed = UC}) ->
     %% NOTE: if queue name does not exist here it's likely that the ref also
     %% does not exist in unconfirmed messages.
@@ -2320,9 +2357,21 @@ send_confirms([], _, State) ->
 send_confirms(_Cs, _, State = #ch{cfg = #conf{state = closing}}) -> %% optimisation
     State;
 send_confirms([MsgSeqNo], _, State) ->
+    case State#ch.debug of
+        true ->
+            rabbit_log:debug("send ack ~p", [MsgSeqNo]);
+        _ ->
+            ok
+    end,
     ok = send(#'basic.ack'{delivery_tag = MsgSeqNo}, State),
     State;
 send_confirms(Cs, Rs, State) ->
+    case State#ch.debug of
+        true ->
+            rabbit_log:debug("send acks ~p", [Cs]);
+        _ ->
+            ok
+    end,
     coalesce_and_send(Cs, Rs,
                       fun(MsgSeqNo, Multiple) ->
                                   #'basic.ack'{delivery_tag = MsgSeqNo,
@@ -2900,3 +2949,15 @@ maybe_decrease_global_publishers(#ch{publishing_mode = true}) ->
     ok;
 maybe_decrease_global_publishers(#ch{publishing_mode = false}) ->
     rabbit_global_counters:publisher_deleted(amqp091).
+
+debug(Pid) ->
+    try
+        case gen_server2:call(Pid, debug, 5000) of
+            {ok, Res}      -> Res;
+            {error, Error} -> throw(Error)
+        end
+    catch
+        exit:{timeout, _} ->
+            rabbit_log:error("Timed out setting debug on channel ~p", [Pid]),
+            throw(timeout)
+    end.
