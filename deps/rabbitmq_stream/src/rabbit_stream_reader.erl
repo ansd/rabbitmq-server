@@ -246,7 +246,9 @@ init([KeepaliveSup,
             State =
             #stream_connection_state{consumers = #{},
                                      blocked = false},
-            Transport:setopts(RealSocket, [{active, once}, {packet, 4}]),
+            Transport:setopts(RealSocket, [{active, once},
+                                           {packet, 4},
+                                           {packet_size, FrameMax}]),
             rabbit_alarm:register(self(), {?MODULE, resource_alarm, []}),
             ConnectionNegotiationStepTimeout =
                 application:get_env(rabbitmq_stream,
@@ -1396,7 +1398,7 @@ handle_frame_pre_auth(Transport,
                       State,
                       {response, _, {tune, _, _} = Tune}) ->
     ?FUNCTION_NAME(Transport, Connection, State, Tune);
-handle_frame_pre_auth(_Transport,
+handle_frame_pre_auth(Transport,
                       #stream_connection{helper_sup = SupPid,
                                          socket = Sock,
                                          name = ConnectionName} =
@@ -1405,6 +1407,7 @@ handle_frame_pre_auth(_Transport,
                       {tune, FrameMax, Heartbeat}) ->
     rabbit_log_connection:debug("Tuning response ~p ~p ",
                                 [FrameMax, Heartbeat]),
+    Transport:setopts(Sock, [{packet_size, FrameMax}]),
     Parent = self(),
     %% sending a message to the main process so the heartbeat frame is sent from this main process
     %% otherwise heartbeat frames can interleave with chunk delivery

@@ -46,7 +46,9 @@ groups() ->
        unauthenticated_client_rejected_authenticating,
        timeout_authenticating,
        timeout_close_sent,
-       max_segment_size_bytes_validation]},
+       max_segment_size_bytes_validation,
+       frame_max,
+       frame_max_unlimited]},
      %% Run `test_global_counters` on its own so the global metrics are
      %% initialised to 0 for each testcase
      {single_node_1, [], [test_global_counters]},
@@ -330,6 +332,69 @@ max_segment_size_bytes_validation(Config) ->
     test_close(Transport, S),
     ok.
 
+frame_max(Config) ->
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    %% For the client itself, we do NOT set socket option packet_size.
+    %% We only want to test the server against our misbehaving client that
+    %% sends too much data.
+    {ok, S} = Transport:connect("localhost", Port, ?SOCKET_OPTS),
+    test_peer_properties(Transport, S),
+
+    FrameMax = 50,
+    test_authenticate(Transport, S, FrameMax),
+
+    Stream = <<"stream-frame-max">>,
+    test_create_stream(Transport, S, Stream),
+    PublisherId = 1,
+    test_declare_publisher(Transport, S, PublisherId, Stream),
+
+    %% Before the actual message body, the publish frame contains 21 bytes of header:
+    %%   2 bytes publish command
+    %% + 2 bytes version
+    %% + 1 byte publisher ID
+    %% + 4 bytes message count
+    %% + 8 bytes publishing ID
+    %% + 4 bytes message body size
+    HeaderSize = 21,
+
+    %% Therefore this message should fit exactly the maximum allowed frame size.
+    test_publish_confirm(Transport, S, PublisherId,
+                         <<1:(FrameMax - HeaderSize)/unit:8>>),
+
+    %% This message should exceed the maximum allowed frame size by 1 byte.
+    BodySize = FrameMax - HeaderSize + 1,
+    Body = <<1:BodySize/unit:8>>,
+    Messages = [<<1:64, 0:1, BodySize:31, Body:BodySize/binary>>],
+    PublishFrame = rabbit_stream_core:frame({publish, PublisherId, 1, Messages}),
+    %% Sanity check that we constructed a frame exceeding FrameMax by 1 byte.
+    ?assertEqual(FrameMax + 1, iolist_size(PublishFrame)),
+    ok = Transport:send(S, PublishFrame),
+    %% We expect the server to close the connection.
+    ?assertEqual(closed, wait_for_socket_close(Transport, S, 10)).
+
+frame_max_unlimited(Config) ->
+    Transport = gen_tcp,
+    Port = get_stream_port(Config),
+    {ok, S} = Transport:connect("localhost", Port, ?SOCKET_OPTS),
+    test_peer_properties(Transport, S),
+
+    test_authenticate(Transport, S, _UnlimitedFrameMax = 0),
+
+    Stream = <<"stream-frame-max-unlimited">>,
+    test_create_stream(Transport, S, Stream),
+    PublisherId = 1,
+    test_declare_publisher(Transport, S, PublisherId, Stream),
+
+    %% Sending a large frame should succeed.
+    test_publish_confirm(Transport, S, PublisherId,
+                         <<1:(?DEFAULT_FRAME_MAX * 2)/unit:8>>),
+
+    test_delete_stream(Transport, S, Stream),
+    test_close(Transport, S),
+    closed = wait_for_socket_close(Transport, S, 10),
+    ok.
+
 consumer_count(Config) ->
     ets_count(Config, ?TABLE_CONSUMER).
 
@@ -427,8 +492,11 @@ test_peer_properties(Transport, S) ->
                  Cmd).
 
 test_authenticate(Transport, S) ->
+    test_authenticate(Transport, S, ?DEFAULT_FRAME_MAX).
+
+test_authenticate(Transport, S, FrameMax) ->
     SaslHandshakeFrame =
-    rabbit_stream_core:frame({request, 1, sasl_handshake}),
+        rabbit_stream_core:frame({request, 1, sasl_handshake}),
     ok = Transport:send(S, SaslHandshakeFrame),
     Plain = <<"PLAIN">>,
     AmqPlain = <<"AMQPLAIN">>,
@@ -454,7 +522,7 @@ test_authenticate(Transport, S) ->
 
     TuneFrame =
         rabbit_stream_core:frame({response, 0,
-                                  {tune, ?DEFAULT_FRAME_MAX, 0}}),
+                                  {tune, FrameMax, _HeartBeat = 0}}),
     ok = Transport:send(S, TuneFrame),
 
     VirtualHost = <<"/">>,
