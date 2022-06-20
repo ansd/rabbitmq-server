@@ -59,7 +59,8 @@ process_command(Cmd, #state{leader = Leader} = State, Tries) ->
 
 -spec handle_ra_event(ra:server_id(), term(), state()) ->
     {ok, state(), actions()}.
-handle_ra_event(Leader, {machine, {dlx_delivery, _} = Del}, #state{leader = Leader} = State) ->
+handle_ra_event(Leader, {machine, {dlx_delivery, _} = Del},
+                #state{leader = Leader} = State) ->
     handle_delivery(Del, State);
 handle_ra_event(From, Evt, State) ->
     rabbit_log:debug("Ignoring ra event ~tp from ~tp", [Evt, From]),

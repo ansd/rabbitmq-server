@@ -99,12 +99,11 @@
 
 -rabbit_feature_flag(
    {restart_streams,
-    #{desc          => "Support for restarting streams with optional preferred next leader argument. "
+    #{desc          => "Support for restarting streams with optional preferred next leader argument."
       "Used to implement stream leader rebalancing",
       stability     => stable,
       depends_on    => [stream_queue]
      }}).
-
 
 -rabbit_feature_flag(
    {stream_sac_coordinator_unblock_group,
@@ -112,4 +111,11 @@
       doc_url       => "https://github.com/rabbitmq/rabbitmq-server/issues/7743",
       stability     => stable,
       depends_on    => [stream_single_active_consumer]
+     }}).
+
+-rabbit_feature_flag(
+   {message_containers,
+    #{desc          => "Message containers.",
+      stability     => stable,
+      depends_on    => [feature_flags_v2]
      }}).

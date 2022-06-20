@@ -1,11 +1,11 @@
 -module(rabbit_confirms_SUITE).
 
+-compile(nowarn_export_all).
 -compile(export_all).
 
 -export([
          ]).
 
--include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%%===================================================================
