@@ -21,7 +21,8 @@
 all() ->
     [
       {group, routing_tests},
-      {group, hash_ring_management_tests}
+      {group, hash_ring_management_tests},
+      {group, clustered}
     ].
 
 groups() ->
@@ -48,7 +49,8 @@ groups() ->
                                 test_hash_ring_updates_when_queue_is_unbound,
                                 test_hash_ring_updates_when_duplicate_binding_is_created_and_queue_is_deleted,
                                 test_hash_ring_updates_when_duplicate_binding_is_created_and_binding_is_deleted
-                               ]}
+                               ]},
+      {clustered, [], [node_restart]}
     ].
 
 %% -------------------------------------------------------------------
@@ -57,23 +59,29 @@ groups() ->
 
 init_per_suite(Config) ->
     rabbit_ct_helpers:log_environment(),
-    Config1 = rabbit_ct_helpers:set_config(Config, [
-        {rmq_nodename_suffix, ?MODULE}
-      ]),
-    rabbit_ct_helpers:run_setup_steps(Config1,
-      rabbit_ct_broker_helpers:setup_steps() ++
-      rabbit_ct_client_helpers:setup_steps()).
+    rabbit_ct_helpers:run_setup_steps(Config, []).
 
 end_per_suite(Config) ->
-    rabbit_ct_helpers:run_teardown_steps(Config,
-      rabbit_ct_client_helpers:teardown_steps() ++
-      rabbit_ct_broker_helpers:teardown_steps()).
+    rabbit_ct_helpers:run_teardown_steps(Config).
 
-init_per_group(_, Config) ->
-    Config.
+init_per_group(Group, Config) ->
+    NodesCount = case Group of
+                     clustered -> 3;
+                     _ -> 1
+                 end,
+    Config1 = rabbit_ct_helpers:set_config(
+                Config,
+                [{rmq_nodes_count, NodesCount},
+                 {rmq_nodename_suffix, Group}
+                ]),
+    rabbit_ct_helpers:run_steps(Config1,
+                                rabbit_ct_broker_helpers:setup_steps() ++
+                                rabbit_ct_client_helpers:setup_steps()).
 
 end_per_group(_, Config) ->
-    Config.
+    rabbit_ct_helpers:run_steps(Config,
+                                rabbit_ct_client_helpers:teardown_steps() ++
+                                rabbit_ct_broker_helpers:teardown_steps()).
 
 init_per_testcase(Testcase, Config) ->
     clean_up_test_topology(Config),
@@ -587,7 +595,10 @@ test_hash_ring_updates_when_duplicate_binding_is_created_and_queue_is_deleted(Co
                                                exchange = X,
                                                routing_key = <<"3">>}),
 
-    ?assertEqual(5, count_buckets_of_exchange(Config, X)),
+    %% 1st binding wins.
+    %% Subsequent bindings with same source and same destination
+    %% (but possibly different routing key) should be ignored.
+    ?assertEqual(2, count_buckets_of_exchange(Config, X)),
     assert_ring_consistency(Config, X),
 
     Q2 = <<"f-q2">>,
@@ -599,7 +610,7 @@ test_hash_ring_updates_when_duplicate_binding_is_created_and_queue_is_deleted(Co
                                                exchange = X,
                                                routing_key = <<"4">>}),
 
-    ?assertEqual(9, count_buckets_of_exchange(Config, X)),
+    ?assertEqual(6, count_buckets_of_exchange(Config, X)),
     assert_ring_consistency(Config, X),
 
     amqp_channel:call(Chan, #'queue.delete' {queue = Q1}),
@@ -643,18 +654,65 @@ test_hash_ring_updates_when_duplicate_binding_is_created_and_binding_is_deleted(
                                                exchange = X,
                                                routing_key = <<"4">>}),
 
-    ?assertEqual(9, count_buckets_of_exchange(Config, X)),
+    ?assertEqual(6, count_buckets_of_exchange(Config, X)),
     assert_ring_consistency(Config, X),
 
-    %% Both bindings to Q1 will be deleted
+    %% Sould be a no-op since duplicate binding got ignored when it was added.
     amqp_channel:call(Chan, #'queue.unbind'{queue = Q1,
                                             exchange = X,
                                             routing_key = <<"3">>}),
+    ?assertEqual(6, count_buckets_of_exchange(Config, X)),
+    assert_ring_consistency(Config, X),
+
+    %% Deleting the original binding should work.
+    amqp_channel:call(Chan, #'queue.unbind'{queue = Q1,
+                                            exchange = X,
+                                            routing_key = <<"2">>}),
     ?assertEqual(4, count_buckets_of_exchange(Config, X)),
     assert_ring_consistency(Config, X),
 
     clean_up_test_topology(Config, X, [Q1, Q2]),
     rabbit_ct_client_helpers:close_channel(Chan),
+    ok.
+
+%% Follows the setup described in
+%% https://github.com/rabbitmq/rabbitmq-server/issues/3386#issuecomment-1103929292
+node_restart(Config) ->
+    Chan1 = rabbit_ct_client_helpers:open_channel(Config, 1),
+    Chan2 = rabbit_ct_client_helpers:open_channel(Config, 2),
+
+    X = atom_to_binary(?FUNCTION_NAME),
+    #'exchange.declare_ok'{} = amqp_channel:call(Chan1,
+                                                 #'exchange.declare'{exchange = X,
+                                                                     durable = true,
+                                                                     type = <<"x-consistent-hash">>}),
+    F = fun(Chan, Qs) ->
+                lists:foreach(
+                  fun(Q) ->
+                          #'queue.declare_ok'{} =
+                          amqp_channel:call(Chan, #'queue.declare'{queue = Q,
+                                                                   durable = true}),
+                          #'queue.bind_ok'{} =
+                          amqp_channel:call(Chan, #'queue.bind' {exchange = X,
+                                                                 queue = Q,
+                                                                 routing_key = <<"1">>})
+                  end, Qs)
+        end,
+    QsNode1 = [<<"q2">>, <<"q4">>],
+    QsNode2 = [<<"q1">>, <<"q3">>],
+    F(Chan1, QsNode1),
+    F(Chan2, QsNode2),
+
+    rabbit_ct_client_helpers:close_channel(Chan1),
+    rabbit_ct_client_helpers:close_channel(Chan2),
+
+    rabbit_ct_broker_helpers:restart_node(Config, 1),
+    rabbit_ct_broker_helpers:restart_node(Config, 2),
+
+    ?assertEqual(4, count_all_hash_ring_buckets(Config)),
+    assert_ring_consistency(Config, X),
+
+    clean_up_test_topology(Config, X, QsNode1 ++ QsNode2),
     ok.
 
 %%
