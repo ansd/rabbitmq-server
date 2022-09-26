@@ -30,7 +30,8 @@
    {stream_queue,
     #{desc          => "Support queues of type `stream`",
       doc_url       => "https://www.rabbitmq.com/stream.html",
-      stability     => stable,
+      %%TODO remove compatibility code
+      stability     => required,
       depends_on    => [quorum_queue]
      }}).
 
