@@ -64,6 +64,10 @@ takeover(Parent, Ref, Socket, Transport, Opts, Buffer, {Handler, HandlerState}) 
                               {Handler, HandlerState#state{socket = Sock}}).
 
 %% cowboy_websocket
+-spec init(Req, any()) ->
+    {ok | module(), Req, any()} |
+    {module(), Req, any(), any()}
+      when Req::cowboy_req:req().
 init(Req, Opts) ->
     {PeerAddr, _PeerPort} = maps:get(peer, Req),
     SockInfo = maps:get(proxy_header, Req, undefined),
@@ -87,6 +91,9 @@ init(Req, Opts) ->
                        received_connect_frame = false
                       }, WsOpts}.
 
+-spec websocket_init(State) ->
+    {cowboy_websocket:commands(), State} |
+    {cowboy_websocket:commands(), State, hibernate}.
 websocket_init(State0 = #state{socket = Sock, peername = PeerAddr}) ->
     ok = file_handle_cache:obtain(),
     case rabbit_net:connection_string(Sock, inbound) of
@@ -102,13 +109,13 @@ websocket_init(State0 = #state{socket = Sock, peername = PeerAddr}) ->
                                                                  fun send_reply/2,
                                                                  PeerAddr),
             process_flag(trap_exit, true),
-            {ok,
+            {[],
              rabbit_event:init_stats_timer(
                State#state{proc_state = ProcessorState},
                #state.stats_timer),
              hibernate};
-        _ ->
-            {stop, State0}
+        {error, Reason} ->
+            {[{shutdown_reason, Reason}], State0}
     end.
 
 -spec close_connection(pid(), string()) -> 'ok'.
@@ -118,15 +125,18 @@ close_connection(Pid, Reason) ->
     sys:terminate(Pid, Reason),
     ok.
 
+-spec websocket_handle(ping | pong | {text | binary | ping | pong, binary()}, State) ->
+    {cowboy_websocket:commands(), State} |
+    {cowboy_websocket:commands(), State, hibernate}.
 websocket_handle({binary, Data}, State) ->
     handle_data(Data, State);
 %% Silently ignore ping and pong frames as Cowboy will automatically reply to ping frames.
 websocket_handle({Ping, _}, State)
   when Ping =:= ping orelse Ping =:= pong ->
-    {ok, State, hibernate};
+    {[], State, hibernate};
 websocket_handle(Ping, State)
   when Ping =:= ping orelse Ping =:= pong ->
-    {ok, State, hibernate};
+    {[], State, hibernate};
 %% Log any other unexpected frames.
 websocket_handle(Frame, State) ->
     rabbit_log_connection:info("Web MQTT: unexpected WebSocket frame ~tp",
@@ -134,8 +144,11 @@ websocket_handle(Frame, State) ->
     %%TODO close connection instead?
     %%"MQTT Control Packets MUST be sent in WebSocket binary data frames.
     %% If any other type of data frame is received the recipient MUST close the Network Connection"
-    {ok, State, hibernate}.
+    {[], State, hibernate}.
 
+-spec websocket_info(any(), State) ->
+    {cowboy_websocket:commands(), State} |
+    {cowboy_websocket:commands(), State, hibernate}.
 websocket_info({conserve_resources, Conserve}, State) ->
     NewState = State#state{conserve_resources = Conserve},
     handle_credits(control_throttle(NewState));
@@ -144,14 +157,14 @@ websocket_info({bump_credit, Msg}, State) ->
     handle_credits(control_throttle(State));
     %%TODO return hibernate?
 websocket_info({reply, Data}, State) ->
-    {reply, {binary, Data}, State, hibernate};
+    {[{binary, Data}], State, hibernate};
 websocket_info({'EXIT', _, _}, State) ->
     stop(State);
 websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}},
                State = #state{proc_state = PState0}) ->
     case rabbit_mqtt_processor:handle_queue_event(QueueEvent, PState0) of
         {ok, PState} ->
-            {ok, State#state{proc_state = PState}, hibernate};
+            {[], State#state{proc_state = PState}, hibernate};
         {error, Reason, PState} ->
             rabbit_log_connection:error("Web MQTT connection ~p failed to handle queue event: ~p",
                                         [State#state.conn_name, Reason]),
@@ -171,7 +184,7 @@ websocket_info({keepalive, Req}, State = #state{keepalive = KState0,
                                                 conn_name = ConnName}) ->
     case rabbit_mqtt_keepalive:handle(Req, KState0) of
         {ok, KState} ->
-            {ok, State#state{keepalive = KState}, hibernate};
+            {[], State#state{keepalive = KState}, hibernate};
         {error, timeout} ->
             rabbit_log_connection:error("keepalive timeout in Web MQTT connection ~p",
                                         [ConnName]),
@@ -182,15 +195,16 @@ websocket_info({keepalive, Req}, State = #state{keepalive = KState0,
             stop(State)
     end;
 websocket_info(emit_stats, State) ->
-    {ok, emit_stats(State), hibernate};
+    {[], emit_stats(State), hibernate};
 websocket_info({ra_event, _From, Evt},
                #state{proc_state = PState0} = State) ->
     PState = rabbit_mqtt_processor:handle_ra_event(Evt, PState0),
-    {ok, State#state{proc_state = PState}, hibernate};
+    {[], State#state{proc_state = PState}, hibernate};
 websocket_info(Msg, State) ->
     rabbit_log_connection:warning("Web MQTT: unexpected message ~p", [Msg]),
-    {ok, State, hibernate}.
+    {[], State, hibernate}.
 
+-spec terminate(any(), cowboy_req:req(), any()) -> ok.
 terminate(_Reason, _Request,
           #state{conn_name = ConnName,
                  proc_state = PState,
@@ -274,7 +288,7 @@ handle_credits(State0) ->
         State = #state{state = running} ->
             {[{active, true}], State};
         State ->
-            {ok, State}
+            {[], State}
     end.
 
 control_throttle(State = #state{state = CS,
@@ -297,6 +311,7 @@ send_reply(Frame, PState) ->
 ensure_stats_timer(State) ->
     rabbit_event:ensure_stats_timer(State, #state.stats_timer, emit_stats).
 
+%% TODO if #state.stats_timer is undefined, rabbit_event:if_enabled crashes
 maybe_emit_stats(State) ->
     rabbit_event:if_enabled(State, #state.stats_timer,
                                 fun() -> emit_stats(State) end).
