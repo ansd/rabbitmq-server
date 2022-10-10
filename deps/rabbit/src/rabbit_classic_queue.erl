@@ -544,7 +544,7 @@ send_rejection(Pid, QName, MsgSeqNo) ->
     end.
 
 deliver_to_consumer(Pid, QName, CTag, AckRequired, Message) ->
-    case  has_classic_queue_type_delivery_support() of
+    case has_classic_queue_type_delivery_support() of
         true ->
             Deliver = {deliver, CTag, AckRequired, [Message]},
             Evt = {queue_event, QName, Deliver},

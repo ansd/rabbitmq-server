@@ -604,14 +604,14 @@ enable_unsupported_feature_flag_in_a_healthy_situation(Config) ->
 
 enable_feature_flag_when_ff_file_is_unwritable(Config) ->
     Supported = rabbit_ct_broker_helpers:is_feature_flag_supported(
-                  Config, stream_queue),
+                  Config, classic_queue_type_delivery_support),
     case Supported of
         true  -> do_enable_feature_flag_when_ff_file_is_unwritable(Config);
-        false -> {skip, "Stream queues are unsupported"}
+        false -> {skip, "classic queue type delivery is unsupported"}
     end.
 
 do_enable_feature_flag_when_ff_file_is_unwritable(Config) ->
-    FeatureName = stream_queue,
+    FeatureName = classic_queue_type_delivery_support,
     ClusterSize = ?config(rmq_nodes_count, Config),
     Node = ClusterSize - 1,
     True = lists:duplicate(ClusterSize, true),
