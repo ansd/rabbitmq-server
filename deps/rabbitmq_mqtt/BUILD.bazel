@@ -166,6 +166,13 @@ suites = [
             "test/rabbitmq_mqtt.app",
         ],
     ),
+    rabbitmq_integration_suite(
+        PACKAGE,
+        name = "ff_SUITE",
+        runtime_deps = [
+            "@emqtt//:erlang_app",
+        ],
+    ),
 ]
 
 assert_suites(
