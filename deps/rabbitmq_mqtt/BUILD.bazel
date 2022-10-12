@@ -90,6 +90,16 @@ rabbitmq_test_helper(
     ],
 )
 
+rabbitmq_test_helper(
+    name = "util",
+    srcs = [
+        "test/util.erl",
+    ],
+    deps = [
+        "//deps/rabbit_common:erlang_app",
+    ],
+)
+
 PACKAGE = "deps/rabbitmq_mqtt"
 
 suites = [
@@ -111,6 +121,9 @@ suites = [
         flaky = True,
         runtime_deps = [
             "@emqtt//:erlang_app",
+        ],
+        additional_beam = [
+            ":util",
         ],
     ),
     rabbitmq_integration_suite(
@@ -151,6 +164,9 @@ suites = [
         runtime_deps = [
             "@emqtt//:erlang_app",
         ],
+        additional_beam = [
+            ":util",
+        ],
     ),
     rabbitmq_integration_suite(
         PACKAGE,
@@ -171,6 +187,9 @@ suites = [
         name = "ff_SUITE",
         runtime_deps = [
             "@emqtt//:erlang_app",
+        ],
+        additional_beam = [
+            ":util",
         ],
     ),
 ]
