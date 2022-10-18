@@ -108,8 +108,16 @@
    {classic_queue_type_delivery_support,
     #{desc          => "Bug fix for classic queue deliveries using mixed versions",
       doc_url       => "https://github.com/rabbitmq/rabbitmq-server/issues/5931",
-      stability     => stable,
+      %%TODO remove compatibility code
+      stability     => required,
       depends_on    => [stream_queue]
+     }}).
+
+-rabbit_feature_flag(
+   {no_queue_name_in_classic_queue_client,
+    #{desc          => "Remove queue name from classic queue type client to save memory",
+      stability     => stable,
+      depends_on    => [classic_queue_type_delivery_support]
      }}).
 
 %% -------------------------------------------------------------------
