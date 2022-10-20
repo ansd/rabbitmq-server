@@ -117,6 +117,18 @@
           type_state = #{} :: map() | '_'
          }).
 
+%% A subset of the amqqueue_v2 record for smaller memory footprint.
+-record(amqqueue_subset,
+        {name :: rabbit_amqqueue:name(),
+         pid :: pid() | ra_server_id() | none,
+         slave_pids :: [pid()] | none,
+         options :: map(),
+         type :: atom(),
+         type_state :: #{}
+        }).
+
+-type amqqueue_subset() :: #amqqueue_subset{}.
+
 -type amqqueue() :: amqqueue_v2().
 -type amqqueue_v2() :: #amqqueue{
                           name :: rabbit_amqqueue:name(),
@@ -171,6 +183,7 @@
               amqqueue_v2/0,
               amqqueue_pattern/0,
               amqqueue_v2_pattern/0,
+              amqqueue_subset/0,
               ra_server_id/0]).
 
 -spec new(rabbit_amqqueue:name(),
@@ -401,18 +414,21 @@ set_operator_policy(#amqqueue{} = Queue, Policy) ->
 
 % name
 
--spec get_name(amqqueue()) -> rabbit_amqqueue:name().
+-spec get_name(amqqueue() | amqqueue_subset()) ->
+    rabbit_amqqueue:name().
 
-get_name(#amqqueue{name = Name}) -> Name.
+get_name(#amqqueue{name = Name}) -> Name;
+get_name(#amqqueue_subset{name = Name}) -> Name.
 
 -spec set_name(amqqueue(), rabbit_amqqueue:name()) -> amqqueue().
 
 set_name(#amqqueue{} = Queue, Name) ->
     Queue#amqqueue{name = Name}.
 
--spec get_options(amqqueue()) -> map().
+-spec get_options(amqqueue() | amqqueue_subset()) -> map().
 
-get_options(#amqqueue{options = Options}) -> Options.
+get_options(#amqqueue{options = Options}) -> Options;
+get_options(#amqqueue_subset{options = Options}) -> Options.
 
 -spec set_options(amqqueue(), map()) -> amqqueue().
 
@@ -421,9 +437,11 @@ set_options(#amqqueue{} = Queue, Options) ->
 
 % pid
 
--spec get_pid(amqqueue_v2()) -> pid() | ra_server_id() | none.
+-spec get_pid(amqqueue_v2() | amqqueue_subset()) ->
+    pid() | ra_server_id() | none.
 
-get_pid(#amqqueue{pid = Pid}) -> Pid.
+get_pid(#amqqueue{pid = Pid}) -> Pid;
+get_pid(#amqqueue_subset{pid = Pid}) -> Pid.
 
 -spec set_pid(amqqueue_v2(), pid() | ra_server_id() | none) -> amqqueue_v2().
 
@@ -467,8 +485,11 @@ set_recoverable_slaves(#amqqueue{} = Queue, Slaves) ->
 
 % type_state (new in v2)
 
--spec get_type_state(amqqueue()) -> map().
+-spec get_type_state(amqqueue() | amqqueue_subset()) ->
+    map().
 get_type_state(#amqqueue{type_state = TState}) ->
+    TState;
+get_type_state(#amqqueue_subset{type_state = TState}) ->
     TState;
 get_type_state(_) ->
     #{}.
@@ -481,9 +502,12 @@ set_type_state(Queue, _TState) ->
 
 % slave_pids
 
--spec get_slave_pids(amqqueue()) -> [pid()] | none.
+-spec get_slave_pids(amqqueue() | amqqueue_subset()) ->
+    [pid()] | none.
 
 get_slave_pids(#amqqueue{slave_pids = Slaves}) ->
+    Slaves;
+get_slave_pids(#amqqueue_subset{slave_pids = Slaves}) ->
     Slaves.
 
 -spec set_slave_pids(amqqueue(), [pid()] | none) -> amqqueue().
@@ -529,9 +553,11 @@ set_sync_slave_pids(#amqqueue{} = Queue, Pids) ->
 
 %% New in v2.
 
--spec get_type(amqqueue()) -> atom().
+-spec get_type(amqqueue() | amqqueue_subset()) ->
+    atom().
 
-get_type(#amqqueue{type = Type}) -> Type.
+get_type(#amqqueue{type = Type}) -> Type;
+get_type(#amqqueue_subset{type = Type}) -> Type.
 
 -spec get_vhost(amqqueue()) -> rabbit_types:vhost() | undefined.
 

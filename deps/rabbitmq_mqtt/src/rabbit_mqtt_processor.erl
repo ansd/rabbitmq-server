@@ -110,6 +110,7 @@ process_request(?PUBLISH,
                    payload = Payload},
                 PState = #proc_state{retainer_pid = RPid,
                                      amqp2mqtt_fun = Amqp2MqttFun}) ->
+    memory(?FUNCTION_NAME, ?LINE),
     rabbit_global_counters:messages_received(mqtt, 1),
     case Qos of
         N when N > ?QOS_0 ->
@@ -1075,9 +1076,14 @@ publish_to_queues(
                   msg_seq_no = MessageId,
                   flow = noflow %%TODO enable flow control
                  },
+    memory(?FUNCTION_NAME, ?LINE),
     case rabbit_exchange:lookup(ExchangeName) of
         {ok, Exchange} ->
+            memory(?FUNCTION_NAME, ?LINE),
+            %% 47 MB memory with 100k destination queues
             QNames = rabbit_exchange:route(Exchange, Delivery),
+            memory(?FUNCTION_NAME, ?LINE),
+            %% 82 MB memory with 100k destination queues - 52 ms
             deliver_to_queues(Delivery, QNames, PState);
         {error, not_found} ->
             rabbit_log:error("~s not found", [rabbit_misc:rs(ExchangeName)]),
@@ -1087,14 +1093,59 @@ publish_to_queues(
 deliver_to_queues(Delivery,
                   RoutedToQNames,
                   PState0 = #proc_state{queue_states = QStates0}) ->
-    %% TODO only lookup fields that are needed using ets:select / match?
-    %% TODO Use ETS continuations to be more space efficient
-    Qs0 = rabbit_amqqueue:lookup(RoutedToQNames),
-    Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
+    %% TODO only lookup fields that are needed
+    %%
+    %% We need only the following rabbit_queue fields:
+    %% * name (already present)
+    %% * options (for extra bcc)
+    %% * type (to forwards to correct queue module)
+    %% * pid
+    %% * slave_pids (rabbit_classic_queue)
+    %%
+    %% As described in http://erlang.org/pipermail/erlang-questions/2012-February/064214.html
+    %% ets:select(Tid, [{{Key,'_'},[],['$_']} || Key <- ["A","B","C"]]).
+    %%
+    %% with limit => ets:select/3
+    % Qs0 = rabbit_amqqueue:lookup(RoutedToQNames),
+    % Qs0 = lists:append([ets:lookup(rabbit_queue, Name) || Name <- RoutedToQNames]),
+    MatchSpec = lists:map(
+                  fun(TableKey) ->
+                          {
+                           %% Constant time lookup because ETS table key is bound
+                           {amqqueue,
+                            TableKey,
+                            '_', '_', '_', '_',
+                            _Pid = '$1',
+                            _SlavePids = '$2',
+                            '_', '_', '_', '_', '_', '_', '_', '_', '_', '_',
+                            _Options = '$3',
+                            _Type = '$4',
+                            _TypeState = '$5'},
+                           [],
+                           [{{ amqqueue_subset, {TableKey}, '$1', '$2', '$3', '$4', '$5' }}]
+                          }
+                  end, RoutedToQNames),
+    rabbit_log:debug("aaa lenght=~p", [length(MatchSpec)]),
+    memory(?FUNCTION_NAME, ?LINE),
+    % A = ets:select(rabbit_queue, [{{'_', Key, '_', '_', '_', '_', '$1', '$2', '_', '_', '_', '_', '_', '_', '_', '_', '_', '_', '$3', '$4', '_'}, [], [ {{ {Key}, '$1', '$2', '$3', '$4' }} ] }]).
+    Qs0 = ets:select(rabbit_queue, MatchSpec),
+
+    memory(?FUNCTION_NAME, ?LINE),
+    %% 168 MB memory with 100k destination queues - 144 ms
+    %%
+    %% TODO get extra_bcc
+    % Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
+    Qs = Qs0,
+
     case rabbit_queue_type:deliver(Qs, Delivery, QStates0) of
         {ok, QStates, _Actions = []} ->
+            memory(?FUNCTION_NAME, ?LINE),
+            %% 123 MB memory with 100k destination queues - 477 ms
             rabbit_global_counters:messages_routed(mqtt, length(Qs)),
             PState = process_routing_confirm(Delivery, Qs, PState0),
+            memory(?FUNCTION_NAME, ?LINE),
+            %% 123 MB memory with 100k destination queues
+
             %% Actions must be processed after registering confirms as actions may
             %% contain rejections of publishes
             %% TODO handle Actions: For example if the messages is rejected, MQTT 5 allows to send a NACK
@@ -1481,3 +1532,24 @@ ssl_login_name(Sock) ->
 
 queue_names(Queues) ->
     lists:map(fun amqqueue:get_name/1, Queues).
+
+memory(Fun, Line) ->
+    BytesPerWord = erlang:system_info(wordsize),
+    [{memory, Memory},
+     {total_heap_size, TotalHeapSize},
+     {heap_size, HeapSize},
+     {stack_size, StackSize},
+     {message_queue_len, MessageQueueLen}]
+    = erlang:process_info(self(), [memory,
+                                   total_heap_size,
+                                   heap_size,
+                                   stack_size,
+                                   message_queue_len]),
+    rabbit_log:debug("~s ~b: ~nmemory = ~b MB ~ntotal_heap_size = ~b MB ~nheap_size = ~b MB ~nstack_size = ~b B ~nmessage_queue_len = ~b~n",
+                     [Fun,
+                      Line,
+                      round(Memory / 1_000_000),
+                      round((TotalHeapSize * BytesPerWord) / 1_000_000),
+                      round((HeapSize * BytesPerWord) / 1_000_000),
+                      StackSize * BytesPerWord,
+                      MessageQueueLen]).

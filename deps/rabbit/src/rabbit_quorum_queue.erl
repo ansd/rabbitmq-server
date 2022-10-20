@@ -125,8 +125,10 @@ is_compatible(_Durable = true,
 is_compatible(_, _, _) ->
     false.
 
--spec init(amqqueue:amqqueue()) -> {ok, rabbit_fifo_client:state()}.
-init(Q) when ?is_amqqueue(Q) ->
+-spec init(amqqueue:amqqueue() | amqqueue:amqqueue_subset()) ->
+    {ok, rabbit_fifo_client:state()}.
+init(Q)
+  when ?is_amqqueue(Q) orelse ?is_amqqueue_subset(Q) ->
     {ok, SoftLimit} = application:get_env(rabbit, quorum_commands_soft_limit),
     %% This lookup could potentially return an {error, not_found}, but we do not
     %% know what to do if the queue has `disappeared`. Let it crash.
@@ -144,10 +146,11 @@ init(Q) when ?is_amqqueue(Q) ->
 close(_State) ->
     ok.
 
--spec update(amqqueue:amqqueue(), rabbit_fifo_client:state()) ->
+-spec update(amqqueue:amqqueue() | amqqueue:amqqueue_subset(), rabbit_fifo_client:state()) ->
     rabbit_fifo_client:state().
-update(Q, State) when ?amqqueue_is_quorum(Q) ->
-    %% QQ state maintains it's own updates
+update(Q, State)
+  when ?is_amqqueue(Q) orelse ?is_amqqueue_subset(Q) ->
+    %% QQ state maintains its own updates
     State.
 
 -spec handle_event({amqqueue:ra_server_id(), any()},
@@ -1690,9 +1693,8 @@ erpc_timeout(_, Timeout) ->
     Timeout.
 
 ets_lookup_element(Tbl, Key, Pos, Default) ->
-    try ets:lookup_element(Tbl, Key, Pos) of
-        V -> V
+    try ets:lookup_element(Tbl, Key, Pos)
     catch
-        _:badarg ->
+        error:badarg ->
             Default
     end.

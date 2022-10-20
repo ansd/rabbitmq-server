@@ -161,7 +161,9 @@ stat(Q) ->
                     {gen_server2, call, [stat, infinity]}).
 
 -spec init(amqqueue:amqqueue()) -> {ok, state()}.
-init(Q) when ?amqqueue_is_classic(Q) ->
+init(Q)
+  when ?amqqueue_is_classic(Q) orelse
+       ?is_amqqueue_subset(Q) ->
     QRef = case rabbit_feature_flags:is_enabled(no_queue_name_in_classic_queue_client) of
                true ->
                    undefined;
@@ -175,8 +177,10 @@ init(Q) when ?amqqueue_is_classic(Q) ->
 close(_State) ->
     ok.
 
--spec update(amqqueue:amqqueue(), state()) -> state().
-update(Q, #?STATE{pid = Pid} = State) when ?amqqueue_is_classic(Q) ->
+-spec update(amqqueue:amqqueue() | amqqueue:amqqueue_subset(), state()) -> state().
+update(Q, #?STATE{pid = Pid} = State)
+  when ?amqqueue_is_classic(Q) orelse
+       ?is_amqqueue_subset(Q) ->
     case amqqueue:get_pid(Q) of
         Pid ->
             State;
@@ -323,9 +327,9 @@ settlement_action(_Type, _QRef, [], Acc) ->
 settlement_action(Type, QRef, MsgSeqs, Acc) ->
     [{Type, QRef, MsgSeqs} | Acc].
 
--spec deliver([{amqqueue:amqqueue(), state()}],
+-spec deliver([{amqqueue:amqqueue() | amqqueue:amqqueue_subset(), state()}],
               Delivery :: term()) ->
-    {[{amqqueue:amqqueue(), state()}], rabbit_queue_type:actions()}.
+    {[{amqqueue:amqqueue() | amqqueue:amqqueue_subset(), state()}], rabbit_queue_type:actions()}.
 deliver(Qs0, #delivery{flow = Flow,
                        msg_seq_no = MsgNo,
                        message = #basic_message{} = Msg0,

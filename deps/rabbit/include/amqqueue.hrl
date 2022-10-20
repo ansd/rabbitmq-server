@@ -10,6 +10,10 @@
 -define(is_amqqueue(Q),
         (?is_amqqueue_v2(Q))).
 
+-define(is_amqqueue_subset(Q),
+        % is_record(Q, amqqueue_subset)).
+        is_tuple(Q) andalso element(1, Q) =:= amqqueue_subset).
+
 -define(amqqueue_is_auto_delete(Q),
         (?is_amqqueue_v2(Q) andalso
          ?amqqueue_v2_field_auto_delete(Q) =:= true)).

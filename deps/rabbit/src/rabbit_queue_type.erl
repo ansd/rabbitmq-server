@@ -474,7 +474,7 @@ module(QRef, State) ->
             {error, not_found}
     end.
 
--spec deliver([amqqueue:amqqueue()], Delivery :: term(),
+-spec deliver([amqqueue:amqqueue() | amqqueue:subset()], Delivery :: term(),
               stateless | state()) ->
     {ok, state(), actions()} | {error, Reason :: term()}.
 deliver(Qs, Delivery, State) ->
@@ -569,7 +569,7 @@ get_ctx(QOrQref, State) ->
     get_ctx_with(QOrQref, State, undefined).
 
 get_ctx_with(Q, #?STATE{ctxs = Contexts}, InitState)
-  when ?is_amqqueue(Q) ->
+  when ?is_amqqueue(Q) orelse ?is_amqqueue_subset(Q) ->
     Ref = qref(Q),
     case Contexts of
         #{Ref := #ctx{module = Mod,
@@ -610,5 +610,6 @@ set_ctx(QRef, Ctx, #?STATE{ctxs = Contexts} = State) ->
 
 qref(#resource{kind = queue} = QName) ->
     QName;
-qref(Q) when ?is_amqqueue(Q) ->
+qref(Q)
+  when ?is_amqqueue(Q) orelse ?is_amqqueue_subset(Q) ->
     amqqueue:get_name(Q).

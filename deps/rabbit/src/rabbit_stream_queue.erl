@@ -719,7 +719,8 @@ readers(QName) ->
             {node(), 0}
     end.
 
-init(Q) when ?is_amqqueue(Q) ->
+init(Q)
+  when ?is_amqqueue(Q) orelse ?is_amqqueue_subset(Q) ->
     Leader = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
     #{name := StreamId} = amqqueue:get_type_state(Q),
@@ -749,7 +750,7 @@ close(#stream_client{readers = Readers}) ->
     ok.
 
 update(Q, State)
-  when ?is_amqqueue(Q) ->
+  when ?is_amqqueue(Q) orelse ?is_amqqueue_subset(Q) ->
     Pid = amqqueue:get_pid(Q),
     update_leader_pid(Pid, State).
 
