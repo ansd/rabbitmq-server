@@ -139,7 +139,8 @@ enqueue(Correlation, Msg,
         #state{queue_status = undefined,
                next_enqueue_seq = 1,
                cfg = #cfg{servers = Servers,
-                          timeout = Timeout}} = State0) ->
+                          timeout = Timeout,
+                          cluster_name = ClusterName}} = State0) ->
     %% it is the first enqueue, check the version
     {_, Node} = pick_server(State0),
     case rpc:call(Node, ra_machine, version, [{machine, rabbit_fifo, #{}}]) of
@@ -152,6 +153,8 @@ enqueue(Correlation, Msg,
             Reg = rabbit_fifo:make_register_enqueuer(self()),
             case ra:process_command(Servers, Reg, Timeout) of
                 {ok, reject_publish, Leader} ->
+                    rabbit_log:debug("~s:~s ~b reject_publish Servers: ~p: Leader: ~p Correlation: ~p",
+                                     [?MODULE, ?FUNCTION_NAME, ?LINE, Servers, Leader, Correlation]),
                     {reject_publish, State0#state{leader = Leader,
                                                   queue_status = reject_publish}};
                 {ok, ok, Leader} ->
@@ -161,20 +164,28 @@ enqueue(Correlation, Msg,
                     %% if we are not able to process the register command
                     %% it is safe to reject the message as we never attempted
                     %% to send it
+                    rabbit_log:debug("~s:~s ~b reject_publish no_more_servers_to_try Correlation: ~p ClusterName: ~p",
+                                     [?MODULE, ?FUNCTION_NAME, ?LINE, Correlation, ClusterName]),
                     {reject_publish, State0};
                 %% TODO: not convinced this can ever happen when using
                 %% a list of servers
                 {timeout, _} ->
+                    rabbit_log:debug("~s:~s ~b reject_publish timeout Correlation: ~p ClusterName: ~p",
+                                     [?MODULE, ?FUNCTION_NAME, ?LINE, Correlation, ClusterName]),
                     {reject_publish, State0};
                 Err ->
                     exit(Err)
             end;
         {badrpc, nodedown} ->
+            rabbit_log:debug("~s:~s ~b reject_publish nodedown Correlation: ~p ClusterName: ~p",
+                             [?MODULE, ?FUNCTION_NAME, ?LINE, Correlation, ClusterName]),
             {reject_publish, State0}
     end;
-enqueue(_Correlation, _Msg,
+enqueue(Correlation, _Msg,
         #state{queue_status = reject_publish,
-               cfg = #cfg{}} = State) ->
+               cfg = #cfg{cluster_name = ClusterName}} = State) ->
+    rabbit_log:debug("~s:~s ~b reject_publish Correlation: ~p ClusterName: ~p",
+                     [?MODULE, ?FUNCTION_NAME, ?LINE, Correlation, ClusterName]),
     {reject_publish, State};
 enqueue(Correlation, Msg,
         #state{slow = Slow,
@@ -198,6 +209,8 @@ enqueue(Correlation, Msg,
                          slow = Tag == slow},
     case Tag of
         slow when not Slow ->
+            rabbit_log:debug("~s:~s ~b blocking down",
+                             [?MODULE, ?FUNCTION_NAME, ?LINE]),
             BlockFun(),
             {slow, set_timer(State)};
         _ ->
@@ -600,6 +613,8 @@ handle_ra_event(From, {applied, Seqs},
                                         send_command(Node, undefined, C,
                                                      normal, S0)
                                 end, State2, Commands),
+            rabbit_log:debug("~s:~s ~b unblocking",
+                             [?MODULE, ?FUNCTION_NAME, ?LINE]),
             UnblockFun(),
             {ok, State, Actions};
         _ ->

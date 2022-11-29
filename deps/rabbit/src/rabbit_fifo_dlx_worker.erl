@@ -1,5 +1,3 @@
-%% This Source Code Form is subject to the terms of the Mozilla Public
-%% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
 %% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
@@ -157,6 +155,8 @@ handle_cast({queue_event, QRef, Evt},
             {noreply, State0}
     end;
 handle_cast(settle_timeout, State0) ->
+    rabbit_log:debug("~s:~s ~b settle_timeout",
+                     [?MODULE, ?FUNCTION_NAME, ?LINE]),
     State = State0#state{timer = undefined},
     redeliver_and_ack(State);
 handle_cast(Request, State) ->
@@ -167,6 +167,8 @@ redeliver_and_ack(State0) ->
     State1 = redeliver_messages(State0),
     State2 = ack(State1),
     State = maybe_set_timer(State2),
+    rabbit_log:debug("~s:~s ~b State0: ~p~nState1: ~p~nState: ~p",
+                     [?MODULE, ?FUNCTION_NAME, ?LINE, State0, State1, State]),
     {noreply, State}.
 
 handle_info({'DOWN', Ref, process, _, _},
@@ -180,6 +182,8 @@ handle_info({'DOWN', Ref, process, _, _},
 handle_info({'DOWN', _MRef, process, QPid, Reason},
             #state{queue_type_state = QTypeState0} = State0) ->
     %% received from target classic queue
+    rabbit_log:debug("~s:~s ~b received DOWN from process ~p: ~p",
+                     [?MODULE, ?FUNCTION_NAME, ?LINE, QPid, Reason]),
     case rabbit_queue_type:handle_down(QPid, Reason, QTypeState0) of
         {ok, QTypeState, Actions} ->
             State = State0#state{queue_type_state = QTypeState},
@@ -271,8 +275,11 @@ rejected(SeqNo, Qs, Pendings)
             maps:update_with(SeqNo,
                              fun(#pending{unsettled = Unsettled,
                                           rejected = Rejected} = P) ->
-                                     P#pending{unsettled = Unsettled -- Qs,
-                                               rejected = Qs ++ Rejected}
+                                     P1 = P#pending{unsettled = Unsettled -- Qs,
+                                                    rejected = Qs ++ Rejected},
+                                     rabbit_log:debug("~s:~s ~b SeqNo: ~p P: ~p P1: ~p",
+                                                      [?MODULE, ?FUNCTION_NAME, ?LINE, SeqNo, P, P1]),
+                                     P1
                              end,
                              Pendings);
         false ->
@@ -378,7 +385,9 @@ handle_settled0(QRef, MsgSeq, #state{pendings = Pendings,
                         settled_ids = [ConsumedId | SettledIds]};
         {ok, #pending{unsettled = [],
                       rejected = [QRef],
-                      consumed_msg_id = ConsumedId}} ->
+                      consumed_msg_id = ConsumedId} = P} ->
+            rabbit_log:debug("~s:~s ~b MsgSeq: ~p P: ~p",
+                             [?MODULE, ?FUNCTION_NAME, ?LINE, MsgSeq, P]),
             State#state{pendings = maps:remove(MsgSeq, Pendings),
                         settled_ids = [ConsumedId | SettledIds]};
         {ok, #pending{unsettled = Unsettled,
@@ -387,6 +396,8 @@ handle_settled0(QRef, MsgSeq, #state{pendings = Pendings,
             Pend = Pend0#pending{unsettled = lists:delete(QRef, Unsettled),
                                  rejected = lists:delete(QRef, Rejected),
                                  settled = [QRef | Settled]},
+            rabbit_log:debug("~s:~s ~b MsgSeq: ~p Pend0: ~p Pend: ~p",
+                             [?MODULE, ?FUNCTION_NAME, ?LINE, MsgSeq, Pend0, Pend]),
             State#state{pendings = maps:update(MsgSeq, Pend, Pendings)};
         error ->
             rabbit_log:debug("Ignoring publisher confirm for unknown sequence number ~b "

@@ -27,6 +27,8 @@
     {ok, state()}.
 settle(MsgIds, #state{leader = Leader} = State)
   when is_list(MsgIds) ->
+    rabbit_log:debug("~s:~s ~b MsgIds=~w",
+                     [?MODULE, ?FUNCTION_NAME, ?LINE, MsgIds]),
     Cmd = rabbit_fifo_dlx:make_settle(MsgIds),
     ra:pipeline_command(Leader, Cmd),
     {ok, State}.
