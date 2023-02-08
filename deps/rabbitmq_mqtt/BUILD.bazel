@@ -244,6 +244,11 @@ rabbitmq_integration_suite(
    ],
 )
 
+rabbitmq_suite(
+    name = "packet_SUITE",
+    size = "small",
+)
+
 assert_suites()
 
 alias(
