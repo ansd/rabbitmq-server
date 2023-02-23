@@ -246,6 +246,18 @@ rabbitmq_integration_suite(
    ],
 )
 
+rabbitmq_integration_suite(
+   name = "v5_SUITE",
+   shard_count = 4,
+   runtime_deps = [
+       "@emqtt//:erlang_app",
+       "@gun//:erlang_app",
+   ],
+   additional_beam = [
+       ":util",
+   ],
+)
+
 rabbitmq_suite(
     name = "packet_SUITE",
     size = "small",
