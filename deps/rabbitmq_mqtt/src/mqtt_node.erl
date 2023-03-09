@@ -31,6 +31,8 @@ all_node_ids() ->
 start() ->
     %% 3s to 6s randomized
     Repetitions = rand:uniform(10) + 10,
+    rabbit_log:warning("aaa ~s:~s ~b Repetitions=~p",
+                       [?MODULE, ?FUNCTION_NAME, ?LINE, Repetitions]),
     start(300, Repetitions).
 
 start(_Delay, AttemptsLeft) when AttemptsLeft =< 0 ->
@@ -52,22 +54,29 @@ start(Delay, AttemptsLeft) ->
                       %% This scenario does not guarantee single cluster formation but without knowing the list of members
                       %% ahead of time, this is a best effort workaround. Multi-node consensus is apparently hard
                       %% to achieve without having consensus around expected cluster members.
-                      rabbit_log:info("MQTT: will wait for ~tp more ms for cluster members to join before triggering a Raft leader election", [Delay]),
+                      rabbit_log:info("aaa MQTT: will wait for ~tp more ms for cluster members to join before triggering a Raft leader election", [Delay]),
                       timer:sleep(Delay),
                       start(Delay, AttemptsLeft - 1);
                   Peers ->
                       %% Trigger an election.
                       %% This is required when we start a node for the first time.
                       %% Using default timeout because it supposed to reply fast.
-                      rabbit_log:info("MQTT: discovered ~tp cluster peers that support client ID tracking", [length(Peers)]),
+                      rabbit_log:info("aaa MQTT: discovered ~tp cluster peers that support client ID tracking", [length(Peers)]),
                       ok = start_server(),
-                      _ = join_peers(NodeId, Peers),
-                      ra:trigger_election(NodeId, ?RA_OPERATION_TIMEOUT)
+                      Res = join_peers(NodeId, Peers),
+                      rabbit_log:warning("aaa ~s:~s ~b join_peers() result: ~p",
+                                         [?MODULE, ?FUNCTION_NAME, ?LINE, Res]),
+                      R = ra:trigger_election(NodeId, ?RA_OPERATION_TIMEOUT),
+                      rabbit_log:warning("aaa ~s:~s ~b trigger_election() result: ~p",
+                                         [?MODULE, ?FUNCTION_NAME, ?LINE, R]),
+                      R
               end;
-          _ ->
-              _ = join_peers(NodeId, Nodes),
-              ok = ra:restart_server(?RA_SYSTEM, NodeId),
-              ra:trigger_election(NodeId, ?RA_OPERATION_TIMEOUT)
+        Uid ->
+            rabbit_log:warning("aaa ~s:~s ~b UID=~p",
+                               [?MODULE, ?FUNCTION_NAME, ?LINE, Uid]),
+            _ = join_peers(NodeId, Nodes),
+            ok = ra:restart_server(?RA_SYSTEM, NodeId),
+            ra:trigger_election(NodeId, ?RA_OPERATION_TIMEOUT)
     end.
 
 compatible_peer_servers() ->
@@ -98,7 +107,7 @@ join_peers(NodeId, Nodes) ->
     join_peers(NodeId, Nodes, 100).
 
 join_peers(_NodeId, _Nodes, RetriesLeft) when RetriesLeft =:= 0 ->
-    rabbit_log:error("MQTT: exhausted all attempts while trying to rejoin cluster peers");
+    rabbit_log:error("aaa MQTT: exhausted all attempts while trying to rejoin cluster peers");
 join_peers(NodeId, Nodes, RetriesLeft) ->
     case ra:members(Nodes, ?START_TIMEOUT) of
         {ok, Members, _} ->
@@ -107,7 +116,7 @@ join_peers(NodeId, Nodes, RetriesLeft) ->
                 false -> ra:add_member(Members, NodeId)
             end;
         {timeout, _} ->
-            rabbit_log:debug("MQTT: timed out contacting cluster peers, %s retries left", [RetriesLeft]),
+            rabbit_log:debug("aaa MQTT: timed out contacting cluster peers, %s retries left", [RetriesLeft]),
             timer:sleep(?RETRY_INTERVAL),
             join_peers(NodeId, Nodes, RetriesLeft - 1);
         Err ->
@@ -140,25 +149,25 @@ delete(_) ->
     LockId = {?ID_NAME, node_id()},
     rabbit_log:info("Trying to acquire lock ~p on nodes ~p ...", [LockId, Nodes]),
     true = global:set_lock(LockId, Nodes),
-    rabbit_log:info("Acquired lock ~p", [LockId]),
+    rabbit_log:info("aaa Acquired lock ~p", [LockId]),
     try whereis(?ID_NAME) of
         undefined ->
-            rabbit_log:info("Local Ra process ~s does not exist", [?ID_NAME]),
+            rabbit_log:info("aaa Local Ra process ~s does not exist", [?ID_NAME]),
             ok;
         _ ->
-            rabbit_log:info("Deleting Ra cluster ~s ...", [?ID_NAME]),
+            rabbit_log:info("aaa Deleting Ra cluster ~s ...", [?ID_NAME]),
             try ra:delete_cluster(RaNodes, ?RA_OPERATION_TIMEOUT) of
                 {ok, _Leader} ->
-                    rabbit_log:info("Successfully deleted Ra cluster ~s", [?ID_NAME]),
+                    rabbit_log:info("aaa Successfully deleted Ra cluster ~s", [?ID_NAME]),
                     ok;
                 {error, _}  = Err ->
-                    rabbit_log:info("Failed to delete Ra cluster ~s: ~p", [?ID_NAME, Err]),
+                    rabbit_log:info("aaa Failed to delete Ra cluster ~s: ~p", [?ID_NAME, Err]),
                     Err
             catch exit:{{shutdown, delete}, _Stacktrace} ->
-                      rabbit_log:info("Ra cluster ~s already being deleted", [?ID_NAME]),
+                      rabbit_log:info("aaa Ra cluster ~s already being deleted", [?ID_NAME]),
                       ok
             end
     after
         true = global:del_lock(LockId, Nodes),
-        rabbit_log:info("Released lock ~p", [LockId])
+        rabbit_log:info("aaa Released lock ~p", [LockId])
     end.

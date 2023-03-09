@@ -20,14 +20,19 @@
          local_connection_pids/0]).
 
 start(normal, []) ->
+    rabbit_log:warning("aaa ~s:~s ~b starting mqtt plugin...", [?MODULE, ?FUNCTION_NAME, ?LINE]),
     init_global_counters(),
     persist_static_configuration(),
     {ok, Listeners} = application:get_env(tcp_listeners),
     {ok, SslListeners} = application:get_env(ssl_listeners),
     case rabbit_mqtt_ff:track_client_id_in_ra() of
         true ->
+            rabbit_log:warning("aaa ~s:~s ~b ff delete_ra_cluster_mqtt_node is disabled. Creating Ra cluster...",
+                               [?MODULE, ?FUNCTION_NAME, ?LINE]),
             ok = mqtt_node:start();
         false ->
+            rabbit_log:warning("aaa ~s:~s ~b ff delete_ra_cluster_mqtt_node is enabled. Skipping Ra cluster creation.",
+                               [?MODULE, ?FUNCTION_NAME, ?LINE]),
             ok
     end,
     Result = rabbit_mqtt_sup:start_link({Listeners, SslListeners}, []),

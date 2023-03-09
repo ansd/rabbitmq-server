@@ -731,8 +731,10 @@ init() ->
     %%   2. We use the returned list to initialize the `enabled_feature_flags'
     %%      file on disk if it doesn't exist. Some external tools rely on that
     %%      file too.
+    ?LOG_INFO("aaa ~s:~b initing feature flags", [?MODULE, ?LINE]),
     EnabledFeatureFlags = list(enabled),
     ok = ensure_enabled_feature_flags_list_file_exists(EnabledFeatureFlags),
+    ?LOG_INFO("aaa ~s:~b inited feature flags", [?MODULE, ?LINE]),
     ok.
 
 -define(PT_TESTSUITE_ATTRS, {?MODULE, testsuite_feature_flags_attrs}).
