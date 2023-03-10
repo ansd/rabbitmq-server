@@ -25,16 +25,7 @@ start(normal, []) ->
     persist_static_configuration(),
     {ok, Listeners} = application:get_env(tcp_listeners),
     {ok, SslListeners} = application:get_env(ssl_listeners),
-    case rabbit_mqtt_ff:track_client_id_in_ra() of
-        true ->
-            rabbit_log:warning("aaa ~s:~s ~b ff delete_ra_cluster_mqtt_node is disabled. Creating Ra cluster...",
-                               [?MODULE, ?FUNCTION_NAME, ?LINE]),
-            ok = mqtt_node:start();
-        false ->
-            rabbit_log:warning("aaa ~s:~s ~b ff delete_ra_cluster_mqtt_node is enabled. Skipping Ra cluster creation.",
-                               [?MODULE, ?FUNCTION_NAME, ?LINE]),
-            ok
-    end,
+    ok = maybe_start_client_id_ra_cluster(10),
     Result = rabbit_mqtt_sup:start_link({Listeners, SslListeners}, []),
     EMPid = case rabbit_event:start_link() of
                 {ok, Pid}                       -> Pid;
@@ -113,3 +104,20 @@ persist_static_configuration() ->
     {ok, MailboxSoftLimit} = application:get_env(?APP_NAME, mailbox_soft_limit),
     ?assert(is_integer(MailboxSoftLimit)),
     ok = persistent_term:put(?PERSISTENT_TERM_MAILBOX_SOFT_LIMIT, MailboxSoftLimit).
+
+maybe_start_client_id_ra_cluster(0) ->
+    rabbit_log:warning("aaa ~s:~s ~b ff delete_ra_cluster_mqtt_node is disabled. Creating Ra cluster...",
+                       [?MODULE, ?FUNCTION_NAME, ?LINE]),
+    ok = mqtt_node:start();
+maybe_start_client_id_ra_cluster(N) ->
+    case rabbit_mqtt_ff:track_client_id_in_ra() of
+        true ->
+            rabbit_log:warning("aaa ~s:~s ~b ff delete_ra_cluster_mqtt_node is disabled N=~b",
+                               [?MODULE, ?FUNCTION_NAME, ?LINE, N]),
+            timer:sleep(1000),
+            maybe_start_client_id_ra_cluster(N - 1);
+        false ->
+            rabbit_log:warning("aaa ~s:~s ~b ff delete_ra_cluster_mqtt_node is enabled. Skipping Ra cluster creation.",
+                               [?MODULE, ?FUNCTION_NAME, ?LINE]),
+            ok
+    end.
