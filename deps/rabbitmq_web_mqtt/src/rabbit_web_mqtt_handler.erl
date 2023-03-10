@@ -189,10 +189,6 @@ websocket_info({keepalive, Req}, State = #state{keepalive = KState0,
     end;
 websocket_info(emit_stats, State) ->
     {[], emit_stats(State), hibernate};
-websocket_info({ra_event, _From, Evt},
-               #state{proc_state = PState0} = State) ->
-    PState = rabbit_mqtt_processor:handle_ra_event(Evt, PState0),
-    {[], State#state{proc_state = PState}, hibernate};
 websocket_info({{'DOWN', _QName}, _MRef, process, _Pid, _Reason} = Evt,
                State = #state{proc_state = PState0}) ->
     case rabbit_mqtt_processor:handle_down(Evt, PState0) of

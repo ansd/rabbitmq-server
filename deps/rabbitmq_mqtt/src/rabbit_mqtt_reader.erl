@@ -226,13 +226,6 @@ handle_info(login_timeout, State) ->
 handle_info(emit_stats, State) ->
     {noreply, emit_stats(State), ?HIBERNATE_AFTER};
 
-handle_info({ra_event, _From, Evt},
-            #state{proc_state = PState0} = State) ->
-    %% handle applied event to ensure registration command actually got applied
-    %% handle not_leader notification in case we send the command to a non-leader
-    PState = rabbit_mqtt_processor:handle_ra_event(Evt, PState0),
-    {noreply, pstate(State, PState), ?HIBERNATE_AFTER};
-
 handle_info({{'DOWN', _QName}, _MRef, process, _Pid, _Reason} = Evt,
             #state{proc_state = PState0} = State) ->
     case rabbit_mqtt_processor:handle_down(Evt, PState0) of

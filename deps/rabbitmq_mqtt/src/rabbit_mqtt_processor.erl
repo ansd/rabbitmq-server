@@ -12,7 +12,7 @@
 
 -export([info/2, init/4, process_packet/2,
          terminate/4, handle_pre_hibernate/0,
-         handle_ra_event/2, handle_down/2, handle_queue_event/2,
+         handle_down/2, handle_queue_event/2,
          proto_version_tuple/1, throttle/2, format_status/1,
          remove_duplicate_client_id_connections/2,
          update_trace/2]).
@@ -84,7 +84,6 @@
          packet_id = 1 :: packet_id(),
          subscriptions = #{} :: #{Topic :: binary() => QoS :: ?QOS_0..?QOS_1},
          auth_state = #auth_state{},
-         ra_register_state :: option(registered | {pending, reference()}),
          %% quorum queues and streams whose soft limit has been exceeded
          queues_soft_limit_exceeded = sets:new([{version, 2}]) :: sets:set(),
          qos0_messages_dropped = 0 :: non_neg_integer()
@@ -146,7 +145,7 @@ process_connect(
         {ok, AuthzCtx} ?= check_vhost_access(VHost, User, ClientId, PeerIp),
         ok ?= check_user_loopback(Username, PeerIp),
         rabbit_core_metrics:auth_attempt_succeeded(PeerIp, Username, mqtt),
-        {ok, RaRegisterState} ?= register_client_id(VHost, ClientId),
+        ok = register_client_id(VHost, ClientId),
         {TraceState, ConnName} = init_trace(VHost, ConnName0),
         ok = rabbit_mqtt_keepalive:start(KeepaliveSecs, Socket),
         self() ! connection_created,
@@ -172,8 +171,8 @@ process_connect(
                        will_msg = make_will_msg(Packet)},
             auth_state = #auth_state{
                             user = User,
-                            authz_ctx = AuthzCtx},
-            ra_register_state = RaRegisterState}}
+                            authz_ctx = AuthzCtx}
+           }}
     end,
     Result = case Result0 of
                  {ok, State0 = #state{}} ->
@@ -415,34 +414,16 @@ ensure_client_id(ClientId, _CleanSess)
   when is_binary(ClientId) ->
     {ok, ClientId}.
 
--spec register_client_id(rabbit_types:vhost(), binary()) ->
-    {ok, RaRegisterState :: undefined | {pending, reference()}} |
-    {error, ConnAckErrorCode :: pos_integer()}.
+-spec register_client_id(rabbit_types:vhost(), binary()) -> ok.
 register_client_id(VHost, ClientId)
   when is_binary(VHost), is_binary(ClientId) ->
     %% Always register client ID in pg.
     PgGroup = {VHost, ClientId},
     ok = pg:join(persistent_term:get(?PG_SCOPE), PgGroup, self()),
-
-    case rabbit_mqtt_ff:track_client_id_in_ra() of
-        true ->
-            case rabbit_mqtt_collector:register(ClientId, self()) of
-                {ok, Corr} ->
-                    %% Ra node takes care of removing duplicate client ID connections.
-                    {ok, {pending, Corr}};
-                {error, _} = Err ->
-                    %% e.g. this node was removed from the MQTT cluster members
-                    ?LOG_ERROR("MQTT connection failed to register client ID ~s in vhost ~s in Ra: ~p",
-                               [ClientId, VHost, Err]),
-                    {error, ?CONNACK_SERVER_UNAVAILABLE}
-            end;
-        false ->
-            ok = erpc:multicast([node() | nodes()],
-                                ?MODULE,
-                                remove_duplicate_client_id_connections,
-                                [PgGroup, self()]),
-            {ok, undefined}
-    end.
+    erpc:multicast([node() | nodes()],
+                   ?MODULE,
+                   remove_duplicate_client_id_connections,
+                   [PgGroup, self()]).
 
 -spec remove_duplicate_client_id_connections({rabbit_types:vhost(), binary()}, pid()) -> ok.
 remove_duplicate_client_id_connections(PgGroup, PidToKeep) ->
@@ -1274,40 +1255,6 @@ handle_pre_hibernate() ->
     erase(topic_permission_cache),
     ok.
 
--spec handle_ra_event(register_timeout
-| {applied, [{reference(), ok}]}
-| {not_leader, term(), reference()}, state()) -> state().
-handle_ra_event({applied, [{Corr, ok}]},
-                State = #state{ra_register_state = {pending, Corr}}) ->
-    %% success case - command was applied transition into registered state
-    State#state{ra_register_state = registered};
-handle_ra_event({not_leader, Leader, Corr},
-                State = #state{ra_register_state = {pending, Corr},
-                               cfg = #cfg{client_id = ClientId}}) ->
-    case rabbit_mqtt_ff:track_client_id_in_ra() of
-        true ->
-            %% retry command against actual leader
-            {ok, NewCorr} = rabbit_mqtt_collector:register(Leader, ClientId, self()),
-            State#state{ra_register_state = {pending, NewCorr}};
-        false ->
-            State
-    end;
-handle_ra_event(register_timeout,
-                State = #state{ra_register_state = {pending, _Corr},
-                               cfg = #cfg{client_id = ClientId}}) ->
-    case rabbit_mqtt_ff:track_client_id_in_ra() of
-        true ->
-            {ok, NewCorr} = rabbit_mqtt_collector:register(ClientId, self()),
-            State#state{ra_register_state = {pending, NewCorr}};
-        false ->
-            State
-    end;
-handle_ra_event(register_timeout, State) ->
-    State;
-handle_ra_event(Evt, State) ->
-    ?LOG_DEBUG("unhandled ra_event: ~w ", [Evt]),
-    State.
-
 -spec handle_down(term(), state()) ->
     {ok, state()} | {error, Reason :: any()}.
 handle_down({{'DOWN', QName}, _MRef, process, QPid, Reason},
@@ -1792,7 +1739,6 @@ format_status(
          packet_id = PackID,
          subscriptions = Subscriptions,
          auth_state = AuthState,
-         ra_register_state = RaRegisterState,
          queues_soft_limit_exceeded = QSLE,
          qos0_messages_dropped = Qos0MsgsDropped,
          cfg = #cfg{
@@ -1843,6 +1789,5 @@ format_status(
       packet_id => PackID,
       subscriptions => Subscriptions,
       auth_state => AuthState,
-      ra_register_state => RaRegisterState,
       queues_soft_limit_exceeded => QSLE,
       qos0_messages_dropped => Qos0MsgsDropped}.

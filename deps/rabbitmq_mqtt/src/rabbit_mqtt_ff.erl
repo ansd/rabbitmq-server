@@ -9,21 +9,8 @@
 
 -include("rabbit_mqtt.hrl").
 
--export([track_client_id_in_ra/0]).
-
 -rabbit_feature_flag(
    {?QUEUE_TYPE_QOS_0,
     #{desc          => "Support pseudo queue type for MQTT QoS 0 subscribers omitting a queue process",
       stability     => stable
      }}).
-
--rabbit_feature_flag(
-   {delete_ra_cluster_mqtt_node,
-    #{desc          => "Delete Ra cluster 'mqtt_node' since MQTT client IDs are tracked locally",
-      stability     => stable,
-      callbacks     => #{enable => {mqtt_node, delete}}
-     }}).
-
--spec track_client_id_in_ra() -> boolean().
-track_client_id_in_ra() ->
-    rabbit_feature_flags:is_disabled(delete_ra_cluster_mqtt_node).
