@@ -20,11 +20,11 @@
          local_connection_pids/0]).
 
 start(normal, []) ->
+    mqtt_machine:ensure_deleted(),
     init_global_counters(),
     persist_static_configuration(),
     {ok, Listeners} = application:get_env(tcp_listeners),
     {ok, SslListeners} = application:get_env(ssl_listeners),
-    mqtt_machine:maybe_delete(),
     Result = rabbit_mqtt_sup:start_link({Listeners, SslListeners}, []),
     EMPid = case rabbit_event:start_link() of
                 {ok, Pid}                       -> Pid;

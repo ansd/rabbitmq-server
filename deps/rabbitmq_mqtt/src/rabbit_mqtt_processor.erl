@@ -128,7 +128,7 @@ process_connect(
                true   -> flow;
                false  -> noflow
            end,
-    Result0 =
+    Result =
     maybe
         ok ?= check_protocol_version(ProtoVer),
         {ok, ClientId} ?= ensure_client_id(ClientId0, CleanSess),
@@ -149,47 +149,45 @@ process_connect(
         {TraceState, ConnName} = init_trace(VHost, ConnName0),
         ok = rabbit_mqtt_keepalive:start(KeepaliveSecs, Socket),
         self() ! connection_created,
-        {ok,
-         #state{
-            cfg = #cfg{socket = Socket,
-                       proto_ver = ProtoVerAtom,
-                       clean_sess = CleanSess,
-                       ssl_login_name = SslLoginName,
-                       delivery_flow = Flow,
-                       trace_state = TraceState,
-                       prefetch = rabbit_mqtt_util:env(prefetch),
-                       conn_name = ConnName,
-                       ip_addr = Ip,
-                       port = Port,
-                       peer_ip_addr = PeerIp,
-                       peer_port = PeerPort,
-                       send_fun = SendFun,
-                       exchange = rabbit_misc:r(VHost, exchange, rabbit_mqtt_util:env(exchange)),
-                       retainer_pid = rabbit_mqtt_retainer_sup:start_child_for_vhost(VHost),
-                       vhost = VHost,
-                       client_id = ClientId,
-                       will_msg = make_will_msg(Packet)},
-            auth_state = #auth_state{
-                            user = User,
-                            authz_ctx = AuthzCtx}
-           }}
+        S0 = #state{
+                cfg = #cfg{socket = Socket,
+                           proto_ver = ProtoVerAtom,
+                           clean_sess = CleanSess,
+                           ssl_login_name = SslLoginName,
+                           delivery_flow = Flow,
+                           trace_state = TraceState,
+                           prefetch = rabbit_mqtt_util:env(prefetch),
+                           conn_name = ConnName,
+                           ip_addr = Ip,
+                           port = Port,
+                           peer_ip_addr = PeerIp,
+                           peer_port = PeerPort,
+                           send_fun = SendFun,
+                           exchange = rabbit_misc:r(VHost, exchange, rabbit_mqtt_util:env(exchange)),
+                           retainer_pid = rabbit_mqtt_retainer_sup:start_child_for_vhost(VHost),
+                           vhost = VHost,
+                           client_id = ClientId,
+                           will_msg = make_will_msg(Packet)},
+                auth_state = #auth_state{
+                                user = User,
+                                authz_ctx = AuthzCtx}
+               },
+        {ok, QoS0SessPresent, S1} ?= handle_clean_sess_qos0(S0),
+        {ok, SessPresent, S2} ?= handle_clean_sess_qos1(QoS0SessPresent, S1),
+        S = cache_subscriptions(SessPresent, S2),
+        ok = rabbit_networking:register_non_amqp_connection(self()),
+        {ok, SessPresent, S}
     end,
-    Result = case Result0 of
-                 {ok, State0 = #state{}} ->
-                     process_connect(State0);
-                 {error, _} = Err0 ->
-                     Err0
-             end,
     case Result of
-        {ok, SessPresent, State = #state{}} ->
-            send_conn_ack(?CONNACK_ACCEPT, SessPresent, ProtoVerAtom, SendFun),
+        {ok, SessionPresent, State = #state{}} ->
+            send_conn_ack(?CONNACK_ACCEPT, SessionPresent, ProtoVerAtom, SendFun),
             {ok, State};
         {error, ReturnErrCode} = Err
-          when is_number(ReturnErrCode) ->
+          when is_integer(ReturnErrCode) ->
             %% If a server sends a CONNACK packet containing a non-zero return
             %% code it MUST set Session Present to 0 [MQTT-3.2.2-4].
-            SessPresent = false,
-            send_conn_ack(ReturnErrCode, SessPresent, ProtoVerAtom, SendFun),
+            SessionPresent = false,
+            send_conn_ack(ReturnErrCode, SessionPresent, ProtoVerAtom, SendFun),
             Err
     end.
 
@@ -199,19 +197,6 @@ send_conn_ack(ReturnCode, SessPresent, ProtoVer, SendFun) ->
                                         session_present = SessPresent,
                                         return_code = ReturnCode}},
     ok = send(Packet, ProtoVer, SendFun).
-
-process_connect(State0) ->
-    maybe
-        {ok, QoS0SessPresent, State1} ?= handle_clean_sess_qos0(State0),
-        {ok, SessPresent, State2} ?= handle_clean_sess_qos1(QoS0SessPresent, State1),
-        State = cache_subscriptions(SessPresent, State2),
-        rabbit_networking:register_non_amqp_connection(self()),
-        {ok, SessPresent, State}
-    else
-        {error, _} = Error ->
-            unregister_client(State0),
-            Error
-    end.
 
 -spec process_packet(mqtt_packet(), state()) ->
     {ok, state()} |
@@ -417,7 +402,6 @@ ensure_client_id(ClientId, _CleanSess)
 -spec register_client_id(rabbit_types:vhost(), binary()) -> ok.
 register_client_id(VHost, ClientId)
   when is_binary(VHost), is_binary(ClientId) ->
-    %% Always register client ID in pg.
     PgGroup = {VHost, ClientId},
     ok = pg:join(persistent_term:get(?PG_SCOPE), PgGroup, self()),
     erpc:multicast([node() | nodes()],
@@ -1187,7 +1171,6 @@ terminate(SendWill, ConnName, ProtoFamily,
     rabbit_core_metrics:connection_closed(self()),
     rabbit_event:notify(connection_closed, Infos),
     rabbit_networking:unregister_non_amqp_connection(self()),
-    unregister_client(State),
     maybe_decrement_consumer(State),
     maybe_decrement_publisher(State),
     maybe_delete_mqtt_qos0_queue(State).
@@ -1205,14 +1188,6 @@ maybe_send_will(true, ConnStr,
     end;
 maybe_send_will(_, _, _) ->
     ok.
-
-unregister_client(#state{cfg = #cfg{client_id = ClientId}}) ->
-    case rabbit_mqtt_ff:track_client_id_in_ra() of
-        true ->
-            rabbit_mqtt_collector:unregister(ClientId, self());
-        false ->
-            ok
-    end.
 
 maybe_delete_mqtt_qos0_queue(
   State = #state{cfg = #cfg{clean_sess = true},
@@ -1584,7 +1559,7 @@ mailbox_soft_limit_exceeded() ->
 is_socket_busy(Socket) ->
     case rabbit_net:getstat(Socket, [send_pend]) of
         {ok, [{send_pend, NumBytes}]}
-          when is_number(NumBytes) andalso NumBytes > 0 ->
+          when is_integer(NumBytes) andalso NumBytes > 0 ->
             true;
         _ ->
             false
