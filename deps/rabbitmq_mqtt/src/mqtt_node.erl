@@ -161,9 +161,19 @@ delete(_) ->
                 {ok, _Leader} ->
                     rabbit_log:info("aaa Successfully deleted Ra cluster ~s", [?ID_NAME]),
                     ok;
-                {error, _}  = Err ->
-                    rabbit_log:info("aaa Failed to delete Ra cluster ~s: ~p", [?ID_NAME, Err]),
-                    Err
+                {error, Reason} ->
+                    rabbit_log:info("aaa Failed to delete Ra cluster ~s: ~p", [?ID_NAME, Reason]),
+                    ServerId = server_id(),
+                    case ra:force_delete_server(?RA_SYSTEM, ServerId) of
+                        ok ->
+                            rabbit_log:info("Successfully force deleted Ra server ~p from Ra cluster '~s'",
+                                            [ServerId, ?ID_NAME]),
+                            ok;
+                        Error ->
+                            rabbit_log:error("Failed to force delete Ra server ~p from Ra cluster '~s': ~p",
+                                             [ServerId, ?ID_NAME, Error]),
+                            {error, Error}
+                    end
             catch exit:{{shutdown, delete}, _Stacktrace} ->
                       rabbit_log:info("aaa Ra cluster ~s already being deleted", [?ID_NAME]),
                       ok
