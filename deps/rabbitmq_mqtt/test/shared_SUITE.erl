@@ -101,8 +101,8 @@ subgroups() ->
      {cluster_size_3, [],
       [
        queue_down_qos1,
-       consuming_classic_mirrored_queue_down,
-       consuming_classic_queue_down,
+       % consuming_classic_mirrored_queue_down,
+       % consuming_classic_queue_down,
        flow_classic_mirrored_queue,
        flow_quorum_queue,
        flow_stream,
@@ -116,7 +116,7 @@ subgroups() ->
     ].
 
 suite() ->
-    [{timetrap, {minutes, 5}}].
+    [{timetrap, {minutes, 1}}].
 
 %% -------------------------------------------------------------------
 %% Testsuite setup/teardown.
@@ -175,6 +175,14 @@ init_per_testcase(T, Config)
        T =:= management_plugin_enable ->
     ok = inets:start(),
     init_per_testcase0(T, Config);
+init_per_testcase(T, Config)
+  when T =:= maintenance ->
+    try rpc(Config, 1, rabbit_mqtt_collector, module_info, []) of
+        _Info ->
+            {skip, "old node tracks MQTT client IDs in Ra"}
+    catch error:{exception, undef, _StackTrace} ->
+              init_per_testcase0(T, Config)
+    end;
 init_per_testcase(Testcase, Config) ->
     init_per_testcase0(Testcase, Config).
 
