@@ -38,22 +38,25 @@ stop(_) ->
 
 -spec emit_connection_info_all([node()], rabbit_types:info_keys(), reference(), pid()) -> term().
 emit_connection_info_all(Nodes, Items, Ref, AggregatorPid) ->
-    Pids = [spawn_link(Node, ?MODULE, emit_connection_info_local,
-                       [Items, Ref, AggregatorPid])
-            || Node <- Nodes],
-    rabbit_control_misc:await_emitters_termination(Pids).
+    Result = erpc:multicall(Nodes, ?MODULE, emit_connection_info_local, [Items, Ref, AggregatorPid]),
+    lists:foreach(fun({ok, ok}) ->
+                          ok;
+                     ({error, {exception, undef, _StackTrace}}) ->
+                          %% Remote node runs a version < 3.12 tracking MQTT client IDs in Ra.
+                          %% Skip remote node's local connection infos in mixed version mode.
+                          rabbit_control_misc:emitting_map_with_exit_handler(
+                            AggregatorPid, Ref, fun(_) -> [] end, []);
+                     (Other) ->
+                          error(Other)
+                  end, Result).
 
 -spec emit_connection_info_local(rabbit_types:info_keys(), reference(), pid()) -> ok.
 emit_connection_info_local(Items, Ref, AggregatorPid) ->
-    LocalPids = local_connection_pids(),
-    emit_connection_info(Items, Ref, AggregatorPid, LocalPids).
-
-emit_connection_info(Items, Ref, AggregatorPid, Pids) ->
     rabbit_control_misc:emitting_map_with_exit_handler(
       AggregatorPid, Ref,
       fun(Pid) ->
               rabbit_mqtt_reader:info(Pid, Items)
-      end, Pids).
+      end, local_connection_pids()).
 
 -spec close_local_client_connections(string() | binary()) -> {'ok', non_neg_integer()}.
 close_local_client_connections(Reason) ->

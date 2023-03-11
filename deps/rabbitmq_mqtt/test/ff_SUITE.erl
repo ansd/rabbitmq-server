@@ -27,8 +27,7 @@ all() ->
 
 groups() ->
     [
-     {cluster_size_3, [], [delete_ra_cluster_mqtt_node,
-                           rabbit_mqtt_qos0_queue]}
+     {cluster_size_3, [], [rabbit_mqtt_qos0_queue]}
     ].
 
 suite() ->
@@ -68,28 +67,6 @@ init_per_testcase(TestCase, Config) ->
 
 end_per_testcase(_TestCase, Config) ->
     Config.
-
-delete_ra_cluster_mqtt_node(Config) ->
-    FeatureFlag = ?FUNCTION_NAME,
-    C = connect(<<"my-client">>, Config, 1, []),
-    timer:sleep(500),
-    %% old client ID tracking works
-    ?assertEqual(1, length(util:all_connection_pids(Config))),
-    %% Ra processes are alive
-    ?assert(lists:all(fun erlang:is_pid/1,
-                      rabbit_ct_broker_helpers:rpc_all(Config, erlang, whereis, [mqtt_node]))),
-
-    ?assertEqual(ok,
-                 rabbit_ct_broker_helpers:enable_feature_flag(Config, FeatureFlag)),
-
-    %% Ra processes should be gone
-    rabbit_ct_helpers:eventually(
-      ?_assert(lists:all(fun(Pid) -> Pid =:= undefined end,
-                         rabbit_ct_broker_helpers:rpc_all(Config, erlang, whereis, [mqtt_node])))),
-    %% new client ID tracking works
-    ?assertEqual(1, length(util:all_connection_pids(Config))),
-    ?assert(erlang:is_process_alive(C)),
-    ok = emqtt:disconnect(C).
 
 rabbit_mqtt_qos0_queue(Config) ->
     FeatureFlag = ?FUNCTION_NAME,
