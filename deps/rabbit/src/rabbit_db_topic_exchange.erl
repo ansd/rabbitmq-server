@@ -9,7 +9,7 @@
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 
--export([set/1, delete_all_for_exchange/1, delete/1, match/2]).
+-export([set/1, delete_all_for_exchange/1, delete/1, match/3]).
 
 %% For testing
 -export([clear/0]).
@@ -67,9 +67,10 @@ delete(Bs) when is_list(Bs) ->
 %% match().
 %% -------------------------------------------------------------------
 
--spec match(ExchangeName, RoutingKey) -> ok when
+-spec match(ExchangeName, RoutingKey, Opts) -> ok when
       ExchangeName :: rabbit_exchange:name(),
-      RoutingKey :: binary().
+      RoutingKey :: rabbit_types:routing_key(),
+      Opts :: [rabbit_exchange:route_opt()].
 %% @doc Finds the topic binding matching the given exchange and routing key and returns
 %% the destination of the binding
 %%
@@ -77,11 +78,12 @@ delete(Bs) when is_list(Bs) ->
 %%
 %% @private
 
-match(XName, RoutingKey) ->
+match(XName, RoutingKey, Opts) ->
     rabbit_db:run(
       #{mnesia =>
             fun() ->
-                    match_in_mnesia(XName, RoutingKey)
+                    match_in_mnesia(XName, RoutingKey,
+                                    lists:member(return_queue_name_with_binding_key, Opts))
             end
        }).
 
@@ -128,9 +130,9 @@ delete_all_for_exchange_in_mnesia(XName) ->
               ok
       end).
 
-match_in_mnesia(XName, RoutingKey) ->
+match_in_mnesia(XName, RoutingKey, ReturnBindKey) ->
     Words = split_topic_key(RoutingKey),
-    mnesia:async_dirty(fun trie_match/2, [XName, Words]).
+    mnesia:async_dirty(fun trie_match/3, [XName, Words, ReturnBindKey]).
 
 trie_remove_all_nodes(X) ->
     remove_all(?MNESIA_NODE_TABLE,
@@ -188,30 +190,46 @@ split_topic_key(<<$., Rest/binary>>, RevWordAcc, RevResAcc) ->
 split_topic_key(<<C:8, Rest/binary>>, RevWordAcc, RevResAcc) ->
     split_topic_key(Rest, [C | RevWordAcc], RevResAcc).
 
-trie_match(X, Words) ->
-    trie_match(X, root, Words, []).
+trie_match(X, Words, ReturnBindKey) ->
+    rabbit_log:debug("aaa ~b Words=~p",
+                     [?LINE, Words]),
+    trie_match(X, root, Words, ReturnBindKey, [], []).
 
-trie_match(X, Node, [], ResAcc) ->
-    trie_match_part(X, Node, "#", fun trie_match_skip_any/4, [],
-                    trie_bindings(X, Node) ++ ResAcc);
-trie_match(X, Node, [W | RestW] = Words, ResAcc) ->
+trie_match(X, Node, [], ReturnBindKey, Walked, ResAcc) ->
+    Destinations0 = trie_bindings(X, Node),
+    Destinations = case ReturnBindKey of
+                       false ->
+                           Destinations0;
+                       true ->
+                           Binding = list_to_binary(lists:join($., lists:reverse(Walked))),
+                           lists:map(fun(#resource{kind = queue} = Dest) -> {Dest, Binding};
+                                        (Dest) -> Dest
+                                     end, Destinations0)
+                   end,
+    rabbit_log:debug("aaa ~b Node=~p Destinations=~p ResAcc=~p",
+                     [?LINE, Node, Destinations, ResAcc]),
+    trie_match_part(X, Node, "#", fun trie_match_skip_any/6, [],
+                    ReturnBindKey, Walked, Destinations ++ ResAcc);
+trie_match(X, Node, [W | RestW] = Words, ReturnBindKey, Walked, ResAcc) ->
+    rabbit_log:debug("aaa ~b Node=~p W=~p RestW=~p Walked=~p ResAcc=~p",
+                     [?LINE, Node, W, RestW, Walked, ResAcc]),
     lists:foldl(fun ({WArg, MatchFun, RestWArg}, Acc) ->
-                        trie_match_part(X, Node, WArg, MatchFun, RestWArg, Acc)
-                end, ResAcc, [{W, fun trie_match/4, RestW},
-                              {"*", fun trie_match/4, RestW},
-                              {"#", fun trie_match_skip_any/4, Words}]).
+                        trie_match_part(X, Node, WArg, MatchFun, RestWArg, ReturnBindKey, Walked, Acc)
+                end, ResAcc, [{W, fun trie_match/6, RestW},
+                              {"*", fun trie_match/6, RestW},
+                              {"#", fun trie_match_skip_any/6, Words}]).
 
-trie_match_part(X, Node, Search, MatchFun, RestW, ResAcc) ->
+trie_match_part(X, Node, Search, MatchFun, RestW, ReturnBindKey, Walked, ResAcc) ->
     case trie_child(X, Node, Search) of
-        {ok, NextNode} -> MatchFun(X, NextNode, RestW, ResAcc);
+        {ok, NextNode} -> MatchFun(X, NextNode, RestW, ReturnBindKey, [Search | Walked], ResAcc);
         error          -> ResAcc
     end.
 
-trie_match_skip_any(X, Node, [], ResAcc) ->
-    trie_match(X, Node, [], ResAcc);
-trie_match_skip_any(X, Node, [_ | RestW] = Words, ResAcc) ->
-    trie_match_skip_any(X, Node, RestW,
-                        trie_match(X, Node, Words, ResAcc)).
+trie_match_skip_any(X, Node, [], ReturnBindKey, Walked, ResAcc) ->
+    trie_match(X, Node, [], ReturnBindKey, Walked, ResAcc);
+trie_match_skip_any(X, Node, [_ | RestW] = Words, ReturnBindKey, Walked, ResAcc) ->
+    trie_match_skip_any(X, Node, RestW, ReturnBindKey, Walked,
+                        trie_match(X, Node, Words, ReturnBindKey, Walked, ResAcc)).
 
 follow_down_create(X, Words) ->
     case follow_down_last_node(X, Words) of

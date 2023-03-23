@@ -14,7 +14,7 @@
          lookup/1, lookup_many/1, lookup_or_die/1, list/0, list/1, lookup_scratch/2,
          update_scratch/3, update_decorators/2, immutable/1,
          info_keys/0, info/1, info/2, info_all/1, info_all/2, info_all/4,
-         route/2, delete/3, validate_binding/2, count/0]).
+         route/2, route/3, delete/3, validate_binding/2, count/0]).
 -export([list_names/0]).
 -export([serialise_events/1]).
 -export([serial/1, peek_serial/1]).
@@ -25,6 +25,7 @@
 -type name() :: rabbit_types:exchange_name().
 -type type() :: rabbit_types:exchange_type().
 -type fun_name() :: atom().
+-type route_opt() :: return_queue_name_with_binding_key.
 
 %%----------------------------------------------------------------------------
 
@@ -342,12 +343,17 @@ info_all(VHostPath, Items, Ref, AggregatorPid) ->
 %% fields can't be undefined. But there are places where
 %% rabbit_exchange:route/2 is called with the absolutely bare delivery
 %% like #delivery{message = #basic_message{routing_keys = [...]}}
--spec route(rabbit_types:exchange(), #delivery{})
-                 -> [rabbit_amqqueue:name()].
+-spec route(rabbit_types:exchange(), #delivery{}) ->
+    [rabbit_amqqueue:name()].
+route(Exchange, Delivery) ->
+    route(Exchange, Delivery, []).
 
+-spec route(rabbit_types:exchange(), #delivery{}, [route_opt()]) ->
+    [rabbit_amqqueue:name() | {rabbit_amqqueue:name(), rabbit_types:binding_key()}].
 route(#exchange{name = #resource{virtual_host = VHost, name = RName} = XName,
                 decorators = Decorators} = X,
-      #delivery{message = #basic_message{routing_keys = RKs}} = Delivery) ->
+      #delivery{message = #basic_message{routing_keys = RKs}} = Delivery,
+      Opts) ->
     case RName of
         <<>> ->
             RKsSorted = lists:usort(RKs),
@@ -357,20 +363,43 @@ route(#exchange{name = #resource{virtual_host = VHost, name = RName} = XName,
                                                 not virtual_reply_queue(RK)];
         _ ->
             Decs = rabbit_exchange_decorator:select(route, Decorators),
-            lists:usort(route1(Delivery, Decs, {[X], XName, []}))
+            QNames = route1(Delivery, Decs, Opts, {[X], XName, []}),
+            %%TODO We actually just want lists:usort(QNames).
+            %% The MQTT sending connection needs to know **all** binding keys
+            %% that caused the message to be routed to the destination.
+            %% The MQTT sending connection then has to deduplicate the destination queues
+            %% including **all** topic filters into the basic_message.
+            %% This is required for MQTT v5 Subscription Identifieres.
+            lists:usort(fun({#resource{} = QName1, _BindingKey1},
+                            {#resource{} = QName2, _BindingKey2}) ->
+                                QName1 =< QName2;
+                           (QName1, QName2) ->
+                                QName1 =< QName2
+                        end, QNames)
     end.
 
 virtual_reply_queue(<<"amq.rabbitmq.reply-to.", _/binary>>) -> true;
 virtual_reply_queue(_)                                      -> false.
 
-route1(_, _, {[], _, QNames}) ->
+route1(_, _, _, {[], _, QNames}) ->
     QNames;
-route1(Delivery, Decorators,
+route1(Delivery, Decorators, Opts,
        {[X = #exchange{type = Type} | WorkList], SeenXs, QNames}) ->
-    ExchangeDests  = (type_to_module(Type)):route(X, Delivery),
+    XMod = type_to_module(Type),
+    ExchangeDests = case Opts of
+                        [] ->
+                            XMod:route(X, Delivery);
+                        _ ->
+                            case erlang:function_exported(XMod, route, 3) of
+                                true ->
+                                    XMod:route(X, Delivery, Opts);
+                                false ->
+                                    XMod:route(X, Delivery)
+                            end
+                    end,
     DecorateDests  = process_decorators(X, Decorators, Delivery),
     AlternateDests = process_alternate(X, ExchangeDests),
-    route1(Delivery, Decorators,
+    route1(Delivery, Decorators, Opts,
            lists:foldl(fun process_route/2, {WorkList, SeenXs, QNames},
                        AlternateDests ++ DecorateDests  ++ ExchangeDests)).
 
@@ -404,7 +433,10 @@ process_route(#resource{kind = exchange} = XName,
     end;
 process_route(#resource{kind = queue} = QName,
               {WorkList, SeenXs, QNames}) ->
-    {WorkList, SeenXs, [QName | QNames]}.
+    {WorkList, SeenXs, [QName | QNames]};
+process_route({#resource{kind = queue}, _BindingKey} = QNameWithBindingKey,
+              {WorkList, SeenXs, QNames}) ->
+    {WorkList, SeenXs, [QNameWithBindingKey | QNames]}.
 
 cons_if_present(XName, L) ->
     case lookup(XName) of

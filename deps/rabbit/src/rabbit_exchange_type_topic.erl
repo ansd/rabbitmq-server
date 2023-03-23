@@ -11,7 +11,7 @@
 
 -behaviour(rabbit_exchange_type).
 
--export([description/0, serialise_events/0, route/2]).
+-export([description/0, serialise_events/0, route/2, route/3]).
 -export([validate/1, validate_binding/2,
          create/2, delete/2, policy_changed/2, add_binding/3,
          remove_bindings/3, assert_args_equivalence/2]).
@@ -34,10 +34,14 @@ description() ->
 
 serialise_events() -> false.
 
+route(Exchange, Delivery) ->
+    route(Exchange, Delivery, []).
+
 %% NB: This may return duplicate results in some situations (that's ok)
 route(#exchange{name = XName},
-      #delivery{message = #basic_message{routing_keys = Routes}}) ->
-    lists:append([rabbit_db_topic_exchange:match(XName, RKey) || RKey <- Routes]).
+      #delivery{message = #basic_message{routing_keys = Routes}},
+      Opts) ->
+    lists:append([rabbit_db_topic_exchange:match(XName, RKey, Opts) || RKey <- Routes]).
 
 validate(_X) -> ok.
 validate_binding(_X, _B) -> ok.

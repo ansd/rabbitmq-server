@@ -87,7 +87,7 @@
          %% (Not to be confused with packet IDs sent from client to server which can be the
          %% same IDs because client and server assign IDs independently of each other.)
          packet_id = 1 :: packet_id(),
-         subscriptions = #{} :: #{TopicFilter :: binary() => QoS :: ?QOS_0..?QOS_1},
+         subscriptions = #{} :: #{TopicFilter :: binary() => #mqtt_subscription_opts{}},
          auth_state = #auth_state{},
          ra_register_state :: option(registered | {pending, reference()}),
          %% quorum queues and streams whose soft limit has been exceeded
@@ -405,15 +405,21 @@ process_request(?SUBSCRIBE,
               %% to close the client connection anyway.
               {[?SUBACK_FAILURE | L], S};
          (#mqtt_subscription{topic_filter = Topic,
-                             qos = TopicQos},
+                             options = #mqtt_subscription_opts{
+                                          qos = TopicQos} = Opts},
           {L, S0}) ->
               QoS = maybe_downgrade_qos(TopicQos),
               maybe
                   ok ?= maybe_replace_old_sub(Topic, QoS, S0),
                   {ok, Q} ?= ensure_queue(QoS, S0),
                   QName = amqqueue:get_name(Q),
+                  %%TODO subsription options and subsription identifier must be stored in the
+                  %% database for non-clean sessions. Store them as binding argument?
+                  %% "If there is a Subscription Identifier, it is stored with the subscription.
+                  %% If this property is not specified, then the absence of a Subscription Identifier
+                  %% is stored with the subscription."
                   ok ?= bind(QName, Topic, S0),
-                  Subs = maps:put(Topic, QoS, S0#state.subscriptions),
+                  Subs = maps:put(Topic, Opts, S0#state.subscriptions),
                   S1 = S0#state{subscriptions = Subs},
                   maybe_increment_consumer(S0, S1),
                   case self_consumes(Q) of
@@ -455,7 +461,7 @@ process_request(?UNSUBSCRIBE,
     State = lists:foldl(
               fun(TopicName, #state{subscriptions = Subs0} = S0) ->
                       case maps:take(TopicName, Subs0) of
-                          {QoS, Subs} ->
+                          {#mqtt_subscription_opts{qos = QoS}, Subs} ->
                               QName = queue_name(QoS, S0),
                               case unbind(QName, TopicName, S0) of
                                   ok ->
@@ -772,8 +778,8 @@ cache_subscriptions(_SessionPresent = _SubscriptionsPresent = true,
                     State = #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
     SubsQos0 = topic_names(?QOS_0, State),
     SubsQos1 = topic_names(?QOS_1, State),
-    Subs = maps:merge(maps:from_keys(SubsQos0, ?QOS_0),
-                      maps:from_keys(SubsQos1, ?QOS_1)),
+    Subs = maps:merge(maps:from_keys(SubsQos0, #mqtt_subscription_opts{qos = ?QOS_0}),
+                      maps:from_keys(SubsQos1, #mqtt_subscription_opts{qos = ?QOS_0})),
     rabbit_global_counters:consumer_created(ProtoVer),
     State#state{subscriptions = Subs};
 cache_subscriptions(_, State) ->
@@ -790,6 +796,7 @@ topic_names(QoS, State = #state{cfg = #cfg{exchange = Exchange}}) ->
       %% the destination queue is different for each MQTT client and
       %% rabbit_reverse_route is sorted by destination queue.
       _Reverse = true),
+    %%TODO fetch all subscriptions options and subscription identifier from binding args
     lists:map(fun(B) -> amqp_to_mqtt(B#binding.key) end, Bindings).
 
 %% "If a Server receives a SUBSCRIBE Packet containing a Topic Filter that is identical
@@ -797,9 +804,13 @@ topic_names(QoS, State = #state{cfg = #cfg{exchange = Exchange}}) ->
 %% existing Subscription with a new Subscription. The Topic Filter in the new Subscription
 %% will be identical to that in the previous Subscription, although its maximum QoS value
 %% could be different." [MQTT-3.8.4-3].
+%% TODO In v5, Topic Filter and QoS can be the same although other subscription options
+%% or subscription identifier can be different:
+%% "The Topic Filter in the new Subscription will be identical to that in the previous
+%% Subscription, although its Subscription Options could be different"
 maybe_replace_old_sub(TopicName, QoS, State = #state{subscriptions = Subs}) ->
     case Subs of
-        #{TopicName := OldQoS} when OldQoS =/= QoS ->
+        #{TopicName := #mqtt_subscription_opts{qos = OldQoS}} when OldQoS =/= QoS ->
             QName = queue_name(OldQoS, State),
             unbind(QName, TopicName, State);
         _ ->
@@ -815,9 +826,12 @@ hand_off_to_retainer(RetainerPid, Topic0, Msg = #mqtt_msg{payload = Payload}) ->
            rabbit_mqtt_retainer:retain(RetainerPid, Topic, Msg)
     end.
 
-maybe_send_retained_message(RPid, #mqtt_subscription{topic_filter = Topic0,
-                                                     qos = SubscribeQos},
-                            State0 = #state{packet_id = PacketId0}) ->
+maybe_send_retained_message(
+  RPid,
+  #mqtt_subscription{topic_filter = Topic0,
+                     options = #mqtt_subscription_opts{
+                                  qos = SubscribeQos}},
+  State0 = #state{packet_id = PacketId0}) ->
     Topic = amqp_to_mqtt(Topic0),
     case rabbit_mqtt_retainer:fetch(RPid, Topic) of
         undefined ->
@@ -1282,8 +1296,10 @@ publish_to_queues(
   #state{cfg = #cfg{exchange = ExchangeName,
                     delivery_flow = Flow,
                     conn_name = ConnName,
+                    client_id = ClientId,
                     trace_state = TraceState},
-         auth_state = #auth_state{user = #user{username = Username}}
+         auth_state = #auth_state{user = #user{username = Username}},
+         subscriptions = Subs
         } = State) ->
     RoutingKey = mqtt_to_amqp(Topic),
     Confirm = Qos > ?QOS_0,
@@ -1324,7 +1340,24 @@ publish_to_queues(
                  },
     case rabbit_exchange:lookup(ExchangeName) of
         {ok, Exchange} ->
-            QNames = rabbit_exchange:route(Exchange, Delivery),
+            ClientIdSize = byte_size(ClientId),
+            %%TODO "Multiple Subscription Identifiers will be included if the publication is the result
+            %% of a match to more than one subscription, in this case their order is not significant."
+            QNames0 = rabbit_exchange:route(Exchange, Delivery, [return_queue_name_with_binding_key]),
+            QNames = lists:filtermap(
+                       fun (#resource{}) ->
+                               true;
+                           ({#resource{name = <<"mqtt-subscription-", ClientId:ClientIdSize/binary, "qos", _:1/binary >>} = QName, BindingKey}) ->
+                               TopicFilter = amqp_to_mqtt(BindingKey),
+                               case Subs of
+                                   #{TopicFilter := #mqtt_subscription_opts{no_local = true}} ->
+                                       false;
+                                   _ ->
+                                       {true, QName}
+                               end;
+                           ({#resource{} = QName, _BindingKey}) ->
+                               {true, QName}
+                       end, QNames0),
             rabbit_trace:tap_in(BasicMessage, QNames, ConnName, Username, TraceState),
             deliver_to_queues(Delivery, QNames, State);
         {error, not_found} ->
