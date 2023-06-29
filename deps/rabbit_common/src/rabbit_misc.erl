@@ -79,8 +79,7 @@
 -export([raw_read_file/1]).
 -export([find_child/2]).
 -export([is_regular_file/1]).
--export([maps_any/2]).
--export([is_valid_shortstr/1]).
+-export([maps_any/2, maps_put_truthy/3]).
 
 %% Horrible macro to use in guards
 -define(IS_BENIGN_EXIT(R),
@@ -1472,17 +1471,11 @@ maps_any_1(Pred, {K, V, I}) ->
             maps_any_1(Pred, maps:next(I))
     end.
 
--spec is_valid_shortstr(term()) -> boolean().
-is_valid_shortstr(Bin) when byte_size(Bin) < 256 ->
-    is_utf8_no_null(Bin);
-is_valid_shortstr(_) ->
-    false.
-
-is_utf8_no_null(<<>>) ->
-    true;
-is_utf8_no_null(<<0, _/binary>>) ->
-    false;
-is_utf8_no_null(<<_/utf8, Rem/binary>>) ->
-    is_utf8_no_null(Rem);
-is_utf8_no_null(_) ->
-    false.
+-spec maps_put_truthy(Key, Value, Map) -> Map when
+      Map :: #{Key => Value}.
+maps_put_truthy(_K, undefined, M) ->
+    M;
+maps_put_truthy(_K, false, M) ->
+    M;
+maps_put_truthy(K, V, M) ->
+    maps:put(K, V, M).

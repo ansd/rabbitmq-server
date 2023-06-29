@@ -18,6 +18,8 @@
          serialize/2
         ]).
 
+-import(rabbit_misc, [maps_put_truthy/3]).
+
 -type message_section() ::
     #'v1_0.header'{} |
     #'v1_0.delivery_annotations'{} |
@@ -293,10 +295,10 @@ recover_annotations(#msg{message_annotations = MA} = Msg) ->
     Priority = get_property(priority, Msg),
     Timestamp = get_property(timestamp, Msg),
     Ttl = get_property(ttl, Msg),
-    Anns = maps_put_t(durable, Durable,
-                      maps_put_t(priority, Priority,
-                                 maps_put_t(timestamp, Timestamp,
-                                            maps_put_t(ttl, Ttl, #{})))),
+    Anns = maps_put_truthy(durable, Durable,
+                           maps_put_truthy(priority, Priority,
+                                           maps_put_truthy(timestamp, Timestamp,
+                                                           maps_put_truthy(ttl, Ttl, #{})))),
     Content = MA#'v1_0.message_annotations'.content,
     lists:foldl(
       fun ({{symbol, <<"x-routing-key">>},
@@ -308,13 +310,6 @@ recover_annotations(#msg{message_annotations = MA} = Msg) ->
           (_, Acc) ->
               Acc
       end, Anns, Content).
-
-maps_put_t(_K, undefined, M) ->
-    M;
-maps_put_t(_K, false, M) ->
-    M;
-maps_put_t(K, V, M) ->
-    maps:put(K, V, M).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

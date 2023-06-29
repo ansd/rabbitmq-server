@@ -26,6 +26,7 @@
 -import(rabbit_mqtt_util, [mqtt_to_amqp/1,
                            amqp_to_mqtt/1,
                            ip_address_to_binary/1]).
+-import(rabbit_misc, [maps_put_truthy/3]).
 
 -include_lib("kernel/include/logger.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
@@ -2729,14 +2730,6 @@ format_status(
       ra_register_state => RaRegisterState,
       queues_soft_limit_exceeded => QSLE,
       qos0_messages_dropped => Qos0MsgsDropped}.
-
-
-maps_put_truthy(_K, undefined, M) ->
-    M;
-% maps_put_truthy(_K, false, M) ->
-%     M;
-maps_put_truthy(K, V, M) ->
-    maps:put(K, V, M).
 
 content(#'P_basic'{} = PBasic, Payload)
   when is_binary(Payload) ->

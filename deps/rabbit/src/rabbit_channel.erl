@@ -69,6 +69,8 @@
 %% Mgmt HTTP API refactor
 -export([handle_method/6]).
 
+-import(rabbit_misc, [maps_put_truthy/3]).
+
 -record(conf, {
           %% starting | running | flow | closing
           state,
@@ -2901,10 +2903,3 @@ maybe_decrease_global_publishers(#ch{publishing_mode = false}) ->
     ok;
 maybe_decrease_global_publishers(#ch{publishing_mode = true}) ->
     rabbit_global_counters:publisher_deleted(amqp091).
-
-maps_put_truthy(_K, undefined, M) ->
-    M;
-maps_put_truthy(_K, false, M) ->
-    M;
-maps_put_truthy(K, V, M) ->
-    maps:put(K, V, M).

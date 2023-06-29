@@ -42,8 +42,8 @@
 -record(?MODULE, {protocol :: protocol(),
                   %% protocol specific data term
                   data :: proto_state(),
-                  %% any annotations done by the broker itself
-                  %% such as recording the exchange / routing keys used
+                  %% any annotations set or processed by the broker itself
+                  %% e.g. exchange, routing keys
                   annotations = #{} :: annotations(),
                   deaths :: undefined | #deaths{}
                  }).
@@ -102,13 +102,10 @@
 init(Proto, Data, Anns)
   when is_atom(Proto)
        andalso is_map(Anns) ->
-    {ProtoData, AddAnns} = Proto:init(Data),
+    {ProtoData, ProtoAnns} = Proto:init(Data),
     #?MODULE{protocol = Proto,
              data = ProtoData,
-             %% not sure what the precedence rule should be for annotations
-             %% that are explicitly passed vs annotations that are recovered
-             %% from the protocol parsing
-             annotations = maps:merge(AddAnns, Anns)}.
+             annotations = maps:merge(ProtoAnns, Anns)}.
 
 -spec size(state()) ->
     {MetadataSize :: non_neg_integer(),

@@ -24,6 +24,8 @@
          serialize/2
         ]).
 
+-import(rabbit_misc, [maps_put_truthy/3]).
+
 -define(HEADER_GUESS_SIZE, 100). %% see determine_persist_to/2
 -define(AMQP10_TYPE, <<"amqp-1.0">>).
 -define(AMQP10_PROPERTIES_HEADER, <<"x-amqp-1.0-properties">>).
@@ -115,7 +117,7 @@ init_amqp(Sections) when is_list(Sections) ->
     {Headers, CorrId091} = message_id(CorrId, <<"x-correlation-id">>, Headers1),
 
     UserId1 = unwrap(UserId0),
-    UserId = case rabbit_misc:is_valid_shortstr(UserId1) of
+    UserId = case mc_util:is_valid_shortstr(UserId1) of
                  true ->
                      UserId1;
                  false ->
@@ -526,7 +528,7 @@ to_091(Key, undefined) -> {Key, void, undefined};
 to_091(Key, null) -> {Key, void, undefined}.
 
 message_id({uuid, UUID}, _HKey, H0) ->
-    {H0, uuid_to_string(UUID)};
+    {H0, mc_util:uuid_to_string(UUID)};
 message_id({ulong, N}, _HKey, H0) ->
     {H0, erlang:integer_to_binary(N)};
 message_id({binary, B}, HKey, H0) ->
@@ -555,20 +557,19 @@ essential_properties(#content{} = C) ->
                         TimestampRaw * 1000
                 end,
     Durable = Mode == 2,
-    maps_put_t(priority, Priority,
-               maps_put_t(ttl, MsgTTL,
-                          maps_put_t(timestamp, Timestamp,
-                                     maps_put_t(durable, Durable,
-                                                maps_put_t(correlation_id, CorrId,
-                                                           maps_put_t(message_id, MsgId,
-                                                                      #{})))))).
-
-maps_put_t(_K, undefined, M) ->
-    M;
-maps_put_t(_K, false, M) ->
-    M;
-maps_put_t(K, V, M) ->
-    maps:put(K, V, M).
+    maps_put_truthy(
+      priority, Priority,
+      maps_put_truthy(
+        ttl, MsgTTL,
+        maps_put_truthy(
+          timestamp, Timestamp,
+          maps_put_truthy(
+            durable, Durable,
+            maps_put_truthy(
+              correlation_id, CorrId,
+              maps_put_truthy(
+                message_id, MsgId,
+                #{})))))).
 
 is_x_header(<<"x-", _/binary>>) ->
     true;
@@ -588,12 +589,6 @@ amqp10_section_header(Header, Headers) ->
         _ ->
             undefined
     end.
-
-
-uuid_to_string(<<TL:32, TM:16, THV:16, CSR:8, CSL:8, N:48>>) ->
-    list_to_binary(
-      io_lib:format(<<"run:uuid:~8.16.0b-~4.16.0b-~4.16.0b-~2.16.0b~2.16.0b-~12.16.0b">>,
-                    [TL, TM, THV, CSR, CSL, N])).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

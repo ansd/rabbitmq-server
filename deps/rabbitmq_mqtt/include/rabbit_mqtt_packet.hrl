@@ -248,7 +248,7 @@
                    topic :: topic(),
                    dup :: boolean(),
                    packet_id :: option(packet_id()) | ?WILL_MSG_QOS_1_CORRELATION,
-                   payload :: binary(),
+                   payload :: iodata(),
                    %% PUBLISH or Will properties
                    props :: properties(),
                    timestamp :: option(integer())
