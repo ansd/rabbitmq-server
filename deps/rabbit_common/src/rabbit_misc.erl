@@ -80,6 +80,7 @@
 -export([find_child/2]).
 -export([is_regular_file/1]).
 -export([maps_any/2]).
+-export([is_valid_shortstr/1]).
 
 %% Horrible macro to use in guards
 -define(IS_BENIGN_EXIT(R),
@@ -1470,3 +1471,18 @@ maps_any_1(Pred, {K, V, I}) ->
         false ->
             maps_any_1(Pred, maps:next(I))
     end.
+
+-spec is_valid_shortstr(term()) -> boolean().
+is_valid_shortstr(Bin) when byte_size(Bin) < 256 ->
+    is_utf8_no_null(Bin);
+is_valid_shortstr(_) ->
+    false.
+
+is_utf8_no_null(<<>>) ->
+    true;
+is_utf8_no_null(<<0, _/binary>>) ->
+    false;
+is_utf8_no_null(<<_/utf8, Rem/binary>>) ->
+    is_utf8_no_null(Rem);
+is_utf8_no_null(_) ->
+    false.
