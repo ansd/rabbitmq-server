@@ -137,8 +137,16 @@ convert(TargetProto, #msg{header = Header,
                           properties = P,
                           application_properties = AP,
                           data = Data}) ->
-    Sections = [Header, MA, P, AP, Data],
-    TargetProto:init_amqp(Sections).
+    Sects = lists_prepend_t(
+              Header,
+              lists_prepend_t(
+                MA,
+                lists_prepend_t(
+                  P,
+                  lists_prepend_t(
+                    AP,
+                    Data)))),
+    TargetProto:init_amqp(Sects).
 
 protocol_state(_S, _Anns, _Deaths) ->
     undefined.
@@ -299,17 +307,26 @@ recover_annotations(#msg{message_annotations = MA} = Msg) ->
                            maps_put_truthy(priority, Priority,
                                            maps_put_truthy(timestamp, Timestamp,
                                                            maps_put_truthy(ttl, Ttl, #{})))),
-    Content = MA#'v1_0.message_annotations'.content,
-    lists:foldl(
-      fun ({{symbol, <<"x-routing-key">>},
-            {utf8, Key}}, Acc) ->
-              Acc#{routing_keys => [Key]};
-          ({{symbol, <<"x-exchange">>},
-            {utf8, Exchange}}, Acc) ->
-              Acc#{exchange => Exchange};
-          (_, Acc) ->
-              Acc
-      end, Anns, Content).
+    case MA of
+        undefined ->
+            Anns;
+        #'v1_0.message_annotations'{content = Content} ->
+            lists:foldl(
+              fun ({{symbol, <<"x-routing-key">>},
+                    {utf8, Key}}, Acc) ->
+                      Acc#{routing_keys => [Key]};
+                  ({{symbol, <<"x-exchange">>},
+                    {utf8, Exchange}}, Acc) ->
+                      Acc#{exchange => Exchange};
+                  (_, Acc) ->
+                      Acc
+              end, Anns, Content)
+    end.
+
+lists_prepend_t(undefined, L) ->
+    L;
+lists_prepend_t(Val, L) ->
+    [Val | L].
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

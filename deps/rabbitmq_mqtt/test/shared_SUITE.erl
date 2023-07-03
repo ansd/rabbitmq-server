@@ -1452,7 +1452,7 @@ trace(Config) ->
     {#'basic.get_ok'{routing_key = <<"publish.amq.topic">>},
      #amqp_msg{props = #'P_basic'{headers = PublishHeaders},
                payload = Payload}} =
-    amqp_channel:call(Ch, #'basic.get'{queue = TraceQ, no_ack = false}),
+    amqp_channel:call(Ch, #'basic.get'{queue = TraceQ}),
     ?assertMatch(#{<<"exchange_name">> := <<"amq.topic">>,
                    <<"routing_keys">> := [Topic],
                    <<"connection">> := <<"127.0.0.1:", _/binary>>,
@@ -1460,15 +1460,14 @@ trace(Config) ->
                    <<"vhost">> := <<"/">>,
                    <<"channel">> := 0,
                    <<"user">> := <<"guest">>,
-                   <<"properties">> := #{<<"delivery_mode">> := 2,
-                                         <<"headers">> := #{<<"x-mqtt-publish-qos">> := 1}},
+                   <<"properties">> := #{<<"delivery_mode">> := 2},
                    <<"routed_queues">> := [<<"mqtt-subscription-trace_subscriberqos0">>]},
                  rabbit_misc:amqp_table(PublishHeaders)),
 
     {#'basic.get_ok'{routing_key = <<"deliver.mqtt-subscription-trace_subscriberqos0">>},
      #amqp_msg{props = #'P_basic'{headers = DeliverHeaders},
                payload = Payload}} =
-    amqp_channel:call(Ch, #'basic.get'{queue = TraceQ, no_ack = false}),
+    amqp_channel:call(Ch, #'basic.get'{queue = TraceQ}),
     ?assertMatch(#{<<"exchange_name">> := <<"amq.topic">>,
                    <<"routing_keys">> := [Topic],
                    <<"connection">> := <<"127.0.0.1:", _/binary>>,
@@ -1476,8 +1475,7 @@ trace(Config) ->
                    <<"vhost">> := <<"/">>,
                    <<"channel">> := 0,
                    <<"user">> := <<"guest">>,
-                   <<"properties">> := #{<<"delivery_mode">> := 2,
-                                         <<"headers">> := #{<<"x-mqtt-publish-qos">> := 1}},
+                   <<"properties">> := #{<<"delivery_mode">> := 2},
                    <<"redelivered">> := 0},
                  rabbit_misc:amqp_table(DeliverHeaders)),
 
@@ -1485,7 +1483,7 @@ trace(Config) ->
     {ok, _} = emqtt:publish(Pub, Topic, Payload, qos1),
     ok = expect_publishes(Sub, Topic, [Payload]),
     ?assertMatch(#'basic.get_empty'{},
-                 amqp_channel:call(Ch, #'basic.get'{queue = TraceQ, no_ack = false})),
+                 amqp_channel:call(Ch, #'basic.get'{queue = TraceQ})),
 
     delete_queue(Ch, TraceQ),
     [ok = emqtt:disconnect(C) || C <- [Pub, Sub]].

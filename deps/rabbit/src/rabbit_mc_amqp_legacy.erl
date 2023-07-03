@@ -46,7 +46,7 @@ init(#content{} = Content) ->
     {strip_header(Content, ?DELETED_HEADER), Anns}.
 
 init_amqp(Sections) when is_list(Sections) ->
-    {_H, MAnn, P, AProp, Body} =
+    {H, MAnn, P, AProp, Body} =
         lists:foldl(
           fun
               (#'v1_0.header'{} = S, Acc) ->
@@ -60,13 +60,16 @@ init_amqp(Sections) when is_list(Sections) ->
               (#'v1_0.footer'{}, Acc) ->
                   %% footer not currently used
                   Acc;
-              (BodySection, Acc) ->
+              (BodySect, Acc) when
+                    is_record(BodySect, 'v1_0.data') orelse
+                    is_record(BodySect, 'v1_0.amqp_sequence') orelse
+                    is_record(BodySect, 'v1_0.amqp_value')  ->
                   Body = element(5, Acc),
-                  setelement(5, Acc, [BodySection | Body])
+                  setelement(5, Acc, [BodySect | Body])
           end, {undefined, undefined, undefined, undefined, []},
           Sections),
 
-    {Payload, Type0} = case Body of
+        {Payload, Type0} = case Body of
                            [#'v1_0.data'{content = Bin}] ->
                                {Bin, undefined};
                            _ ->
@@ -89,29 +92,33 @@ init_amqp(Sections) when is_list(Sections) ->
                                                      P
                                              end,
 
-    AP0 = case AProp of
-              #'v1_0.application_properties'{content = AC} -> AC;
-              _ -> []
-          end,
-    MA0 = case MAnn of
-              #'v1_0.message_annotations'{content = MC} -> MC;
-              _ -> []
-          end,
+    AP = case AProp of
+             #'v1_0.application_properties'{content = AC} -> AC;
+             _ -> []
+         end,
+    MA = case MAnn of
+             #'v1_0.message_annotations'{content = MC} -> MC;
+             _ -> []
+         end,
 
-    %% TODO: check amqp header first for durable, priority, ttl
-    Priority = amqp10_map_get(symbol(<<"x-basic-priority">>), MA0),
-    DelMode = amqp10_map_get(symbol(<<"x-basic-delivery-mode">>), MA0),
-    Expiration = amqp10_map_get(symbol(<<"x-basic-expiration">>), MA0),
+    DelMode = case H of
+                  #'v1_0.header'{durable = true} -> 2;
+                  #'v1_0.header'{durable = false} -> 1;
+                  _ -> amqp10_map_get(symbol(<<"x-basic-delivery-mode">>), MA)
+              end,
+    %% TODO: check amqp header first for priority, ttl
+    Priority = amqp10_map_get(symbol(<<"x-basic-priority">>), MA),
+    Expiration = amqp10_map_get(symbol(<<"x-basic-expiration">>), MA),
     Type = case Type0 of
                undefined ->
-                   amqp10_map_get(symbol(<<"x-basic-type">>), MA0);
+                   amqp10_map_get(symbol(<<"x-basic-type">>), MA);
                _ ->
                    Type0
            end,
 
-    Headers0 = [to_091(unwrap(K), V) || {K, V} <- AP0],
+    Headers0 = [to_091(unwrap(K), V) || {K, V} <- AP],
     %% Add remaining message annotations as headers?
-    XHeaders = [to_091(K, V) || {{_, K}, V} <- MA0,
+    XHeaders = [to_091(K, V) || {{_, K}, V} <- MA,
                                 not is_x_basic_header(K)],
     {Headers1, MsgId091} = message_id(MsgId, <<"x-message-id">>, Headers0),
     {Headers, CorrId091} = message_id(CorrId, <<"x-correlation-id">>, Headers1),
@@ -312,7 +319,7 @@ convert(rabbit_mc_amqp, #content{properties = Props,
 convert(_, _C) ->
     not_implemented.
 
-protocol_state(#content{properties = #'P_basic'{headers = H00} = B} = C,
+protocol_state(#content{properties = #'P_basic'{headers = H00} = B0} = C,
                Anns, Deaths) ->
     %% Add any x- annotations as headers
     %% TODO: conversion is very primitive for now
@@ -326,6 +333,11 @@ protocol_state(#content{properties = #'P_basic'{headers = H00} = B} = C,
                          [{Key, long, Val} | H];
                      (<<"x-", _>> = Key, Val, H) when is_binary(Val) ->
                          [{Key, longstr, Val} | H];
+                     (<<"timestamp_in_ms">> = Key, Val, H) when is_integer(Val) ->
+                         %% TODO We might want to drop this backwards compat header with
+                         %% https://github.com/rabbitmq/rabbitmq-message-timestamp
+                         %% and instead only set timestamp in rabbit_message_interceptor
+                         [{Key, long, Val} | H];
                      (_, _, Acc) ->
                          Acc
                  end, deaths_to_headers(Deaths, H0), Anns),
@@ -336,7 +348,15 @@ protocol_state(#content{properties = #'P_basic'{headers = H00} = B} = C,
                       Headers0
               end,
 
-    C#content{properties = B#'P_basic'{headers = Headers},
+    B = case Anns of
+            #{timestamp := Timestamp} ->
+                B0#'P_basic'{timestamp = Timestamp div 1000,
+                             headers = Headers};
+            _ ->
+                B0#'P_basic'{headers = Headers}
+        end,
+
+    C#content{properties = B,
               properties_bin = none}.
 
 -spec message(rabbit_types:exchange_name(), rabbit_types:routing_key(), #content{}) -> mc:state().
@@ -539,7 +559,9 @@ message_id({utf8, S}, HKey, H0) ->
             {[{HKey, longstr, S} | H0], undefined};
         false ->
             {H0, S}
-    end.
+    end;
+message_id(undefined, _HKey, H) ->
+    {H, undefined}.
 
 essential_properties(#content{} = C) ->
     %% TODO: ensure content decoded

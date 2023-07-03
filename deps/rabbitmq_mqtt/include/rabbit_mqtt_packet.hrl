@@ -245,7 +245,7 @@
 %% MQTT application message starting in 3.13
 -record(mqtt_msg, {retain :: boolean(),
                    qos :: qos(),
-                   topic :: topic(),
+                   topic :: option(topic()),
                    dup :: boolean(),
                    packet_id :: option(packet_id()) | ?WILL_MSG_QOS_1_CORRELATION,
                    payload :: iodata(),

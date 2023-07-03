@@ -235,9 +235,10 @@ convert(TargetProto, #?MODULE{protocol = Proto,
         not_implemented ->
             %% convert to 1.0 then try again
             AmqpData = Proto:convert(rabbit_mc_amqp, Data),
+            TargetData = rabbit_mc_amqp:convert(TargetProto, AmqpData),
             %% init the target from a list of amqp sections
             State#?MODULE{protocol = TargetProto,
-                          data = TargetProto:init_amqp(AmqpData)};
+                          data = TargetData};
         TargetState ->
             State#?MODULE{protocol = TargetProto,
                           data = TargetState}

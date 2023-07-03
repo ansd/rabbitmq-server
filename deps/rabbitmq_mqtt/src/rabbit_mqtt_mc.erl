@@ -46,45 +46,62 @@ init(Msg = #mqtt_msg{qos = Qos,
 
 init_amqp(Sections)
   when is_list(Sections) ->
-    {Header, AmqpProps, PayloadRev} =
+    {_Header, MsgAnns, AmqpProps, PayloadRev} =
     lists:foldl(
       fun(#'v1_0.header'{} = S, Acc) ->
               setelement(1, Acc, S);
-         (#'v1_0.message_annotations'{}, Acc) ->
-              Acc;
-         (#'v1_0.properties'{} = S, Acc) ->
+         (#'v1_0.message_annotations'{} = S, Acc) ->
               setelement(2, Acc, S);
+         (#'v1_0.properties'{} = S, Acc) ->
+              setelement(3, Acc, S);
          (#'v1_0.application_properties'{}, Acc) ->
               Acc;
          (#'v1_0.footer'{}, Acc) ->
               Acc;
-         (#'v1_0.data'{content = Bin}, Acc) ->
-              setelement(3, Acc, [Bin | element(3, Acc)]);
-         (BodySection, Acc) ->
+         (#'v1_0.data'{content = L}, Acc) ->
+              setelement(4, Acc, [L | element(4, Acc)]);
+         (BodySect, Acc)
+           when is_record(BodySect, 'v1_0.amqp_sequence') orelse
+                is_record(BodySect, 'v1_0.amqp_value') ->
               %% TODO How to indicate to MQTT client that payload is encoded by AMQP type system?
               %% There is no registered message/amqp content type or encoding.
-              Bin = amqp10_framing:encode_bin(BodySection),
-              setelement(3, Acc, [Bin | element(3, Acc)])
-      end, {undefined, ndefined, []}, Sections),
-    Qos = case Header of
-              #'v1_0.header'{durable = true} ->
-                  ?QOS_1;
-              _ ->
-                  ?QOS_0
-          end,
-    Props0 = case AmqpProps of
-                 #'v1_0.properties'{correlation_id = {_Type, _Val} = Corr} ->
-                     #{'Correlation-Data' => correlation_id(Corr)};
+              Bin = amqp10_framing:encode_bin(BodySect),
+              setelement(4, Acc, [Bin | element(4, Acc)])
+      end, {undefined, undefined, undefined, []}, Sections),
+
+    %%TODO Up to 3.12 non-MQTT publishes are assumed to be QoS 1 regardless of delivery_mode
+    %% https://github.com/rabbitmq/rabbitmq-server/blob/75a953ce286a10aca910c098805a4f545989af38/deps/rabbitmq_mqtt/src/rabbit_mqtt_processor.erl#L2075-L2076
+    %% Should we keep that behaviour?
+    Qos = ?QOS_1,
+    % Qos = case Header of
+    %           #'v1_0.header'{durable = true} ->
+    %               ?QOS_1;
+    %           _ ->
+    %               ?QOS_0
+    %       end,
+
+    Props0 = case MsgAnns of
+                 #'v1_0.message_annotations'{
+                    content = #{{symbol, <<"x-opt-reply-to-topic">>} := {utf8, Topic}}} ->
+                     #{'Response-Topic' => rabbit_mqtt_util:amqp_to_mqtt(Topic)};
                  _ ->
                      #{}
              end,
+    Props1 = case AmqpProps of
+                 #'v1_0.properties'{correlation_id = {_Type, _Val} = Corr} ->
+                     Props0#{'Correlation-Data' => correlation_id(Corr)};
+                 _ ->
+                     Props0
+             end,
     Props = case AmqpProps of
                 #'v1_0.properties'{content_type = {symbol, ContentType}} ->
-                    Props0#{'Content-Type' => rabbit_data_coercion:to_binary(ContentType)};
+                    Props1#{'Content-Type' => rabbit_data_coercion:to_binary(ContentType)};
                 _ ->
-                    Props0
+                    Props1
             end,
-    #mqtt_msg{qos = Qos,
+    #mqtt_msg{retain = false,
+              qos = Qos,
+              dup = false,
               props = Props,
               payload = lists:reverse(PayloadRev)}.
 
@@ -104,14 +121,27 @@ convert(rabbit_mc_amqp, #mqtt_msg{qos = Qos,
                   end,
     CorrId = case Props of
                  #{'Correlation-Data' := Corr} ->
-                     {binary, Corr};
+                     case mc_util:is_utf8_no_null(Corr) of
+                         true ->
+                             {utf8, Corr};
+                         false ->
+                             {binary, Corr}
+                     end;
                  _ ->
                      undefined
              end,
     AmqpProps = #'v1_0.properties'{content_type = ContentType,
                                    correlation_id = CorrId},
     AppData = #'v1_0.data'{content = [Payload]},
-    Sections = [Header, AmqpProps, AppData],
+    Sections = case Props of
+                   #{'Response-Topic' := Topic} ->
+                       MsgAnns = #'v1_0.message_annotations'{
+                                    content = [{{symbol, <<"x-opt-reply-to-topic">>},
+                                                {utf8, rabbit_mqtt_util:mqtt_to_amqp(Topic)}}]},
+                       [Header, MsgAnns, AmqpProps, AppData];
+                   _ ->
+                       [Header, AmqpProps, AppData]
+               end,
     rabbit_mc_amqp:init_amqp(Sections);
 convert(_TargetProto, #mqtt_msg{}) ->
     not_implemented.
@@ -135,8 +165,8 @@ size_prop('User-Property', L, Sum) ->
 size_prop(_, _, Sum) ->
     Sum.
 
-x_header(_Key, #mqtt_msg{}) ->
-    undefined.
+x_header(_Key, #mqtt_msg{} = Msg) ->
+    {undefined, Msg}.
 
 routing_headers(#mqtt_msg{}, _Opts) ->
     #{}.
