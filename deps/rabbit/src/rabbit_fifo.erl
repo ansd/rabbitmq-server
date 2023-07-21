@@ -132,7 +132,6 @@
               delivery/0,
               command/0,
               credit_mode/0,
-              consumer_tag/0,
               consumer_meta/0,
               consumer_id/0,
               client_msg/0,
@@ -285,6 +284,12 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
                waiting_consumers = Waiting0} = State0) ->
     case Cons0 of
         #{ConsumerId := #consumer{delivery_count = DelCnt} = Con0} ->
+            %%TODO We do this caluclation twice and keep a delivery count twice:
+            %% 1. in the AMQP 1.0 plugin
+            %% 2. here
+            %% Do we keep the additional delivery count and calculation in the AMQP 1.0 plugin
+            %% because classic queues do not keep track of delivery count?
+            %%
             %% this can go below 0 when credit is reduced
             C = max(0, RemoteDelCnt + NewCredit - DelCnt),
             %% grant the credit
@@ -312,12 +317,14 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
                                          Con#consumer{delivery_count = DeliveryCount,
                                                       credit = 0},
                                          State1#?MODULE.consumers),
-                    Drained = Con#consumer.credit,
                     {CTag, _} = ConsumerId,
                     {State1#?MODULE{consumers = Consumers},
                      %% returning a multi response with two client actions
                      %% for the channel to execute
-                     {multi, [Response, {send_drained, {CTag, Drained}}]},
+                     %%TODO Shouldn't {send_drained, _} be sent AFTER the delivery effects?
+                     %% Currently a synchronous Get [2.6.8] cannot be achieved because the client
+                     %% receives the FLOW with drained=true before the delivery.
+                     {multi, [Response, {send_drained, {CTag, PostCred}}]},
                      Effects}
             end;
         _ when Waiting0 /= [] ->
@@ -2355,8 +2362,8 @@ make_return(ConsumerId, MsgIds) ->
 make_discard(ConsumerId, MsgIds) ->
     #discard{consumer_id = ConsumerId, msg_ids = MsgIds}.
 
--spec make_credit(consumer_id(), non_neg_integer(), non_neg_integer(),
-                  boolean()) -> protocol().
+-spec make_credit(consumer_id(), rabbit_queue_type:credit(),
+                  non_neg_integer(), boolean()) -> protocol().
 make_credit(ConsumerId, Credit, DeliveryCount, Drain) ->
     #credit{consumer_id = ConsumerId,
             credit = Credit,

@@ -8,7 +8,7 @@
 -include("resource.hrl").
 
 %% Passed around most places
--record(user, {username,
+-record(user, {username :: rabbit_types:option(rabbit_types:username()),
                tags,
                authz_backends}). %% List of {Module, AuthUserImpl} pairs
 

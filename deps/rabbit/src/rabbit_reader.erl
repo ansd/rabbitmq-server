@@ -1633,8 +1633,16 @@ pack_for_1_0(Buf, BufLen, #v1{parent       = Parent,
                               recv_len     = RecvLen,
                               pending_recv = PendingRecv,
                               helper_sup   = SupPid,
-                              proxy_socket = ProxySocket}) ->
-    {Parent, Sock, RecvLen, PendingRecv, SupPid, Buf, BufLen, ProxySocket}.
+                              proxy_socket = ProxySocket,
+                              connection = #connection{
+                                              name = Name,
+                                              host = Host,
+                                              peer_host = PeerHost,
+                                              port = Port,
+                                              peer_port = PeerPort,
+                                              connected_at = ConnectedAt}}) ->
+    {Parent, Sock, RecvLen, PendingRecv, SupPid, Buf, BufLen, ProxySocket,
+     Name, Host, PeerHost, Port, PeerPort, ConnectedAt}.
 
 respond_and_close(State, Channel, Protocol, Reason, LogErr) ->
     log_hard_error(State, Channel, LogErr),

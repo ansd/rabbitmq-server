@@ -87,13 +87,9 @@
           %% same as reader's name, see #v1.name
           %% in rabbit_reader
           conn_name,
-          %% channel's originating source e.g. rabbit_reader | rabbit_direct | undefined
-          %% or any other channel creating/spawning entity
-          source,
           %% same as #v1.user in the reader, used in
           %% authorisation checks
           user,
-          %% same as #v1.user in the reader
           virtual_host,
           %% when queue.bind's queue field is empty,
           %% this name will be used instead
@@ -112,10 +108,7 @@
           consumer_timeout,
           authz_context,
           %% defines how ofter gc will be executed
-          writer_gc_threshold,
-          %% true with AMQP 1.0 to include the publishing sequence
-          %% in the return callback, false otherwise
-          extended_return_callback
+          writer_gc_threshold
          }).
 
 -record(pending_ack, {
@@ -516,7 +509,6 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
     MaxMessageSize = get_max_message_size(),
     ConsumerTimeout = get_consumer_timeout(),
     OptionalVariables = extract_variable_map_from_amqp_params(AmqpParams),
-    UseExtendedReturnCallback = use_extended_return_callback(AmqpParams),
     {ok, GCThreshold} = application:get_env(rabbit, writer_gc_threshold),
     State = #ch{cfg = #conf{state = starting,
                             protocol = Protocol,
@@ -535,8 +527,7 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
                             max_message_size = MaxMessageSize,
                             consumer_timeout = ConsumerTimeout,
                             authz_context = OptionalVariables,
-                            writer_gc_threshold = GCThreshold,
-                            extended_return_callback = UseExtendedReturnCallback
+                            writer_gc_threshold = GCThreshold
                            },
                 limiter = Limiter,
                 tx                      = none,
@@ -812,17 +803,17 @@ terminate(_Reason,
           State = #ch{cfg = #conf{user = #user{username = Username}},
                       consumer_mapping = CM,
                       queue_states = QueueCtxs}) ->
-    _ = rabbit_queue_type:close(QueueCtxs),
+    rabbit_queue_type:close(QueueCtxs),
     {_Res, _State1} = notify_queues(State),
     pg_local:leave(rabbit_channels, self()),
     rabbit_event:if_enabled(State, #ch.stats_timer,
                             fun() -> emit_stats(State) end),
     [delete_stats(Tag) || {Tag, _} <- get()],
     maybe_decrease_global_publishers(State),
-    _ = maps:map(
-          fun (_, _) ->
-                  rabbit_global_counters:consumer_deleted(amqp091)
-          end, CM),
+    maps:foreach(
+      fun (_, _) ->
+              rabbit_global_counters:consumer_deleted(amqp091)
+      end, CM),
     rabbit_core_metrics:channel_closed(self()),
     rabbit_event:notify(channel_closed, [{pid, self()},
                                          {user_who_performed_action, Username}]),
@@ -1026,15 +1017,6 @@ extract_variable_map_from_amqp_params([Value]) ->
     extract_variable_map_from_amqp_params(Value);
 extract_variable_map_from_amqp_params(_) ->
     #{}.
-
-%% Use tuple representation of amqp_params to avoid a dependency on amqp_client.
-%% Used for AMQP 1.0
-use_extended_return_callback({amqp_params_direct,_,_,_,_,
-                              {amqp_adapter_info,_,_,_,_,_,{'AMQP',"1.0"},_},
-                              _}) ->
-    true;
-use_extended_return_callback(_) ->
-    false.
 
 check_msg_size(Content, MaxMessageSize, GCThreshold) ->
     Size = rabbit_basic:maybe_gc_large_msg(Content, GCThreshold),
@@ -2146,10 +2128,10 @@ deliver_to_queues(XName,
         {ok, QueueStates, Actions} ->
             rabbit_global_counters:messages_routed(amqp091, length(Qs)),
             QueueNames = rabbit_amqqueue:queue_names(Qs),
-            MsgSeqNo = maps:get(correlation, Options, undefined),
             %% NB: the order here is important since basic.returns must be
             %% sent before confirms.
-            ok = process_routing_mandatory(Mandatory, RoutedToQueues, MsgSeqNo, Message, XName, State0),
+            ok = process_routing_mandatory(Mandatory, RoutedToQueues, Message, XName, State0),
+            MsgSeqNo = maps:get(correlation, Options, undefined),
             State1 = process_routing_confirm(MsgSeqNo, QueueNames, XName, State0),
             %% Actions must be processed after registering confirms as actions may
             %% contain rejections of publishes
@@ -2178,32 +2160,23 @@ deliver_to_queues(XName,
 
 process_routing_mandatory(_Mandatory = true,
                           _RoutedToQs = [],
-                          MsgSeqNo,
                           Msg,
                           XName,
-                          State = #ch{cfg = #conf{extended_return_callback = ExtRetCallback}}) ->
+                          State) ->
     rabbit_global_counters:messages_unroutable_returned(amqp091, 1),
     ?INCR_STATS(exchange_stats, XName, 1, return_unroutable, State),
-    Content0 = mc:protocol_state(Msg),
-    Content = case ExtRetCallback of
-                  true ->
-                      %% providing the publishing sequence for AMQP 1.0
-                      {MsgSeqNo, Content0};
-                  false ->
-                      Content0
-              end,
+    Content = mc:protocol_state(Msg),
     [RoutingKey | _] = mc:get_annotation(routing_keys, Msg),
     ok = basic_return(Content, RoutingKey, XName#resource.name, State, no_route);
 process_routing_mandatory(_Mandatory = false,
                           _RoutedToQs = [],
-                          _MsgSeqNo,
                           _Msg,
                           XName,
                           State) ->
     rabbit_global_counters:messages_unroutable_dropped(amqp091, 1),
     ?INCR_STATS(exchange_stats, XName, 1, drop_unroutable, State),
     ok;
-process_routing_mandatory(_, _, _, _, _, _) ->
+process_routing_mandatory(_, _, _, _, _) ->
     ok.
 
 process_routing_confirm(undefined, _, _, State) ->
@@ -2823,6 +2796,8 @@ handle_queue_actions(Actions, #ch{cfg = #conf{writer_pid = WriterPid}} = State0)
           ({unblock, QName}, S0) ->
               credit_flow:unblock(QName),
               S0;
+          %% TODO channel needs to understand this new format if Native AMQP is hidden behind a feature flag
+          % ({send_credit_reply, Ctag, Credit, Avail}, S0) ->
           ({send_credit_reply, Avail}, S0) ->
               ok = rabbit_writer:send_command(WriterPid,
                                               #'basic.credit_ok'{available = Avail}),

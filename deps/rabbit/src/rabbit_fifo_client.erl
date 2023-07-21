@@ -41,7 +41,7 @@
 -type seq() :: non_neg_integer().
 -type action() :: {send_credit_reply, Available :: non_neg_integer()} |
                   {send_drained, CTagCredit ::
-                   {rabbit_fifo:consumer_tag(), non_neg_integer()}} |
+                   {rabbit_types:ctag(), non_neg_integer()}} |
                   rabbit_queue_type:action().
 -type actions() :: [action()].
 
@@ -65,7 +65,7 @@
                                            {[seq()], [seq()], [seq()]}},
                 pending = #{} :: #{seq() =>
                                    {term(), rabbit_fifo:command()}},
-                consumer_deliveries = #{} :: #{rabbit_fifo:consumer_tag() =>
+                consumer_deliveries = #{} :: #{rabbit_types:ctag() =>
                                                #consumer{}},
                 timer_state :: term()
                }).
@@ -193,7 +193,7 @@ enqueue(QName, Msg, State) ->
 %% @param State The {@module} state.
 %%
 %% @returns `{ok, IdMsg, State}' or `{error | timeout, term()}'
--spec dequeue(rabbit_amqqueue:name(), rabbit_fifo:consumer_tag(),
+-spec dequeue(rabbit_amqqueue:name(), rabbit_types:ctag(),
               Settlement :: settled | unsettled, state()) ->
     {ok, non_neg_integer(), term(), non_neg_integer()}
      | {empty, state()} | {error | timeout, term()}.
@@ -239,7 +239,7 @@ add_delivery_count_header(Msg, Count) ->
 %% @param MsgIds the message ids received with the {@link rabbit_fifo:delivery/0.}
 %% @param State the {@module} state
 %%
--spec settle(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
+-spec settle(rabbit_types:ctag(), [rabbit_fifo:msg_id()], state()) ->
     {state(), list()}.
 settle(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     ServerId = pick_server(State0),
@@ -267,7 +267,7 @@ settle(ConsumerTag, [_|_] = MsgIds,
 %% @returns
 %% `{State, list()}' if the command was successfully sent.
 %%
--spec return(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
+-spec return(rabbit_types:ctag(), [rabbit_fifo:msg_id()], state()) ->
     {state(), list()}.
 return(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     ServerId = pick_server(State0),
@@ -292,7 +292,7 @@ return(ConsumerTag, [_|_] = MsgIds,
 %% @param MsgIds the message ids to discard
 %% from {@link rabbit_fifo:delivery/0.}
 %% @param State the {@module} state
--spec discard(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
+-spec discard(rabbit_types:ctag(), [rabbit_fifo:msg_id()], state()) ->
     {state(), list()}.
 discard(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
     ServerId = pick_server(State0),
@@ -325,7 +325,7 @@ discard(ConsumerTag, [_|_] = MsgIds,
 %% @param State The {@module} state.
 %%
 %% @returns `{ok, State}' or `{error | timeout, term()}'
--spec checkout(rabbit_fifo:consumer_tag(),
+-spec checkout(rabbit_types:ctag(),
                NumUnsettled :: non_neg_integer(),
                CreditMode :: rabbit_fifo:credit_mode(),
                Meta :: rabbit_fifo:consumer_meta(),
@@ -389,12 +389,12 @@ query_single_active_consumer(#state{leader = Leader}) ->
 %%
 %% This only has an effect if the consumer uses credit mode: credited
 %% @param ConsumerTag a unique tag to identify this particular consumer.
-%% @param Credit the amount of credit to provide to theq queue
+%% @param Credit the amount of credit to provide to the queue
 %% @param Drain tells the queue to use up any credit that cannot be immediately
 %% fulfilled. (i.e. there are not enough messages on queue to use up all the
 %% provided credit).
--spec credit(rabbit_fifo:consumer_tag(),
-             Credit :: non_neg_integer(),
+-spec credit(rabbit_types:ctag(),
+             rabbit_queue_type:credit(),
              Drain :: boolean(),
              state()) ->
           {state(), actions()}.
@@ -418,7 +418,7 @@ credit(ConsumerTag, Credit, Drain,
 %% @param State The {@module} state.
 %%
 %% @returns `{ok, State}' or `{error | timeout, term()}'
--spec cancel_checkout(rabbit_fifo:consumer_tag(), state()) ->
+-spec cancel_checkout(rabbit_types:ctag(), state()) ->
     {ok, state()} | {error | timeout, term()}.
 cancel_checkout(ConsumerTag, #state{consumer_deliveries = CDels} = State0) ->
     Servers = sorted_servers(State0),

@@ -79,10 +79,7 @@
       transfer_limit_margin => 0 | neg_integer(),
       %% These credentials_obfuscation-wrapped values have the type of
       %% decrypted_sasl/0
-      sasl => encrypted_sasl() | decrypted_sasl(),
-      notify => pid(),
-      notify_when_opened => pid() | none,
-      notify_when_closed => pid() | none
+      sasl => encrypted_sasl() | decrypted_sasl()
   }.
 
 -record(state,
@@ -167,7 +164,7 @@ protocol_header_received(Pid, Protocol, Maj, Min, Rev) ->
 
 -spec begin_session(pid()) -> supervisor:startchild_ret().
 begin_session(Pid) ->
-    gen_statem:call(Pid, begin_session, {dirty_timeout, ?TIMEOUT}).
+    gen_statem:call(Pid, begin_session, ?TIMEOUT).
 
 heartbeat(Pid) ->
     gen_statem:cast(Pid, heartbeat).

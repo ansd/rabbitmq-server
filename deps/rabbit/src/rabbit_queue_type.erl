@@ -66,8 +66,11 @@
 -type msg_tag() :: term().
 -type arguments() :: queue_arguments | consumer_arguments.
 -type queue_type() :: rabbit_classic_queue | rabbit_quorum_queue | rabbit_stream_queue.
+%% Link credit can be negative, see AMQP 1.0 [2.6.7].
+-type credit() :: integer().
 
--export_type([queue_type/0]).
+-export_type([queue_type/0,
+              credit/0]).
 
 -define(STATE, ?MODULE).
 
@@ -208,7 +211,7 @@
     {'protocol_error', Type :: atom(), Reason :: string(), Args :: term()}.
 
 -callback credit(queue_name(), rabbit_types:ctag(),
-                 non_neg_integer(), Drain :: boolean(), queue_state()) ->
+                 credit(), Drain :: boolean(), queue_state()) ->
     {queue_state(), actions()}.
 
 -callback dequeue(queue_name(), NoAck :: boolean(), LimiterPid :: pid(),
@@ -630,13 +633,12 @@ settle(#resource{kind = queue} = QRef, Op, CTag, MsgIds, Ctxs) ->
     end.
 
 -spec credit(amqqueue:amqqueue() | queue_name(),
-             rabbit_types:ctag(), non_neg_integer(),
+             rabbit_types:ctag(), credit(),
              boolean(), state()) -> {ok, state(), actions()}.
 credit(Q, CTag, Credit, Drain, Ctxs) ->
     #ctx{state = State0,
          module = Mod} = Ctx = get_ctx(Q, Ctxs),
-    QName = amqqueue:get_name(Q),
-    {State, Actions} = Mod:credit(QName, CTag, Credit, Drain, State0),
+    {State, Actions} = Mod:credit(qref(Q), CTag, Credit, Drain, State0),
     {ok, set_ctx(Q, Ctx#ctx{state = State}, Ctxs), Actions}.
 
 -spec dequeue(amqqueue:amqqueue(), boolean(),

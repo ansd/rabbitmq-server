@@ -37,6 +37,8 @@ all_srcs(name = "all_srcs")
 
 test_suite_beam_files(name = "test_suite_beam_files")
 
+# gazelle:erlang_app_dep amqp_client
+
 rabbitmq_app(
     name = "erlang_app",
     srcs = [":all_srcs"],
@@ -93,7 +95,8 @@ broker_for_integration_suites()
 
 rabbitmq_integration_suite(
     name = "amqp10_client_SUITE",
-    size = "medium",
+    size = "large",
+    shard_count = 3,
     runtime_deps = [
         "//deps/amqp10_client:erlang_app",
     ],
@@ -132,7 +135,7 @@ rabbitmq_integration_suite(
 )
 
 rabbitmq_suite(
-    name = "unit_SUITE",
+    name = "serial_number_SUITE",
     size = "small",
     deps = [
         "//deps/amqp10_common:erlang_app",

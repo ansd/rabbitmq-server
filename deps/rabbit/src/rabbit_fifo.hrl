@@ -56,14 +56,10 @@
 -type delivery_msg() :: {msg_id(), {msg_header(), raw_msg()}}.
 %% A tuple consisting of the message id, and the headered message.
 
--type consumer_tag() :: binary().
-%% An arbitrary binary tag used to distinguish between different consumers
-%% set up by the same process. See: {@link rabbit_fifo_client:checkout/3.}
-
--type delivery() :: {delivery, consumer_tag(), [delivery_msg()]}.
+-type delivery() :: {delivery, rabbit_types:ctag(), [delivery_msg()]}.
 %% Represents the delivery of one or more rabbit_fifo messages.
 
--type consumer_id() :: {consumer_tag(), pid()}.
+-type consumer_id() :: {rabbit_types:ctag(), pid()}.
 %% The entity that receives messages. Uniquely identifies a consumer.
 
 -type credit_mode() :: credited |
@@ -101,7 +97,7 @@
 -record(consumer_cfg,
         {meta = #{} :: consumer_meta(),
          pid :: pid(),
-         tag :: consumer_tag(),
+         tag :: rabbit_types:ctag(),
          %% the mode of how credit is incremented
          %% simple_prefetch: credit is re-filled as deliveries are settled
          %% or returned.

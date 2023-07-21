@@ -142,7 +142,6 @@
          notify :: pid()
         }).
 
-
 %% -------------------------------------------------------------------
 %% Public API.
 %% -------------------------------------------------------------------
@@ -173,18 +172,17 @@ begin_sync(Connection, Timeout) ->
 
 -spec attach(pid(), attach_args()) -> {ok, link_ref()}.
 attach(Session, Args) ->
-    gen_statem:call(Session, {attach, Args}, {dirty_timeout, ?TIMEOUT}).
+    gen_statem:call(Session, {attach, Args}, ?TIMEOUT).
 
 -spec detach(pid(), link_handle()) -> ok | {error, link_not_found | half_attached}.
 detach(Session, Handle) ->
-    gen_statem:call(Session, {detach, Handle}, {dirty_timeout, ?TIMEOUT}).
+    gen_statem:call(Session, {detach, Handle}, ?TIMEOUT).
 
 -spec transfer(pid(), amqp10_msg:amqp10_msg(), timeout()) ->
     ok | {error, insufficient_credit | link_not_found | half_attached}.
 transfer(Session, Amqp10Msg, Timeout) ->
     [Transfer | Records] = amqp10_msg:to_amqp_records(Amqp10Msg),
-    gen_statem:call(Session, {transfer, Transfer, Records},
-                    {dirty_timeout, Timeout}).
+    gen_statem:call(Session, {transfer, Transfer, Records}, Timeout).
 
 flow(Session, Handle, Flow, RenewAfter) ->
     gen_statem:cast(Session, {flow, Handle, Flow, RenewAfter}).
@@ -193,7 +191,7 @@ flow(Session, Handle, Flow, RenewAfter) ->
                   amqp10_client_types:delivery_state()) -> ok.
 disposition(Session, Role, First, Last, Settled, DeliveryState) ->
     gen_statem:call(Session, {disposition, Role, First, Last, Settled,
-                              DeliveryState}, {dirty_timeout, ?TIMEOUT}).
+                              DeliveryState}, ?TIMEOUT).
 
 
 
@@ -265,10 +263,7 @@ mapped(cast, #'v1_0.end'{error = Err}, State) ->
     %% We receive the first end frame, reply and terminate.
     _ = send_end(State),
     % TODO: send notifications for links?
-    Reason = case Err of
-                 undefined -> normal;
-                 _ -> Err
-             end,
+    Reason = reason(Err),
     ok = notify_session_ended(State, Reason),
     {stop, normal, State};
 mapped(cast, #'v1_0.attach'{name = {utf8, Name},
@@ -296,10 +291,7 @@ mapped(cast, #'v1_0.detach'{handle = {uint, InHandle},
         #state{links = Links, link_handle_index = LHI} = State0) ->
     with_link(InHandle, State0,
               fun (#link{output_handle = OutHandle} = Link, State) ->
-                      Reason = case Err of
-                                   undefined -> normal;
-                                   Err -> Err
-                               end,
+                      Reason = reason(Err),
                       ok = notify_link_detached(Link, Reason),
                       {next_state, mapped,
                        State#state{links = maps:remove(OutHandle, Links),
@@ -501,7 +493,9 @@ mapped(_EvtType, Msg, _State) ->
                           [Msg, 10]),
     keep_state_and_data.
 
-end_sent(_EvtType, #'v1_0.end'{}, State) ->
+end_sent(_EvtType, #'v1_0.end'{error = Err}, State) ->
+    Reason = reason(Err),
+    ok = notify_session_ended(State, Reason),
     {stop, normal, State};
 end_sent(_EvtType, _Frame, State) ->
     % just drop frames here
@@ -1025,6 +1019,9 @@ utf8(V) -> amqp10_client_types:utf8(V).
 sym(B) when is_binary(B) -> {symbol, B};
 sym(B) when is_list(B) -> {symbol, list_to_binary(B)};
 sym(B) when is_atom(B) -> {symbol, atom_to_binary(B, utf8)}.
+
+reason(undefined) -> normal;
+reason(Other) -> Other.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

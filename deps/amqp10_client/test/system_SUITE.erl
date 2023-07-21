@@ -14,21 +14,10 @@
 
 -include("src/amqp10_client.hrl").
 
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
--define(UNAUTHORIZED_USER, <<"test_user_no_perm">>).
-
-%% The latch constant defines how many processes are spawned in order
-%% to run certain functionality in parallel. It follows the standard
-%% countdown latch pattern.
--define(LATCH, 100).
-
-%% The wait constant defines how long a consumer waits before it
-%% unsubscribes
--define(WAIT, 200).
-
-%% How to long wait for a process to die after an expected failure
--define(PROCESS_EXIT_TIMEOUT, 5000).
+suite() ->
+    [{timetrap, {seconds, 120}}].
 
 all() ->
     [
@@ -344,7 +333,7 @@ roundtrip(OpenConf, Body) ->
                                                         <<"test1">>,
                                                         settled,
                                                         unsettled_state),
-    {ok, OutMsg} = amqp10_client:get_msg(Receiver, 60000 * 5),
+    {ok, OutMsg} = amqp10_client:get_msg(Receiver, 60_000 * 4),
     ok = amqp10_client:end_session(Session),
     ok = amqp10_client:close_connection(Connection),
     % ct:pal(?LOW_IMPORTANCE, "roundtrip message Out: ~tp~nIn: ~tp~n", [OutMsg, Msg]),
@@ -379,7 +368,7 @@ filtered_roundtrip(OpenConf, Body) ->
                                                         settled,
                                                         unsettled_state),
     ok = amqp10_client:send_msg(Sender, Msg1),
-    {ok, OutMsg1} = amqp10_client:get_msg(DefaultReceiver, 60000 * 5),
+    {ok, OutMsg1} = amqp10_client:get_msg(DefaultReceiver, 60_000 * 4),
     ?assertEqual(<<"msg-1-tag">>, amqp10_msg:delivery_tag(OutMsg1)),
 
     timer:sleep(5 * 1000),
@@ -398,10 +387,10 @@ filtered_roundtrip(OpenConf, Body) ->
                                                         unsettled_state,
                                                         #{<<"apache.org:selector-filter:string">> => <<"amqp.annotation.x-opt-enqueuedtimeutc > ", Now2Binary/binary>>}),
 
-    {ok, OutMsg2} = amqp10_client:get_msg(DefaultReceiver, 60000 * 5),
+    {ok, OutMsg2} = amqp10_client:get_msg(DefaultReceiver, 60_000 * 4),
     ?assertEqual(<<"msg-2-tag">>, amqp10_msg:delivery_tag(OutMsg2)),
 
-    {ok, OutMsgFiltered} = amqp10_client:get_msg(FilteredReceiver, 60000 * 5),
+    {ok, OutMsgFiltered} = amqp10_client:get_msg(FilteredReceiver, 60_000 * 4),
     ?assertEqual(<<"msg-2-tag">>, amqp10_msg:delivery_tag(OutMsgFiltered)),
 
     ok = amqp10_client:end_session(Session),
@@ -676,11 +665,13 @@ incoming_heartbeat(Config) ->
               idle_time_out => 1000, notify => self()},
     {ok, Connection} = amqp10_client:open_connection(CConf),
     receive
-        {amqp10_event, {connection, Connection,
-         {closed, {resource_limit_exceeded, <<"remote idle-time-out">>}}}} ->
+        {amqp10_event,
+         {connection, Connection0,
+          {closed, {resource_limit_exceeded, <<"remote idle-time-out">>}}}}
+          when Connection0 =:= Connection ->
             ok
     after 5000 ->
-          exit(incoming_heartbeat_assert)
+              exit(incoming_heartbeat_assert)
     end,
     demonitor(MockRef).
 
@@ -704,7 +695,8 @@ publish_messages(Sender, Data, Num) ->
 
 receive_one(Receiver) ->
     receive
-        {amqp10_msg, Receiver, Msg} ->
+        {amqp10_msg, Receiver0, Msg}
+          when Receiver0 =:= Receiver ->
             amqp10_client:accept_msg(Receiver, Msg)
     after 2000 ->
           timeout
@@ -712,7 +704,8 @@ receive_one(Receiver) ->
 
 await_disposition(DeliveryTag) ->
     receive
-        {amqp10_disposition, {accepted, DeliveryTag}} -> ok
+        {amqp10_disposition, {accepted, DeliveryTag0}}
+          when DeliveryTag0 =:= DeliveryTag -> ok
     after 3000 ->
               flush(),
               exit(dispostion_timeout)
@@ -720,9 +713,12 @@ await_disposition(DeliveryTag) ->
 
 await_link(Who, What, Err) ->
     receive
-        {amqp10_event, {link, Who, What}} ->
+        {amqp10_event, {link, Who0, What0}}
+          when Who0 =:= Who andalso
+               What0 =:= What ->
             ok;
-        {amqp10_event, {link, Who, {detached, Why}}} ->
+        {amqp10_event, {link, Who0, {detached, Why}}}
+          when Who0 =:= Who ->
             exit(Why)
     after 5000 ->
               flush(),

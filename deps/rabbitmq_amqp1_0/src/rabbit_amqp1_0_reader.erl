@@ -9,7 +9,6 @@
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
--include_lib("kernel/include/inet.hrl").
 -include("rabbit_amqp1_0.hrl").
 
 -export([init/2, mainloop/2]).
@@ -29,13 +28,31 @@
 
 %%--------------------------------------------------------------------------
 
--record(v1, {parent, sock, connection, callback, recv_len, pending_recv,
-             connection_state, queue_collector, heartbeater, helper_sup,
-             channel_sup_sup_pid, buf, buf_len, throttle, proxy_socket,
-             tracked_channels}).
+-record(v1,
+        {
+         parent,
+         sock :: rabbit_net:socket(),
+         connection, callback, recv_len, pending_recv,
+         connection_state, heartbeater,
+         helper_sup :: pid(),
+         session_sup :: rabbit_types:option(pid()),
+         buf, buf_len, throttle, proxy_socket,
+         tracked_channels,
+         writer :: rabbit_types:option(pid())
+        }).
 
--record(v1_connection, {user, timeout_sec, frame_max, auth_mechanism, auth_state,
-                        hostname}).
+-record(v1_connection,
+        {name :: binary(),
+         host,
+         peer_host,
+         port,
+         peer_port,
+         connected_at,
+         user :: none | rabbit_types:user(),
+         timeout_sec, frame_max, auth_mechanism, auth_state,
+         hostname,
+         properties :: rabbit_types:option({map, list(tuple())})
+        }).
 
 -record(throttle, {alarmed_by, last_blocked_by, last_blocked_at}).
 
@@ -46,15 +63,15 @@
 
 %%--------------------------------------------------------------------------
 
-unpack_from_0_9_1({Parent, Sock,RecvLen, PendingRecv,
-                   HelperSupPid, Buf, BufLen, ProxySocket}) ->
+unpack_from_0_9_1(
+  {Parent, Sock,RecvLen, PendingRecv, HelperSupPid, Buf, BufLen, ProxySocket,
+   ConnectionName, Host, PeerHost, Port, PeerPort, ConnectedAt}) ->
     #v1{parent              = Parent,
         sock                = Sock,
         callback            = handshake,
         recv_len            = RecvLen,
         pending_recv        = PendingRecv,
         connection_state    = pre_init,
-        queue_collector     = undefined,
         heartbeater         = none,
         helper_sup          = HelperSupPid,
         buf                 = Buf,
@@ -62,7 +79,13 @@ unpack_from_0_9_1({Parent, Sock,RecvLen, PendingRecv,
         throttle = #throttle{alarmed_by      = [],
                              last_blocked_by = none,
                              last_blocked_at = never},
-        connection = #v1_connection{user           = none,
+        connection = #v1_connection{name = ConnectionName,
+                                    host = Host,
+                                    peer_host = PeerHost,
+                                    port = Port,
+                                    peer_port = PeerPort,
+                                    connected_at = ConnectedAt,
+                                    user = none,
                                     timeout_sec    = ?HANDSHAKE_TIMEOUT,
                                     frame_max      = ?FRAME_MIN_SIZE,
                                     auth_mechanism = none,
@@ -191,14 +214,15 @@ handle_other({bump_credit, Msg}, State) ->
     credit_flow:handle_bump_msg(Msg),
     control_throttle(State);
 handle_other(terminate_connection, State) ->
+    %%TODO terminate?
     State;
-handle_other({info, InfoItems, Pid}, State) ->
+handle_other({info, InfoItems, From}, State) ->
     Infos = lists:map(
               fun(InfoItem) ->
-                      {InfoItem, info_internal(InfoItem, State)}
+                      {InfoItem, i(InfoItem, State)}
               end,
               InfoItems),
-    Pid ! {info_reply, Infos},
+    From ! {info_reply, Infos},
     State;
 handle_other(Other, _State) ->
     %% internal error -> something worth dying for
@@ -236,14 +260,26 @@ update_last_blocked_by(Throttle) ->
 %%--------------------------------------------------------------------------
 %% error handling / termination
 
-close_connection(State = #v1{connection = #v1_connection{
-                                             timeout_sec = TimeoutSec}}) ->
-    Pid = self(),
-    erlang:send_after((if TimeoutSec > 0 andalso
-                          TimeoutSec < ?CLOSING_TIMEOUT -> TimeoutSec;
-                          true                          -> ?CLOSING_TIMEOUT
-                       end) * 1000, Pid, terminate_connection),
-    rabbit_amqp1_0:unregister_connection(Pid),
+close(Error, State = #v1{sock = Sock,
+                         connection = #v1_connection{
+                                         name = Name,
+                                         timeout_sec = TimeoutSec}}) ->
+    Self = self(),
+    Seconds = if TimeoutSec > 0 andalso
+                 TimeoutSec < ?CLOSING_TIMEOUT ->
+                     TimeoutSec;
+                 true ->
+                     ?CLOSING_TIMEOUT
+              end,
+    Millis = Seconds * 1000,
+    _TRef = erlang:send_after(Millis, Self, terminate_connection),
+    ok = rabbit_core_metrics:connection_closed(Self),
+    ok = rabbit_event:notify(connection_closed,
+                             [{name, Name},
+                              {pid, Self},
+                              {node, node()}]),
+    ok = rabbit_amqp1_0:unregister_connection(Self),
+    ok = send_on_channel0(Sock, #'v1_0.close'{error = Error}),
     State#v1{connection_state = closed}.
 
 handle_dependent_exit(ChPid, Reason, State) ->
@@ -261,17 +297,8 @@ handle_dependent_exit(ChPid, Reason, State) ->
 termination_kind(normal) -> controlled;
 termination_kind(_)      -> uncontrolled.
 
-maybe_close(State = #v1{connection_state = closing,
-                        sock = Sock}) ->
-    NewState = close_connection(State),
-    ok = send_on_channel0(Sock, #'v1_0.close'{}),
-    % Perform an rpc call to each session process to allow it time to
-    % process it's internal message buffer before the supervision tree
-    % shuts everything down and in flight messages such as dispositions
-    % could be lost
-    _ = [ _ = rabbit_amqp1_0_session:get_info(SessionPid)
-          || {{channel, _}, {ch_fr_pid, SessionPid}} <- get()],
-    NewState;
+maybe_close(State = #v1{connection_state = closing}) ->
+    close(undefined, State);
 maybe_close(State) ->
     State.
 
@@ -282,18 +309,18 @@ error_frame(Condition, Fmt, Args) ->
 
 handle_exception(State = #v1{connection_state = closed}, Channel,
                  #'v1_0.error'{description = {utf8, Desc}}) ->
-    rabbit_log_connection:error("Error on AMQP 1.0 connection ~tp (~tp), channel ~tp:~n~tp",
-        [self(), closed, Channel, Desc]),
+    rabbit_log_connection:error(
+      "Error on AMQP 1.0 connection ~tp (~tp), channel ~tp:~n~tp",
+      [self(), closed, Channel, Desc]),
     State;
 handle_exception(State = #v1{connection_state = CS}, Channel,
-                 ErrorFrame = #'v1_0.error'{description = {utf8, Desc}})
+                 Error = #'v1_0.error'{description = {utf8, Desc}})
   when ?IS_RUNNING(State) orelse CS =:= closing ->
-    rabbit_log_connection:error("Error on AMQP 1.0 connection ~tp (~tp), channel ~tp:~n~tp",
-        [self(), CS, Channel, Desc]),
+    rabbit_log_connection:error(
+      "Error on AMQP 1.0 connection ~tp (~tp), channel ~tp:~n~tp",
+      [self(), CS, Channel, Desc]),
     %% TODO: session errors shouldn't force the connection to close
-    State1 = close_connection(State),
-    ok = send_on_channel0(State#v1.sock, #'v1_0.close'{error = ErrorFrame}),
-    State1;
+    close(Error, State);
 handle_exception(State, Channel, Error) ->
     %% We don't trust the client at this point - force them to wait
     %% for a bit so they can't DOS us with repeated failed logins etc.
@@ -365,68 +392,66 @@ parse_1_0_frame(Payload, _Channel) ->
         _    -> {Perf, Rest}
     end.
 
-handle_1_0_connection_frame(#'v1_0.open'{ max_frame_size = ClientFrameMax,
-                                          channel_max = ClientChannelMax,
-                                          idle_time_out = IdleTimeout,
-                                          hostname = Hostname },
-                            State = #v1{
-                              connection_state = starting,
-                              connection = Connection,
-                              throttle   = Throttle,
-                              helper_sup = HelperSupPid,
-                              sock = Sock}) ->
+handle_1_0_connection_frame(
+  #'v1_0.open'{max_frame_size = ClientFrameMax,
+               channel_max = ClientChannelMax,
+               idle_time_out = IdleTimeout,
+               hostname = Hostname,
+               properties = Properties},
+  #v1{connection_state = starting,
+      connection = Connection,
+      throttle   = Throttle,
+      helper_sup = HelperSupPid,
+      sock = Sock} = State0) ->
     ClientHeartbeatSec = case IdleTimeout of
-                             undefined        -> 0;
+                             undefined -> 0;
                              {uint, Interval} -> Interval div 1000
                          end,
-    FrameMax           = case ClientFrameMax of
-                             undefined -> unlimited;
-                             {_, FM}   -> FM
-                         end,
+    FrameMax = case ClientFrameMax of
+                   undefined -> unlimited;
+                   {_, FM}   -> FM
+               end,
     {ok, HeartbeatSec} = application:get_env(rabbit, heartbeat),
-    State1 =
-        if (FrameMax =/= unlimited) and (FrameMax < ?FRAME_1_0_MIN_SIZE) ->
-                protocol_error(?V_1_0_AMQP_ERROR_FRAME_SIZE_TOO_SMALL,
-                               "frame_max=~w < ~w min size",
-                               [FrameMax, ?FRAME_1_0_MIN_SIZE]);
-           true ->
-                {ok, Collector} =
-                    rabbit_connection_helper_sup:start_queue_collector(
-                      HelperSupPid, <<"AMQP 1.0">>), %% TODO describe the connection
-                SendFun =
-                    fun() ->
-                            Frame =
-                                amqp10_binary_generator:build_heartbeat_frame(),
-                            catch rabbit_net:send(Sock, Frame)
-                    end,
+    if (FrameMax =/= unlimited) and (FrameMax < ?FRAME_1_0_MIN_SIZE) ->
+           protocol_error(?V_1_0_AMQP_ERROR_FRAME_SIZE_TOO_SMALL,
+                          "frame_max=~w < ~w min size",
+                          [FrameMax, ?FRAME_1_0_MIN_SIZE]);
+       true ->
+           ok
+    end,
 
-                Parent = self(),
-                ReceiveFun =
-                    fun() ->
-                            Parent ! heartbeat_timeout
-                    end,
-                %% [2.4.5] the value in idle-time-out SHOULD be half the peer's
-                %%         actual timeout threshold
-                ReceiverHeartbeatSec = lists:min([HeartbeatSec * 2, 4294967]),
-                %% TODO: only start heartbeat receive timer at next next frame
-                Heartbeater =
-                    rabbit_heartbeat:start(HelperSupPid, Sock,
-                                           ClientHeartbeatSec, SendFun,
-                                           ReceiverHeartbeatSec, ReceiveFun),
-                State#v1{connection_state = running,
-                         connection = Connection#v1_connection{
-                                                   frame_max = FrameMax,
-                                                   hostname  = Hostname},
-                         heartbeater = Heartbeater,
-                         queue_collector = Collector}
-        end,
+    SendFun = fun() ->
+                      Frame = amqp10_binary_generator:build_heartbeat_frame(),
+                      catch rabbit_net:send(Sock, Frame)
+              end,
+    Self = self(),
+    Parent = Self,
+    ReceiveFun = fun() ->
+                         Parent ! heartbeat_timeout
+                 end,
+    %% [2.4.5] the value in idle-time-out SHOULD be half the peer's
+    %%         actual timeout threshold
+    ReceiverHeartbeatSec = lists:min([HeartbeatSec * 2, 4294967]),
+    %% TODO: only start heartbeat receive timer at next next frame
+    Heartbeater = rabbit_heartbeat:start(
+                    HelperSupPid, Sock,
+                    ClientHeartbeatSec, SendFun,
+                    ReceiverHeartbeatSec, ReceiveFun),
+    State1 = State0#v1{connection_state = running,
+                       connection = Connection#v1_connection{
+                                      frame_max = FrameMax,
+                                      hostname  = Hostname,
+                                      properties = Properties},
+                       heartbeater = Heartbeater},
+    State2 = start_writer(State1),
     HostnameVal = case Hostname of
-                    undefined -> undefined;
-                    null -> undefined;
-                    {utf8, Val} -> Val
+                      undefined -> undefined;
+                      null -> undefined;
+                      {utf8, Val} -> Val
                   end,
-    rabbit_log:debug("AMQP 1.0 connection.open frame: hostname = ~ts, extracted vhost = ~ts, idle_timeout = ~tp" ,
-                    [HostnameVal, vhost(Hostname), HeartbeatSec * 1000]),
+    rabbit_log:debug("AMQP 1.0 connection.open frame: hostname = ~ts, "
+                     "extracted vhost = ~ts, idle_timeout = ~tp" ,
+                     [HostnameVal, vhost(Hostname), HeartbeatSec * 1000]),
     %% TODO enforce channel_max
     ok = send_on_channel0(
            Sock,
@@ -435,13 +460,36 @@ handle_1_0_connection_frame(#'v1_0.open'{ max_frame_size = ClientFrameMax,
                         idle_time_out  = {uint, HeartbeatSec * 1000},
                         container_id   = {utf8, rabbit_nodes:cluster_name()},
                         properties     = server_properties()}),
-    Conserve = rabbit_alarm:register(self(), {?MODULE, conserve_resources, []}),
-    rabbit_amqp1_0:register_connection(self()),
-    control_throttle(
-      State1#v1{throttle = Throttle#throttle{alarmed_by = Conserve}});
+    Conserve = rabbit_alarm:register(Self, {?MODULE, conserve_resources, []}),
+    State = State2#v1{throttle = Throttle#throttle{alarmed_by = Conserve}},
 
-handle_1_0_connection_frame(_Frame, State) ->
-    maybe_close(State#v1{connection_state = closing}).
+    Infos = infos(?EVENT_KEYS, State),
+    ok = rabbit_core_metrics:connection_created(
+           proplists:get_value(pid, Infos),
+           Infos),
+    ok = rabbit_event:notify(connection_created, Infos),
+    ok = rabbit_amqp1_0:register_connection(Self),
+
+    control_throttle(State);
+
+handle_1_0_connection_frame(#'v1_0.close'{}, State0) ->
+    State = State0#v1{connection_state = closing},
+    close(undefined, State).
+
+start_writer(#v1{helper_sup = SupPid,
+                 sock = Sock,
+                 connection = #v1_connection{frame_max = FrameMax}} = State) ->
+    ChildSpec = #{id => writer,
+                  start => {rabbit_amqp1_0_writer, start_link,
+                            [Sock, FrameMax, self()]},
+                  restart => transient,
+                  significant => true,
+                  shutdown => ?WORKER_WAIT,
+                  type => worker,
+                  modules => [rabbit_amqp1_0_writer]
+                 },
+    {ok, Pid} = supervisor:start_child(SupPid, ChildSpec),
+    State#v1{writer = Pid}.
 
 handle_1_0_session_frame(Channel, Frame, State) ->
     case maps:get(Channel, State#v1.tracked_channels, undefined) of
@@ -588,25 +636,23 @@ start_1_0_connection(amqp,
 
 start_1_0_connection0(Mode, State = #v1{connection = Connection,
                                         helper_sup = HelperSup}) ->
-    ChannelSupSupPid =
-        case Mode of
-            sasl ->
-                undefined;
-            amqp ->
-                StartMFA = {rabbit_amqp1_0_session_sup_sup, start_link, []},
-                ChildSpec = #{id => channel_sup_sup,
-                              start => StartMFA,
-                              restart => transient,
-                              significant => true,
-                              shutdown => infinity,
-                              type => supervisor,
-                              modules => [rabbit_amqp1_0_session_sup_sup]},
-                {ok, Pid} = supervisor:start_child(HelperSup, ChildSpec),
-                Pid
-        end,
+    SessionSup = case Mode of
+                     sasl ->
+                         undefined;
+                     amqp ->
+                         ChildSpec = #{id => session_sup,
+                                       start => {rabbit_amqp1_0_session_sup, start_link, [self()]},
+                                       restart => transient,
+                                       significant => true,
+                                       shutdown => infinity,
+                                       type => supervisor,
+                                       modules => [rabbit_amqp1_0_session_sup]},
+                         {ok, Pid} = supervisor:start_child(HelperSup, ChildSpec),
+                         Pid
+                 end,
     switch_callback(State#v1{connection = Connection#v1_connection{
                                             timeout_sec = ?NORMAL_TIMEOUT},
-                             channel_sup_sup_pid = ChannelSupSupPid,
+                             session_sup = SessionSup,
                              connection_state = starting},
                     {frame_header_1_0, Mode}, 8).
 
@@ -617,8 +663,7 @@ send_on_channel0(Sock, Method) ->
     send_on_channel0(Sock, Method, amqp10_framing).
 
 send_on_channel0(Sock, Method, Framing) ->
-    ok = rabbit_amqp1_0_writer:internal_send_command(
-           Sock, 0, Method, Framing).
+    ok = rabbit_amqp1_0_writer:internal_send_command(Sock, Method, Framing).
 
 %% End 1-0
 
@@ -693,9 +738,10 @@ auth_phase_1_0(Response,
               handshake, 8)
     end.
 
-track_channel(Channel, ChFrPid, State) ->
-    rabbit_log:debug("AMQP 1.0 opened channel = ~tp " , [{Channel, ChFrPid}]),
-    State#v1{tracked_channels = maps:put(Channel, ChFrPid, State#v1.tracked_channels)}.
+track_channel(ChannelNum, SessionPid, State) ->
+    rabbit_log:debug("AMQP 1.0 created session process ~p for channel number ~b",
+                     [SessionPid, ChannelNum]),
+    State#v1{tracked_channels = maps:put(ChannelNum, SessionPid, State#v1.tracked_channels)}.
 
 untrack_channel(Channel, State) ->
     case maps:take(Channel, State#v1.tracked_channels) of
@@ -705,31 +751,32 @@ untrack_channel(Channel, State) ->
         error -> State
     end.
 
-send_to_new_1_0_session(Channel, Frame, State) ->
-    #v1{sock = Sock, queue_collector = Collector,
-        channel_sup_sup_pid = ChanSupSup,
-        connection = #v1_connection{frame_max = FrameMax,
-                                    hostname  = Hostname,
-                                    user      = User},
-        proxy_socket = ProxySocket} = State,
-    %% Note: the equivalent, start_channel is in channel_sup_sup
-
-    case rabbit_amqp1_0_session_sup_sup:start_session(
-           %% NB subtract fixed frame header size
-           ChanSupSup, {amqp10_framing, Sock, Channel,
-                        case FrameMax of
-                            unlimited -> unlimited;
-                            _         -> FrameMax - 8
-                        end,
-                        self(), User, vhost(Hostname), Collector, ProxySocket}) of
-        {ok, _ChSupPid, ChFrPid} ->
-            erlang:monitor(process, ChFrPid),
-            ModifiedState = track_channel(Channel, ChFrPid, State),
+send_to_new_1_0_session(
+  ChannelNum, Frame,
+  #v1{session_sup = SessionSup,
+      connection = #v1_connection{frame_max = FrameMax0,
+                                  hostname = Hostname,
+                                  user = User},
+      writer = WriterPid} = State) ->
+    %% Subtract fixed frame header size.
+    FrameMax = case FrameMax0 of
+                   unlimited -> unlimited;
+                   _ -> FrameMax0 - 8
+               end,
+    ChildArgs = [WriterPid,
+                 ChannelNum,
+                 FrameMax,
+                 User,
+                 vhost(Hostname)],
+    case rabbit_amqp1_0_session_sup:start_session(SessionSup, ChildArgs) of
+        {ok, SessionPid} ->
+            erlang:monitor(process, SessionPid),
+            ModifiedState = track_channel(ChannelNum, SessionPid, State),
             rabbit_log_connection:info(
                         "AMQP 1.0 connection ~tp: "
                         "user '~ts' authenticated and granted access to vhost '~ts'",
                         [self(), User#user.username, vhost(Hostname)]),
-            ok = rabbit_amqp1_0_session:process_frame(ChFrPid, Frame),
+            ok = rabbit_amqp1_0_session:process_frame(SessionPid, Frame),
             ModifiedState;
         {error, {not_allowed, _}} ->
             rabbit_log:error("AMQP 1.0: user '~ts' is not allowed to access virtual host '~ts'",
@@ -763,49 +810,80 @@ info(Pid, InfoItems) ->
         UnknownItems -> throw({bad_argument, UnknownItems})
     end.
 
-info_internal(pid, #v1{}) -> self();
-info_internal(connection, #v1{connection = Val}) ->
+infos(Items, State) ->
+    [{Item, i(Item, State)} || Item <- Items].
+
+i(pid, #v1{}) ->
+    self();
+i(type, #v1{}) ->
+    network;
+i(protocol, #v1{}) ->
+    {'AMQP', "1.0"};
+i(connection, #v1{connection = Val}) ->
     Val;
-info_internal(node, #v1{}) -> node();
-info_internal(auth_mechanism, #v1{connection = #v1_connection{auth_mechanism = none}}) ->
+i(node, #v1{}) ->
+    node();
+i(auth_mechanism, #v1{connection = #v1_connection{auth_mechanism = none}}) ->
     none;
-info_internal(auth_mechanism, #v1{connection = #v1_connection{auth_mechanism = {Name, _Mod}}}) ->
+i(auth_mechanism, #v1{connection = #v1_connection{auth_mechanism = {Name, _Mod}}}) ->
     Name;
-info_internal(host, #v1{connection = #v1_connection{hostname = {utf8, Val}}}) ->
+i(frame_max, #v1{connection = #v1_connection{frame_max = Val}}) ->
     Val;
-info_internal(host, #v1{connection = #v1_connection{hostname = Val}}) ->
+i(timeout, #v1{connection = #v1_connection{timeout_sec = Val}}) ->
     Val;
-info_internal(frame_max, #v1{connection = #v1_connection{frame_max = Val}}) ->
+i(user,
+  #v1{connection = #v1_connection{user = #user{username = Val}}}) ->
     Val;
-info_internal(timeout, #v1{connection = #v1_connection{timeout_sec = Val}}) ->
-    Val;
-info_internal(user,
-              #v1{connection = #v1_connection{user = #user{username = Val}}}) ->
-    Val;
-info_internal(user,
-              #v1{connection = #v1_connection{user = none}}) ->
+i(user,
+  #v1{connection = #v1_connection{user = none}}) ->
     '';
-info_internal(state, #v1{connection_state = Val}) ->
+i(connection_state, #v1{connection_state = Val}) ->
     Val;
-info_internal(SockStat, S) when SockStat =:= recv_oct;
-                                SockStat =:= recv_cnt;
-                                SockStat =:= send_oct;
-                                SockStat =:= send_cnt;
-                                SockStat =:= send_pend ->
+i(connected_at, #v1{connection = #v1_connection{connected_at = Val}}) ->
+    Val;
+i(name, #v1{connection = #v1_connection{name = Val}}) ->
+    Val;
+% i(host, #v1{connection = #v1_connection{hostname = {utf8, Val}}}) ->
+%     Val;
+% i(host, #v1{connection = #v1_connection{hostname = Val}}) ->
+%     Val;
+i(host, #v1{connection = #v1_connection{host = Val}}) ->
+    Val;
+i(port, #v1{connection = #v1_connection{port = Val}}) ->
+    Val;
+i(peer_host, #v1{connection = #v1_connection{peer_host = Val}}) ->
+    Val;
+i(peer_port, #v1{connection = #v1_connection{peer_port = Val}}) ->
+    Val;
+i(SockStat, S) when SockStat =:= recv_oct;
+                    SockStat =:= recv_cnt;
+                    SockStat =:= send_oct;
+                    SockStat =:= send_cnt;
+                    SockStat =:= send_pend ->
     socket_info(fun (Sock) -> rabbit_net:getstat(Sock, [SockStat]) end,
                 fun ([{_, I}]) -> I end, S);
-info_internal(ssl, #v1{sock = Sock}) -> rabbit_net:is_ssl(Sock);
-info_internal(SSL, #v1{sock = Sock, proxy_socket = ProxySock})
+i(ssl, #v1{sock = Sock}) -> rabbit_net:is_ssl(Sock);
+i(SSL, #v1{sock = Sock, proxy_socket = ProxySock})
   when SSL =:= ssl_protocol;
        SSL =:= ssl_key_exchange;
        SSL =:= ssl_cipher;
        SSL =:= ssl_hash ->
     rabbit_ssl:info(SSL, {Sock, ProxySock});
-info_internal(Cert, #v1{sock = Sock})
+i(Cert, #v1{sock = Sock})
   when Cert =:= peer_cert_issuer;
        Cert =:= peer_cert_subject;
        Cert =:= peer_cert_validity ->
-    rabbit_ssl:cert_info(Cert, Sock).
+    rabbit_ssl:cert_info(Cert, Sock);
+i(client_properties, #v1{connection = #v1_connection{properties = Props}}) ->
+    %% Connection properties sent by the client.
+    %% Displayed in rabbitmq_management/priv/www/js/tmpl/connection.ejs
+    case Props of
+        undefined ->
+            [];
+        {map, Fields} ->
+            [mc_amqpl:to_091(Key, TypeVal) ||
+             {{symbol, Key}, TypeVal} <- Fields]
+    end.
 
 %% From rabbit_reader
 socket_info(Get, Select, #v1{sock = Sock}) ->

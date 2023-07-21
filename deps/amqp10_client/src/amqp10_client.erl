@@ -340,8 +340,6 @@ echo(#link_ref{role = receiver, session = Session,
 %%% messages
 
 %% @doc Send a message on a the link referred to be the 'LinkRef'.
-%% Returns ok for "async" transfers when messages are sent with settled=true
-%% else it returns the delivery state from the disposition
 -spec send_msg(link_ref(), amqp10_msg:amqp10_msg()) ->
     ok | {error, insufficient_credit | link_not_found | half_attached}.
 send_msg(#link_ref{role = sender, session = Session,

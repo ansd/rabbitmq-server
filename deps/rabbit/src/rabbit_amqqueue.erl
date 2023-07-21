@@ -91,7 +91,7 @@
 -define(IS_QUORUM(QPid), is_tuple(QPid)).
 %%----------------------------------------------------------------------------
 
--export_type([name/0, qmsg/0, absent_reason/0]).
+-export_type([name/0, qmsg/0, msg_id/0, absent_reason/0]).
 
 -type name() :: rabbit_types:r('queue').
 
@@ -100,7 +100,7 @@
 -type qfun(A) :: fun ((amqqueue:amqqueue()) -> A | no_return()).
 -type qmsg() :: {name(), pid() | {atom(), pid()}, msg_id(),
                  boolean(), mc:state()}.
--type msg_id() :: non_neg_integer().
+-type msg_id() :: rabbit_types:option(non_neg_integer()).
 -type ok_or_errors() ::
         'ok' | {'error', [{'error' | 'exit' | 'throw', any()}]}.
 -type absent_reason() :: 'nodedown' | 'crashed' | stopped | timeout.

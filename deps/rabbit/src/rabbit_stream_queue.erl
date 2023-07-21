@@ -448,6 +448,12 @@ credit(QName, CTag, Credit, Drain, #stream_client{readers = Readers0,
                                                   local_pid = LocalPid} = State) ->
     {Readers1, Msgs} = case Readers0 of
                           #{CTag := #stream{credit = Credit0} = Str0} ->
+                               %%TODO why
+                               %% credit = Credit0 + Credit
+                               %% instead of
+                               %% credit = Credit
+                               %% ?
+                               %% AMQP 1.0 calculates the current link credit.
                               Str1 = Str0#stream{credit = Credit0 + Credit},
                               {Str, Msgs0} = stream_entries(QName, Name, LocalPid, Str1),
                               {Readers0#{CTag => Str}, Msgs0};
@@ -468,7 +474,7 @@ credit(QName, CTag, Credit, Drain, #stream_client{readers = Readers0,
                 {Readers1, []}
         end,
     {State#stream_client{readers = Readers},
-     [{send_credit_reply, length(Msgs)},
+     [{send_credit_reply, CTag, Credit, length(Msgs)},
       {deliver, CTag, true, Msgs}] ++ Actions}.
 
 deliver(QSs, Msg, Options) ->
@@ -529,24 +535,29 @@ dequeue(_, _, _, _, #stream_client{name = Name}) ->
      [rabbit_misc:rs(Name)]}.
 
 handle_event(_QName, {osiris_written, From, _WriterId, Corrs},
-             State = #stream_client{correlation = Correlation0,
-                                    soft_limit = SftLmt,
-                                    slow = Slow0,
-                                    name = Name}) ->
+             State0 = #stream_client{correlation = Correlation0,
+                                     soft_limit = SftLmt,
+                                     slow = Slow0,
+                                     name = Name}) ->
     MsgIds = lists:sort(maps:fold(
                           fun (_Seq, {I, _M}, Acc) ->
                                   [I | Acc]
                           end, [], maps:with(Corrs, Correlation0))),
 
     Correlation = maps:without(Corrs, Correlation0),
-    {Slow, Actions} = case maps:size(Correlation) < SftLmt of
-                          true when Slow0 ->
-                              {false, [{unblock, Name}]};
-                          _ ->
-                              {Slow0, []}
-                      end,
-    {ok, State#stream_client{correlation = Correlation,
-                             slow = Slow}, [{settled, From, MsgIds} | Actions]};
+    {Slow, Actions0} = case maps:size(Correlation) < SftLmt of
+                           true when Slow0 ->
+                               {false, [{unblock, Name}]};
+                           _ ->
+                               {Slow0, []}
+                       end,
+    Actions = case MsgIds of
+                  [] -> Actions0;
+                  [_|_] -> [{settled, From, MsgIds} | Actions0]
+              end,
+    State = State0#stream_client{correlation = Correlation,
+                                 slow = Slow},
+    {ok, State, Actions};
 handle_event(QName, {osiris_offset, _From, _Offs},
              State = #stream_client{local_pid = LocalPid,
                                     readers = Readers0,
