@@ -109,7 +109,7 @@ def test_suite_beam_files(name = "test_suite_beam_files"):
         outs = ["test/amqp10_client_SUITE.beam"],
         app_name = "rabbitmq_amqp1_0",
         erlc_opts = "//:test_erlc_opts",
-        deps = ["//deps/amqp_client:erlang_app"],
+        deps = ["//deps/amqp10_common:erlang_app", "//deps/amqp_client:erlang_app"],
     )
     erlang_bytecode(
         name = "command_SUITE_beam_files",

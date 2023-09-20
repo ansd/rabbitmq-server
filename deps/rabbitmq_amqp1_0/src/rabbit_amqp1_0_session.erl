@@ -51,20 +51,25 @@
          compare/2]).
 
 -record(incoming_link, {
-          name,
           exchange :: rabbit_exchange:name(),
           routing_key :: undefined | rabbit_types:routing_key(),
+          %% Queue is only set if the link target address refers to a queue.
+          queue :: undefined | rabbit_misc:resource_name(),
           delivery_id :: undefined | delivery_number(),
           delivery_count = 0 :: sequence_no(),
           send_settle_mode = undefined,
           recv_settle_mode = undefined,
           credit_used = ?INCOMING_CREDIT div 2,
-          msg_acc = []}).
+          msg_acc = []
+         }).
 
 -record(outgoing_link, {
-          queue :: undefined | rabbit_misc:resource_name(),
+          %% Although the source address of a link might be an exchange name and binding key
+          %% or a topic filter, an outgoing link will always consume from a queue.
+          queue :: rabbit_misc:resource_name(),
           delivery_count = 0 :: sequence_no(),
-          send_settled :: boolean()}).
+          send_settled :: boolean()
+         }).
 
 -record(outgoing_unsettled, {
           %% The queue sent us this consumer scoped sequence number.
@@ -112,13 +117,16 @@
           %% We send messages to clients on outgoing links.
           outgoing_links = #{} :: #{link_handle() => #outgoing_link{}},
           %% TRANSFER delivery IDs published to queues but not yet confirmed by queues
-          incoming_unsettled_map = #{} :: #{delivery_number() => #{rabbit_amqqueue:name() := ok}},
+          incoming_unsettled_map = #{} :: #{delivery_number() =>
+                                            {#{rabbit_amqqueue:name() := ok},
+                                             AtLeastOneQueueConfirmed :: boolean()}},
           %% TRANSFER delivery IDs published to consuming clients but not yet acknowledged by clients.
           outgoing_unsettled_map = #{} :: #{delivery_number() => #outgoing_unsettled{}},
-          %% Stashed queue actions that we will process later such that we can confirm and
-          %% reject delivery IDs in ranges to reduce the number of DISPOSITION frames.
-          rejected_queue_actions = [] :: [{rejected, rabbit_amqqueue:name(), [delivery_number(),...]}],
-          settled_queue_actions = [] :: [{settled, rabbit_amqqueue:name(), [delivery_number(),...]}],
+          %% Queue actions that we will process later such that we can confirm and reject
+          %% delivery IDs in ranges to reduce the number of DISPOSITION frames sent to the client.
+          stashed_rejected = [] :: [{rejected, rabbit_amqqueue:name(), [delivery_number(),...]}],
+          stashed_settled = [] :: [{settled, rabbit_amqqueue:name(), [delivery_number(),...]}],
+          stashed_eol = [] :: [rabbit_amqqueue:name()],
           queue_states = rabbit_queue_type:init() :: rabbit_queue_type:state()
          }).
 
@@ -143,8 +151,16 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost}) ->
                 vhost = Vhost,
                 channel_num = ChannelNum}}.
 
-terminate(_Reason, _State) ->
-    ok.
+terminate(_Reason, #state{queue_states = QStates,
+                          incoming_unsettled_map = IncomingUnsettledMap}) ->
+    ok = rabbit_queue_type:close(QStates),
+    case maps:size(IncomingUnsettledMap) of
+        0 ->
+            ok;
+        NumUnsettled ->
+            rabbit_log:info("Session is terminating with ~b pending publisher confirms",
+                            [NumUnsettled])
+    end.
 
 handle_call(Msg, _From, State) ->
     Reply = {error, {not_understood, Msg}},
@@ -155,6 +171,21 @@ handle_info(timeout, State) ->
 handle_info({bump_credit, Msg}, State) ->
     credit_flow:handle_bump_msg(Msg),
     noreply(State);
+handle_info({{'DOWN', QName}, _MRef, process, QPid, Reason},
+            #state{queue_states = QStates0,
+                   stashed_eol = Eol} = State0) ->
+    credit_flow:peer_down(QPid),
+    case rabbit_queue_type:handle_down(QPid, QName, Reason, QStates0) of
+        {ok, QStates, Actions} ->
+            State1 = State0#state{queue_states = QStates},
+            {Reply, State} = handle_queue_actions(Actions, State1),
+            reply0(Reply, State);
+        {eol, QStates, QRef} ->
+            State = State0#state{queue_states = QStates,
+                                 stashed_eol = [QRef | Eol]},
+            %%TODO see rabbit_channel:handle_eol()
+            noreply(State)
+    end;
 handle_info({'EXIT', WriterPid, Reason = {writer, send_failed, _Error}},
             State = #state{writer_pid = WriterPid,
                            reader_pid = ReaderPid,
@@ -204,8 +235,9 @@ handle_cast({queue_event, _, _} = QEvent,
     noreply_coalesce(State).
 
 %% Batch confirms / rejects to publishers.
-noreply_coalesce(#state{rejected_queue_actions = [],
-                        settled_queue_actions = []} = State) ->
+noreply_coalesce(#state{stashed_rejected = [],
+                        stashed_settled = [],
+                        stashed_eol = []} = State) ->
     {noreply, State};
 noreply_coalesce(State) ->
     Timeout = 0,
@@ -220,78 +252,169 @@ reply(Reply, State0) ->
     {reply, Reply, State}.
 
 %% Send confirms / rejects to publishers.
-send_delivery_state_changes(#state{rejected_queue_actions = [],
-                                   settled_queue_actions = []} = State) ->
+send_delivery_state_changes(#state{stashed_rejected = [],
+                                   stashed_settled = [],
+                                   stashed_eol = []} = State) ->
     State;
 send_delivery_state_changes(#state{writer_pid = Writer,
                                    channel_num = ChannelNum} = State0) ->
     case rabbit_node_monitor:pause_partition_guard() of
         ok ->
-            {RejectedDeliveryIds, State1} = handle_rejected_queue_actions(State0),
-            send_dispositions(RejectedDeliveryIds, #'v1_0.rejected'{}, Writer, ChannelNum),
-
-            {AcceptedDeliveryIds, State} = handle_settled_queue_actions(State1),
-            if AcceptedDeliveryIds =/= [] andalso
+            %% 1. Process queue rejections.
+            {RejectedDelIds, State1} = handle_stashed_rejected(State0),
+            send_dispositions(RejectedDelIds, #'v1_0.rejected'{}, Writer, ChannelNum),
+            %% 2. Process queue confirmations.
+            {AcceptedDelIds0, State2} = handle_stashed_settled(State1),
+            %% 3. Process queue deletions.
+            {ReleasedDelIds, AcceptedDelIds1, DetachFrames, State} = handle_stashed_eol(State2),
+            send_dispositions(ReleasedDelIds, #'v1_0.released'{}, Writer, ChannelNum),
+            AcceptedDelIds2 = AcceptedDelIds1 ++ AcceptedDelIds0,
+            if AcceptedDelIds2 =/= [] andalso
                map_size(State#state.incoming_unsettled_map) =:= 0 ->
+                   AcceptedDelIds = serial_number:usort(AcceptedDelIds2),
                    %% Optimisation: Send single disposition.
                    Disposition = disposition(#'v1_0.accepted'{},
-                                             hd(AcceptedDeliveryIds),
-                                             lists:last(AcceptedDeliveryIds)),
+                                             hd(AcceptedDelIds),
+                                             lists:last(AcceptedDelIds)),
                    rabbit_amqp1_0_writer:send_command(Writer, ChannelNum, Disposition);
                true ->
-                   send_dispositions(AcceptedDeliveryIds, #'v1_0.accepted'{}, Writer, ChannelNum)
+                   send_dispositions(AcceptedDelIds2, #'v1_0.accepted'{}, Writer, ChannelNum)
             end,
+            %% Send DETACH frames after DISPOSITION frames such that
+            %% clients can handle DISPOSITIONs before closing their links.
+            lists:foreach(fun(Frame) ->
+                                  rabbit_amqp1_0_writer:send_command(Writer, ChannelNum, Frame)
+                          end, DetachFrames),
             State;
         pausing ->
             State0
     end.
 
-handle_rejected_queue_actions(#state{rejected_queue_actions = []} = State) ->
+handle_stashed_rejected(#state{stashed_rejected = []} = State) ->
     {[], State};
-handle_rejected_queue_actions(#state{rejected_queue_actions = Actions,
-                                     incoming_unsettled_map = M0} = State0) ->
-    {Ids0, M} = lists:foldl(
-                  fun({rejected, _QName, DeliveryIds}, Accum) ->
-                          lists:foldl(
-                            fun(DeliveryId, {L, U0} = Acc) ->
-                                    case maps:take(DeliveryId, U0) of
-                                        {_, U} ->
-                                            {[DeliveryId | L], U};
-                                        error ->
-                                            Acc
-                                    end
-                            end, Accum, DeliveryIds)
-                  end, {[], M0}, Actions),
-    Ids = serial_number:usort(Ids0),
-    State = State0#state{rejected_queue_actions = [],
+handle_stashed_rejected(#state{stashed_rejected = Actions,
+                               incoming_unsettled_map = M0} = State0) ->
+    {Ids, M} = lists:foldl(
+                 fun({rejected, _QName, DeliveryIds}, Accum) ->
+                         lists:foldl(
+                           fun(DeliveryId, {L, U0} = Acc) ->
+                                   case maps:take(DeliveryId, U0) of
+                                       {_, U} ->
+                                           {[DeliveryId | L], U};
+                                       error ->
+                                           Acc
+                                   end
+                           end, Accum, DeliveryIds)
+                 end, {[], M0}, Actions),
+    State = State0#state{stashed_rejected = [],
                          incoming_unsettled_map = M},
     {Ids, State}.
 
-handle_settled_queue_actions(#state{settled_queue_actions = []} = State) ->
+handle_stashed_settled(#state{stashed_settled = []} = State) ->
     {[], State};
-handle_settled_queue_actions(#state{settled_queue_actions = Actions,
-                                    incoming_unsettled_map = M0} = State0) ->
-    {Ids0, M} = lists:foldl(
-                  fun({settled, QName, DeliveryIds}, Accum) ->
-                          lists:foldl(
-                            fun(DeliveryId, {L, U0} = Acc) ->
-                                    case maps:take(DeliveryId, U0) of
-                                        {Qs = #{QName := _}, U}
-                                          when map_size(Qs) =:= 1 ->
-                                            %% last queue confirm
-                                            {[DeliveryId | L], U};
-                                        {Qs, U1} ->
-                                            U = U1#{DeliveryId => maps:remove(QName, Qs)},
-                                            {L, U};
-                                        error ->
-                                            Acc
-                                    end
-                            end, Accum, DeliveryIds)
-                  end, {[], M0}, Actions),
-    Ids = serial_number:usort(Ids0),
-    State = State0#state{settled_queue_actions = [],
+handle_stashed_settled(#state{stashed_settled = Actions,
+                              incoming_unsettled_map = M0} = State0) ->
+    {Ids, M} = lists:foldl(
+                 fun({settled, QName, DeliveryIds}, Accum) ->
+                         lists:foldl(
+                           fun(DeliveryId, {L, U0} = Acc) ->
+                                   case maps:take(DeliveryId, U0) of
+                                       {{Qs = #{QName := _}, _}, U1} ->
+                                           UnconfirmedQs = maps:size(Qs),
+                                           if UnconfirmedQs =:= 1 ->
+                                                  %% last queue confirmed
+                                                  {[DeliveryId | L], U1};
+                                              UnconfirmedQs > 1 ->
+                                                  U = maps:update(DeliveryId,
+                                                                  {maps:remove(QName, Qs), true},
+                                                                  U0),
+                                                  {L, U}
+                                           end;
+                                       _ ->
+                                           Acc
+                                   end
+                           end, Accum, DeliveryIds)
+                 end, {[], M0}, Actions),
+    State = State0#state{stashed_settled = [],
                          incoming_unsettled_map = M},
     {Ids, State}.
+
+handle_stashed_eol(#state{stashed_eol = []} = State) ->
+    {[], [], [], State};
+handle_stashed_eol(#state{stashed_eol = Eols} = State0) ->
+    {ReleasedIs, AcceptedIds, DetachFrames, State1} =
+    lists:foldl(fun(QName, {RIds0, AIds0, DetachFrames0, S0 = #state{incoming_unsettled_map = M0,
+                                                                     queue_states = QStates0}}) ->
+                        {RIds, AIds, M} = settle_eol(QName, {RIds0, AIds0, M0}),
+                        QStates = rabbit_queue_type:remove(QName, QStates0),
+                        S1 = S0#state{incoming_unsettled_map = M,
+                                      queue_states = QStates},
+                        {DetachFrames1, S} = destroy_links(QName, DetachFrames0, S1),
+                        {RIds, AIds, DetachFrames1, S}
+                end, {[], [], [], State0}, Eols),
+    State = State1#state{stashed_eol = []},
+    {ReleasedIs, AcceptedIds, DetachFrames, State}.
+
+settle_eol(QName, Acc = {_ReleasedIds, _AcceptedIds, IncomingUnsettledMap}) ->
+    maps:fold(
+      fun(DeliveryId, {Qs = #{QName := _}, AtLeastOneQueueConfirmed}, {RelIds, AcceptIds, M0}) ->
+              UnconfirmedQs = maps:size(Qs),
+              if UnconfirmedQs =:= 1 ->
+                     %% The last queue that this delivery ID was waiting a confirm for got deleted.
+                     M = maps:remove(DeliveryId, M0),
+                     case AtLeastOneQueueConfirmed of
+                         true ->
+                             %% Since at least one queue confirmed this message, we reply to
+                             %% the client with ACCEPTED. This allows e.g. for large fanout
+                             %% scenarios where temporary target queues are deleted
+                             %% (think about an MQTT subscriber disconnects).
+                             {RelIds, [DeliveryId | AcceptIds], M};
+                         false ->
+                             %% Since no queue confirmed this message, we reply to the client
+                             %% with RELEASED. (The client can then re-publish this message.)
+                             {[DeliveryId | RelIds], AcceptIds, M}
+                     end;
+                 UnconfirmedQs > 1 ->
+                     M = maps:update(DeliveryId,
+                                     {maps:remove(QName, Qs), AtLeastOneQueueConfirmed},
+                                     M0),
+                     {RelIds, AcceptIds, M}
+              end;
+         (_, _, A) ->
+              A
+      end, Acc, IncomingUnsettledMap).
+
+destroy_links(#resource{kind = queue,
+                        name = QNameBin},
+              Frames0,
+              #state{incoming_links = IncomingLinks0,
+                     outgoing_links = OutgoingLinks0} = State0) ->
+    {Frames1, IncomingLinks} = maps:fold(fun(Handle, Link, Acc) ->
+                                                 destroy_link(Handle, Link, QNameBin, #incoming_link.queue, Acc)
+                                         end, {Frames0, IncomingLinks0}, IncomingLinks0),
+    {Frames, OutgoingLinks} = maps:fold(fun(Handle, Link, Acc) ->
+                                                destroy_link(Handle, Link, QNameBin, #outgoing_link.queue, Acc)
+                                        end, {Frames1, OutgoingLinks0}, OutgoingLinks0),
+    State = State0#state{incoming_links = IncomingLinks,
+                         outgoing_links = OutgoingLinks},
+    {Frames, State}.
+
+destroy_link(Handle, Link, QNameBin, QPos, Acc = {Frames0, Links0}) ->
+    case element(QPos, Link) of
+        QNameBin ->
+            Frame = detach_deleted(Handle),
+            Frames = [Frame | Frames0],
+            Links = maps:remove(Handle, Links0),
+            {Frames, Links};
+        _ ->
+            Acc
+    end.
+
+detach_deleted(Handle) ->
+    #'v1_0.detach'{handle = ?UINT(Handle),
+                   closed = true,
+                   error = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_RESOURCE_DELETED}}.
+
 
 send_dispositions(Ids, DeliveryState, Writer, ChannelNum) ->
     Ranges = serial_number:ranges(Ids),
@@ -370,7 +493,7 @@ handle_control(#'v1_0.begin'{next_outgoing_id = ?UINT(RemoteNextOut),
     reply0(Reply, State);
 
 handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
-                              name = Name,
+                              name = LinkName,
                               handle = InputHandle = ?UINT(HandleInt),
                               source = Source,
                               snd_settle_mode = SndSettleMode,
@@ -382,19 +505,19 @@ handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
                       incoming_links = IncomingLinks0} = State0) ->
     ok = validate_attach(Attach),
     case ensure_target(Target, Vhost, User) of
-        {ok, XName, RoutingKey} ->
-            %% TODO associate link name with target
-            IncomingLink = #incoming_link{name = Name,
-                                          exchange = XName,
-                                          routing_key = RoutingKey,
-                                          delivery_count = InitTransfer,
-                                          recv_settle_mode = RcvSettleMode},
+        {ok, XName, RoutingKey, QNameBin} ->
+            IncomingLink = #incoming_link{
+                              exchange = XName,
+                              routing_key = RoutingKey,
+                              queue = QNameBin,
+                              delivery_count = InitTransfer,
+                              recv_settle_mode = RcvSettleMode},
             _Outcomes = outcomes(Source),
             % rabbit_global_counters:publisher_created(ProtoVer),
 
             OutputHandle = output_handle(InputHandle),
             AttachReply = #'v1_0.attach'{
-                             name = Name,
+                             name = LinkName,
                              handle = OutputHandle,
                              source = Source,
                              snd_settle_mode = SndSettleMode,
@@ -424,7 +547,7 @@ handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
     end;
 
 handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
-                              name = Name,
+                              name = LinkName,
                               handle = InputHandle = ?UINT(HandleInt),
                               source = Source,
                               snd_settle_mode = SndSettleMode,
@@ -466,7 +589,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                                {ok, QStates} ->
                                    OutputHandle = output_handle(InputHandle),
                                    AttachReply = #'v1_0.attach'{
-                                                    name = Name,
+                                                    name = LinkName,
                                                     handle = OutputHandle,
                                                     initial_delivery_count = ?UINT(?INIT_TXFR_COUNT),
                                                     snd_settle_mode = case SndSettled of
@@ -521,13 +644,17 @@ handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle)}, MsgPart},
         #{Handle := Link0} ->
             {Flows, State1} = incr_incoming_id(State0),
             case incoming_link_transfer(Txfr, MsgPart, Link0, State1) of
-                {message, Reply0, Link, State2} ->
+                {ok, Reply0, Link, State2} ->
                     Reply = Reply0 ++ Flows,
                     State = State2#state{incoming_links = maps:update(Handle, Link, IncomingLinks)},
                     reply0(Reply, State);
-                {ok, Link} ->
-                    State = State1#state{incoming_links = maps:update(Handle, Link, IncomingLinks)},
-                    reply0(Flows, State)
+                {error, Reply0} ->
+                    %% "When an error occurs at a link endpoint, the endpoint MUST be detached
+                    %% with appropriate error information supplied in the error field of the
+                    %% detach frame. The link endpoint MUST then be destroyed." [2.6.5]
+                    Reply = Reply0 ++ Flows,
+                    State = State1#state{incoming_links = maps:remove(Handle, IncomingLinks)},
+                    reply0(Reply, State)
             end;
         _ ->
             protocol_error(?V_1_0_AMQP_ERROR_ILLEGAL_STATE,
@@ -618,10 +745,8 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
     {noreply, State};
 
 handle_control(#'v1_0.end'{}, #state{writer_pid = WriterPid,
-                                     channel_num = Ch,
-                                     queue_states = QStates} = State0) ->
+                                     channel_num = Ch} = State0) ->
     State = send_delivery_state_changes(State0),
-    ok = rabbit_queue_type:close(QStates),
     ok = try rabbit_amqp1_0_writer:send_command_sync(WriterPid, Ch, #'v1_0.end'{})
          catch exit:{Reason, {gen_server, call, _ArgList}}
                  when Reason =:= shutdown orelse
@@ -1002,33 +1127,26 @@ handle_queue_event({queue_event, QRef, Evt},
     case rabbit_queue_type:handle_event(QRef, Evt, QStates0) of
         {ok, QStates1, Actions} ->
             S = S0#state{queue_states = QStates1},
-            handle_queue_actions(Actions, S)
-            % {eol, Actions} ->
-            %     State1 = handle_queue_actions(Actions, State0),
-            %     State2 = handle_consuming_queue_down_or_eol(QRef, State1),
-            %     {ConfirmMXs, UC1} =
-            %         rabbit_confirms:remove_queue(QRef, State2#ch.unconfirmed),
-            %     %% Deleted queue is a special case.
-            %     %% Do not nack the "rejected" messages.
-            %     State3 = record_confirms(ConfirmMXs,
-            %                              State2#ch{unconfirmed = UC1}),
-            %     _ = erase_queue_stats(QRef),
-            %     noreply_coalesce(
-            %       State3#ch{queue_states = rabbit_queue_type:remove(QRef, QueueStates0)});
-            % {protocol_error, Type, Reason, ReasonArgs} ->
-            %     rabbit_misc:protocol_error(Type, Reason, ReasonArgs)
+            handle_queue_actions(Actions, S);
+        {eol, Actions} ->
+            {Reply, S1} = handle_queue_actions(Actions, S0),
+            S = S1#state{stashed_eol = [QRef | S1#state.stashed_eol]},
+            %%TODO see rabbit_channel:handle_eol()
+            {Reply, S};
+        {protocol_error, _Type, Reason, ReasonArgs} ->
+            protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR, Reason, ReasonArgs)
     end.
 
 handle_queue_actions(Actions, State0) ->
     {ReplyRev, State} =
     lists:foldl(
       fun ({settled, _QName, _DelIds} = Action,
-           {Reply, S0 = #state{settled_queue_actions = As}}) ->
-              S = S0#state{settled_queue_actions = [Action | As]},
+           {Reply, S0 = #state{stashed_settled = As}}) ->
+              S = S0#state{stashed_settled = [Action | As]},
               {Reply, S};
           ({rejected, _QName, _DelIds} = Action,
-           {Reply, S0 = #state{rejected_queue_actions = As}}) ->
-              S = S0#state{rejected_queue_actions = [Action | As]},
+           {Reply, S0 = #state{stashed_rejected = As}}) ->
+              S = S0#state{stashed_rejected = [Action | As]},
               {Reply, S};
           ({deliver, CTag, AckRequired, Msgs}, {Reply, S0}) ->
               S1 = lists:foldl(fun(Msg, S) ->
@@ -1063,7 +1181,16 @@ handle_queue_actions(Actions, State0) ->
                         %% TODO Why do we set available to 0?
                         available = ?UINT(0),
                         drain = true},
-              {[Flow | Reply], S}
+              {[Flow | Reply], S};
+          ({block, _QName}, Acc) ->
+              %%TODO
+              Acc;
+          ({unblock, _QName}, Acc) ->
+              %%TODO
+              Acc;
+          ({queue_down, _QName}, Acc) ->
+              %%TODO
+              Acc
       end, {[], State0}, Actions),
     {lists:reverse(ReplyRev), State}.
 
@@ -1148,33 +1275,36 @@ handle_deliver(ConsumerTag, AckRequired,
 %%% Incoming Link %%%
 %%%%%%%%%%%%%%%%%%%%%
 
-incoming_link_transfer(#'v1_0.transfer'{delivery_id = DeliveryId,
-                                        more        = true,
-                                        settled     = Settled},
-                       MsgPart,
-                       #incoming_link{msg_acc = MsgAcc,
-                                      send_settle_mode = SSM} = Link0,
-                       _State) ->
+incoming_link_transfer(
+  #'v1_0.transfer'{delivery_id = DeliveryId,
+                   more        = true,
+                   settled     = Settled},
+  MsgPart,
+  #incoming_link{msg_acc = MsgAcc,
+                 send_settle_mode = SSM} = Link0,
+  State) ->
     Link1 = Link0#incoming_link{msg_acc = [MsgPart | MsgAcc],
                                 send_settle_mode = effective_send_settle_mode(Settled, SSM)},
     Link = set_delivery_id(DeliveryId, Link1),
-    {ok, Link};
-incoming_link_transfer(#'v1_0.transfer'{delivery_id     = DeliveryId0,
-                                        delivery_tag = DeliveryTag,
-                                        settled         = Settled,
-                                        rcv_settle_mode = RcvSettleMode,
-                                        handle          = Handle},
-                       MsgPart,
-                       #incoming_link{exchange = XName = #resource{name = XNameBin},
-                                      routing_key      = LinkRKey,
-                                      delivery_count   = Count,
-                                      credit_used      = CreditUsed,
-                                      msg_acc          = MsgAcc,
-                                      send_settle_mode = SSM,
-                                      recv_settle_mode = RSM} = Link,
-                       #state{queue_states = QStates0,
-                              incoming_unsettled_map = U0
-                             } = State0) ->
+    {ok, [], Link, State};
+incoming_link_transfer(
+  #'v1_0.transfer'{delivery_id = DeliveryId0,
+                   delivery_tag = DeliveryTag,
+                   settled = Settled,
+                   rcv_settle_mode = RcvSettleMode,
+                   handle = Handle = ?UINT(HandleInt)},
+  MsgPart,
+  #incoming_link{exchange = XName = #resource{name = XNameBin},
+                 routing_key      = LinkRKey,
+                 delivery_count   = Count,
+                 credit_used      = CreditUsed,
+                 msg_acc          = MsgAcc,
+                 send_settle_mode = SSM,
+                 recv_settle_mode = RSM} = Link0,
+  #state{queue_states = QStates0,
+         incoming_unsettled_map = U0
+        } = State0) ->
+    #incoming_link{delivery_id = DeliveryId} = set_delivery_id(DeliveryId0, Link0),
     MsgBin = iolist_to_binary(lists:reverse([MsgPart | MsgAcc])),
     Sections = amqp10_framing:decode_bin(MsgBin),
     ?DEBUG("Inbound content:~n  ~tp",
@@ -1188,65 +1318,67 @@ incoming_link_transfer(#'v1_0.transfer'{delivery_id     = DeliveryId0,
     Mc = mc:init(mc_amqp, Sections, Anns),
     % Mc1 = rabbit_message_interceptor:intercept(Mc),
     % rabbit_global_counters:messages_received(ProtoVer, 1),
-    X = case rabbit_exchange:lookup(XName) of
-            {ok, Exchange} ->
-                Exchange;
-            {error, not_found} ->
-                protocol_error(?V_1_0_AMQP_ERROR_NOT_FOUND, "no ~ts", [rabbit_misc:rs(XName)])
-        end,
-    RoutedQNames = rabbit_exchange:route(X, Mc, #{return_binding_keys => true}),
-    #incoming_link{delivery_id = DeliveryId} = set_delivery_id(DeliveryId0, Link),
-    % rabbit_trace:tap_in(Msg, QNames, ConnName, Username, TraceState),
-    EffectiveSendSettleMode = effective_send_settle_mode(Settled, SSM),
-    EffectiveRecvSettleMode = effective_recv_settle_mode(RcvSettleMode, RSM),
-    case not EffectiveSendSettleMode andalso
-         EffectiveRecvSettleMode =:= ?V_1_0_RECEIVER_SETTLE_MODE_SECOND of
-        false -> ok;
-        true  -> protocol_error(?V_1_0_AMQP_ERROR_NOT_IMPLEMENTED,
-                                "rcv-settle-mode second not supported", [])
-    end,
-    Opts = case EffectiveSendSettleMode of
-               true -> #{};
-               false -> #{correlation => DeliveryId}
-           end,
-    % Opts1 = maps_put_truthy(flow, Flow, Opts),
-    Qs0 = rabbit_amqqueue:lookup_many(RoutedQNames),
-    Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
-    %% TODO convert message container to AMQP 0.9.1 message if feature flag message_containers
-    %% is disabled, see rabbit_mqtt_processor:compat/2:
-    %% https://github.com/rabbitmq/rabbitmq-server/blob/49b357ebd89f8f250afb292d9aeadf0357657c4a/deps/rabbitmq_mqtt/src/rabbit_mqtt_processor.erl#L2564-L2576
-    case rabbit_queue_type:deliver(Qs, Mc, Opts, QStates0) of
-        {ok, QStates, Actions} ->
-            % rabbit_global_counters:messages_routed(ProtoVer, length(Qs)),
-            %% Confirms must be registered before processing actions
-            %% because actions may contain rejections of publishes.
-            {U, Reply0} = process_routing_confirm(Qs, EffectiveSendSettleMode, DeliveryId, U0),
-            State1 = State0#state{queue_states = QStates,
-                                  incoming_unsettled_map = U},
-            {Reply1, State} = handle_queue_actions(Actions, State1),
-            {SendFlow, CreditUsed1} = case CreditUsed - 1 of
-                                          C when C =< 0 ->
-                                              {true,  ?INCOMING_CREDIT div 2};
-                                          D ->
-                                              {false, D}
-                                      end,
-            NewLink = Link#incoming_link{
-                        delivery_id      = undefined,
-                        send_settle_mode = undefined,
-                        delivery_count   = add(Count, 1),
-                        credit_used      = CreditUsed1,
-                        msg_acc          = []},
-            Reply = case SendFlow of
-                        true  -> ?DEBUG("sending flow for incoming ~tp", [NewLink]),
-                                 Reply0 ++ Reply1 ++ [incoming_flow(NewLink, Handle)];
-                        false -> Reply0 ++ Reply1
-                    end,
-            {message, Reply, NewLink, State};
-
-        {error, Reason} ->
-            rabbit_log:error("Failed to deliver message to queues, delivery_tag=~p, delivery_id=~p, reason=~p",
-                             [DeliveryTag, DeliveryId, Reason])
-            %%TODO handle error
+    case rabbit_exchange:lookup(XName) of
+        {ok, Exchange} ->
+            RoutedQNames = rabbit_exchange:route(Exchange, Mc, #{return_binding_keys => true}),
+            % rabbit_trace:tap_in(Msg, QNames, ConnName, Username, TraceState),
+            EffectiveSendSettleMode = effective_send_settle_mode(Settled, SSM),
+            EffectiveRecvSettleMode = effective_recv_settle_mode(RcvSettleMode, RSM),
+            case not EffectiveSendSettleMode andalso
+                 EffectiveRecvSettleMode =:= ?V_1_0_RECEIVER_SETTLE_MODE_SECOND of
+                false -> ok;
+                true  -> protocol_error(?V_1_0_AMQP_ERROR_NOT_IMPLEMENTED,
+                                        "rcv-settle-mode second not supported", [])
+            end,
+            Opts = case EffectiveSendSettleMode of
+                       true -> #{};
+                       false -> #{correlation => DeliveryId}
+                   end,
+            % Opts1 = maps_put_truthy(flow, Flow, Opts),
+            Qs0 = rabbit_amqqueue:lookup_many(RoutedQNames),
+            Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
+            %% TODO convert message container to AMQP 0.9.1 message if feature flag message_containers
+            %% is disabled, see rabbit_mqtt_processor:compat/2:
+            %% https://github.com/rabbitmq/rabbitmq-server/blob/49b357ebd89f8f250afb292d9aeadf0357657c4a/deps/rabbitmq_mqtt/src/rabbit_mqtt_processor.erl#L2564-L2576
+            case rabbit_queue_type:deliver(Qs, Mc, Opts, QStates0) of
+                {ok, QStates, Actions} ->
+                    % rabbit_global_counters:messages_routed(ProtoVer, length(Qs)),
+                    %% Confirms must be registered before processing actions
+                    %% because actions may contain rejections of publishes.
+                    {U, Reply0} = process_routing_confirm(
+                                    Qs, EffectiveSendSettleMode, DeliveryId, U0),
+                    State1 = State0#state{queue_states = QStates,
+                                          incoming_unsettled_map = U},
+                    {Reply1, State} = handle_queue_actions(Actions, State1),
+                    {SendFlow, CreditUsed1} = case CreditUsed - 1 of
+                                                  C when C =< 0 ->
+                                                      {true,  ?INCOMING_CREDIT div 2};
+                                                  D ->
+                                                      {false, D}
+                                              end,
+                    Link = Link0#incoming_link{
+                             delivery_id      = undefined,
+                             send_settle_mode = undefined,
+                             delivery_count   = add(Count, 1),
+                             credit_used      = CreditUsed1,
+                             msg_acc          = []},
+                    Reply = case SendFlow of
+                                true  -> ?DEBUG("sending flow for incoming ~tp", [Link]),
+                                         Reply0 ++ Reply1 ++ [incoming_flow(Link, Handle)];
+                                false -> Reply0 ++ Reply1
+                            end,
+                    {ok, Reply, Link, State};
+                {error, Reason} ->
+                    rabbit_log:warning(
+                      "Failed to deliver message to queues, "
+                      "delivery_tag=~p, delivery_id=~p, reason=~p",
+                      [DeliveryTag, DeliveryId, Reason])
+                    %%TODO handle error
+            end;
+        {error, not_found} ->
+            Disposition = released(DeliveryId),
+            Detach = detach_deleted(HandleInt),
+            {error, [Disposition, Detach]}
     end.
 
 process_routing_confirm([], _SenderSettles = true, _, U) ->
@@ -1254,18 +1386,21 @@ process_routing_confirm([], _SenderSettles = true, _, U) ->
     {U, []};
 process_routing_confirm([], _SenderSettles = false, DeliveryId, U) ->
     % rabbit_global_counters:messages_unroutable_returned(ProtoVer, 1),
-    Disposition = #'v1_0.disposition'{role = ?RECV_ROLE,
-                                      first = ?UINT(DeliveryId),
-                                      settled = true,
-                                      state = #'v1_0.released'{}},
+    Disposition = released(DeliveryId),
     {U, [Disposition]};
 process_routing_confirm([_|_], _SenderSettles = true, _, U) ->
     {U, []};
 process_routing_confirm([_|_] = Qs, _SenderSettles = false, DeliveryId, U0) ->
     QNames = rabbit_amqqueue:queue_names(Qs),
     false = maps:is_key(DeliveryId, U0),
-    U = U0#{DeliveryId => maps:from_keys(QNames, ok)},
+    U = U0#{DeliveryId => {maps:from_keys(QNames, ok), false}},
     {U, []}.
+
+released(DeliveryId) ->
+    #'v1_0.disposition'{role = ?RECV_ROLE,
+                        first = ?UINT(DeliveryId),
+                        settled = true,
+                        state = #'v1_0.released'{}}.
 
 %% TODO default-outcome and outcomes, dynamic lifetimes
 
@@ -1278,7 +1413,7 @@ ensure_target(#'v1_0.target'{address = Address,
         {utf8, Destination} ->
             case rabbit_routing_util:parse_endpoint(Destination, true) of
                 {ok, Dest} ->
-                    _QNameBin = ensure_terminus(target, Dest, Vhost, Durable),
+                    QNameBin = ensure_terminus(target, Dest, Vhost, Durable),
                     {XNameList1, RK} = rabbit_routing_util:parse_routing(Dest),
                     XName = rabbit_misc:r(Vhost, exchange, list_to_binary(XNameList1)),
                     check_write_permitted(XName, User),
@@ -1287,7 +1422,7 @@ ensure_target(#'v1_0.target'{address = Address,
                                      []        -> undefined;
                                      _         -> list_to_binary(RK)
                                  end,
-                    {ok, XName, RoutingKey};
+                    {ok, XName, RoutingKey, QNameBin};
                 {error, _} = E ->
                     E
             end;

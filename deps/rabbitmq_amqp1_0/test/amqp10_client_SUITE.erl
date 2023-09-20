@@ -10,6 +10,7 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
+-include_lib("amqp10_common/include/amqp10_framing.hrl").
 
 -compile([nowarn_export_all,
           export_all]).
@@ -30,8 +31,8 @@ groups() ->
     [
      {cluster_size_1, [shuffle],
       [
-       reliable_send_receive_with_outcomes_classic,
-       reliable_send_receive_with_outcomes_quorum,
+       reliable_send_receive_with_outcomes_classic_queue,
+       reliable_send_receive_with_outcomes_quorum_queue,
        sender_settle_mode_unsettled,
        sender_settle_mode_unsettled_fanout,
        sender_settle_mode_mixed,
@@ -44,12 +45,20 @@ groups() ->
        roundtrip_stream_queue_with_drain,
        amqp_stream_amqpl,
        message_headers_conversion,
-       multiple_sessions
+       multiple_sessions,
+       server_closes_link_classic_queue,
+       server_closes_link_quorum_queue,
+       server_closes_link_stream,
+       server_closes_link_exchange,
+       link_target_classic_queue_deleted,
+       link_target_quorum_queue_deleted,
+       target_queues_deleted_accepted
       ]},
 
      {cluster_size_3, [shuffle],
       [
-       last_queue_confirms
+       last_queue_confirms,
+       target_queue_deleted
       ]},
 
      {metrics, [shuffle],
@@ -97,10 +106,10 @@ end_per_testcase(Testcase, Config) ->
     eventually(?_assertEqual([], rpc(Config, rabbit_amqqueue, list, []))),
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
 
-reliable_send_receive_with_outcomes_classic(Config) ->
+reliable_send_receive_with_outcomes_classic_queue(Config) ->
     reliable_send_receive_with_outcomes(<<"classic">>, Config).
 
-reliable_send_receive_with_outcomes_quorum(Config) ->
+reliable_send_receive_with_outcomes_quorum_queue(Config) ->
     reliable_send_receive_with_outcomes(<<"quorum">>, Config).
 
 reliable_send_receive_with_outcomes(QType, Config) ->
@@ -747,6 +756,229 @@ multiple_sessions(Config) ->
     ok = amqp10_client:close_connection(Connection),
     [ok = delete_queue(Config, Q) || Q <- Qs].
 
+server_closes_link_classic_queue(Config) ->
+    server_closes_link(<<"classic">>, Config).
+
+server_closes_link_quorum_queue(Config) ->
+    server_closes_link(<<"quorum">>, Config).
+
+server_closes_link_stream(Config) ->
+    server_closes_link(<<"stream">>, Config).
+
+server_closes_link(QType, Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    DTag = <<0>>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag, <<"body">>, false)),
+    ok = wait_for_settlement(DTag),
+
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"test-receiver">>, Address, unsettled),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing ATTACH frame from server")
+    end,
+
+    %% Server closes the link endpoint due to some AMQP 1.0 external condition:
+    %% In this test, the external condition is that an AMQP 0.9.1 client deletes the queue.
+    delete_queue(Config, QName),
+
+    %% We expect that the server closes the link endpoints,
+    %% i.e. the server sends us DETACH frames.
+    ExpectedError = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_RESOURCE_DELETED},
+    receive {amqp10_event, {link, Sender, {detached, ExpectedError}}} -> ok
+    after 5000 -> ct:fail("server did not close our outgoing link")
+    end,
+
+    receive {amqp10_event, {link, Receiver, {detached, ExpectedError}}} -> ok
+    after 5000 -> ct:fail("server did not close our incoming link")
+    end,
+
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection).
+
+server_closes_link_exchange(Config) ->
+    XName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'exchange.declare_ok'{} =  amqp_channel:call(Ch, #'exchange.declare'{exchange = XName}),
+
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/exchange/", XName/binary, "/some-routing-key">>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+
+    %% Server closes the link endpoint due to some AMQP 1.0 external condition:
+    %% In this test, the external condition is that an AMQP 0.9.1 client deletes the exchange.
+    #'exchange.delete_ok'{} = amqp_channel:call(Ch, #'exchange.delete'{exchange = XName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+
+    %% When we publish the next message, we expect:
+    %% 1. that the message is released because the exchange doesn't exist anymore, and
+    DTag = <<255>>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag, <<"body">>, false)),
+    receive {amqp10_disposition, {released, DTag}} -> ok
+    after 5000 -> ct:fail(released_timeout)
+    end,
+    %% 2. that the server closes the link, i.e. sends us a DETACH frame.
+
+    ExpectedError = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_RESOURCE_DELETED},
+    receive {amqp10_event, {link, Sender, {detached, ExpectedError}}} -> ok
+    after 5000 -> ct:fail("server did not close our outgoing link")
+    end,
+
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection).
+
+link_target_classic_queue_deleted(Config) ->
+    link_target_queue_deleted(<<"classic">>, Config).
+
+link_target_quorum_queue_deleted(Config) ->
+    link_target_queue_deleted(<<"quorum">>, Config).
+
+link_target_queue_deleted(QType, Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    DTag1 = <<1>>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag1, <<"m1">>, false)),
+    ok = wait_for_settlement(DTag1),
+
+    %% Mock delivery to the target queue to do nothing.
+    rabbit_ct_broker_helpers:setup_meck(Config, [?MODULE]),
+    Mod = rabbit_queue_type,
+    ok = rpc(Config, meck, new, [Mod, [no_link, passthrough]]),
+    ok = rpc(Config, meck, expect, [Mod, deliver, fun ?MODULE:rabbit_queue_type_deliver_noop/4]),
+
+    %% Send 2nd message.
+    DTag2 = <<2>>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag2, <<"m2">>, false)),
+    receive {amqp10_disposition, Unexpected} -> ct:fail({unexpected_disposition, Unexpected})
+    after 200 -> ok
+    end,
+
+    %% Now, the server AMQP session contains a delivery that did not get confirmed by the target queue.
+    %% If we now delete that target queue, RabbitMQ must not reply to us with ACCEPTED.
+    %% Instead, we expect RabbitMQ to reply with RELEASED since no queue ever received our 2nd message.
+    delete_queue(Config, QName),
+    receive {amqp10_disposition, {released, DTag2}} -> ok
+    after 5000 -> ct:fail(released_timeout)
+    end,
+
+    %% After the 2nd message got released, we additionally expect RabbitMQ to close the link given
+    %% that the target link endpoint - the queue - got deleted.
+    ExpectedError = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_RESOURCE_DELETED},
+    receive {amqp10_event, {link, Sender, {detached, ExpectedError}}} -> ok
+    after 5000 -> ct:fail("server did not close our outgoing link")
+    end,
+
+    ?assert(rpc(Config, meck, validate, [Mod])),
+    ok = rpc(Config, meck, unload, [Mod]),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection).
+
+rabbit_queue_type_deliver_noop(_TargetQs, _Msg, _Opts, QTypeState) ->
+    Actions = [],
+    {ok, QTypeState, Actions}.
+
+target_queues_deleted_accepted(Config) ->
+    Q1 = <<"q1">>,
+    Q2 = <<"q2">>,
+    Q3 = <<"q3">>,
+    QNames = [Q1, Q2, Q3],
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    [begin
+         #'queue.declare_ok'{} =  amqp_channel:call(Ch, #'queue.declare'{queue = QName}),
+         #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{queue = QName,
+                                                                  exchange = <<"amq.fanout">>})
+     end || QName <- QNames],
+
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/exchange/amq.fanout/ignored">>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address, unsettled),
+    ok = wait_for_credit(Sender),
+
+    DTag1 = <<1>>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag1, <<"m1">>, false)),
+    ok = wait_for_settlement(DTag1),
+
+    %% Mock to deliver only to q1.
+    rabbit_ct_broker_helpers:setup_meck(Config, [?MODULE]),
+    Mod = rabbit_queue_type,
+    ok = rpc(Config, meck, new, [Mod, [no_link, passthrough]]),
+    ok = rpc(Config, meck, expect, [Mod, deliver, fun ?MODULE:rabbit_queue_type_deliver_to_q1/4]),
+
+    %% Send 2nd message.
+    DTag2 = <<2>>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag2, <<"m2">>, false)),
+    receive {amqp10_disposition, Disp1} -> ct:fail({unexpected_disposition, Disp1})
+    after 200 -> ok
+    end,
+
+    %% Now, the server AMQP session contains a delivery that got confirmed by only q1.
+    %% If we delete q2, we should still receive no DISPOSITION since q3 hasn't confirmed.
+    ?assertEqual(#'queue.delete_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = Q2})),
+    receive {amqp10_disposition, Disp2} -> ct:fail({unexpected_disposition, Disp2})
+    after 100 -> ok
+    end,
+    %% If we delete q3, RabbitMQ should reply with ACCEPTED since at least one target queue (q1) confirmed.
+    ?assertEqual(#'queue.delete_ok'{message_count = 1},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = Q3})),
+    receive {amqp10_disposition, {accepted, DTag2}} -> ok
+    after 5000 -> ct:fail(accepted_timeout)
+    end,
+
+    ?assertEqual(#'queue.delete_ok'{message_count = 2},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = Q1})),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+    ?assert(rpc(Config, meck, validate, [Mod])),
+    ok = rpc(Config, meck, unload, [Mod]),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection).
+
+rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
+    %% Drop q2 and q3.
+    3 = length(Qs),
+    Q1 = lists:filter(fun({Q, _RouteInos}) ->
+                              amqqueue:get_name(Q) =:= rabbit_misc:r(<<"/">>, queue, <<"q1">>)
+                      end, Qs),
+    1 = length(Q1),
+    meck:passthrough([Q1, Msg, Opts, QTypeState]).
+
 auth_attempt_metrics(Config) ->
     open_and_close_connection(Config),
     [Attempt] = rpc(Config, 0, rabbit_core_metrics, get_auth_attempts, []),
@@ -839,6 +1071,71 @@ last_queue_confirms(Config) ->
     ok = amqp10_client:close_connection(Connection),
     ?assertEqual(#'queue.delete_ok'{message_count = 3},
                  amqp_channel:call(Ch, #'queue.delete'{queue = ClassicQ})),
+    ?assertEqual(#'queue.delete_ok'{message_count = 2},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = QuorumQ})),
+    ok = rabbit_ct_client_helpers:close_channel(Ch).
+
+target_queue_deleted(Config) ->
+    ClassicQ = <<"my classic queue">>,
+    QuorumQ = <<"my quorum queue">>,
+    Qs = [ClassicQ, QuorumQ],
+    Ch = rabbit_ct_client_helpers:open_channel(Config, 0),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{queue = ClassicQ}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QuorumQ,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                                  {<<"x-quorum-initial-group-size">>, long, 3}
+                                                 ]}),
+    [#'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{queue = QName,
+                                                              exchange = <<"amq.fanout">>})
+     || QName <- Qs],
+
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+
+    Address = <<"/exchange/amq.fanout/ignored">>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"sender">>, Address, unsettled),
+    ok = wait_for_credit(Sender),
+
+    DTag1 = <<"t1">>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag1, <<"m1">>, false)),
+    receive {amqp10_disposition, {accepted, DTag1}} -> ok
+    after 5000 -> ct:fail({missing_accepted, DTag1})
+    end,
+
+    %% Make quorum queue unavailable.
+    ok = rabbit_ct_broker_helpers:stop_node(Config, 2),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, 1),
+
+    flush("quorum queue is down"),
+    DTag2 = <<"t2">>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag2, <<"m2">>, false)),
+    %% Target classic queue should receive m2.
+    assert_messages(ClassicQ, 2, 0, Config),
+    %% Delete target classic queue.
+    ?assertEqual(#'queue.delete_ok'{message_count = 2},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = ClassicQ})),
+
+    %% Since quorum queue is down, we should still receive no DISPOSITION.
+    receive {amqp10_disposition, Unexpected} -> ct:fail({unexpected_disposition, Unexpected})
+    after 100 -> ok
+    end,
+
+    ok = rabbit_ct_broker_helpers:start_node(Config, 1),
+    ok = rabbit_ct_broker_helpers:start_node(Config, 2),
+    %% Since the quorum queue has become available, we should now get a confirmation for m2.
+    receive {amqp10_disposition, {accepted, DTag2}} -> ok
+    after 10_000 -> ct:fail({missing_accepted, DTag2})
+    end,
+
+    ok = amqp10_client:detach_link(Sender),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
     ?assertEqual(#'queue.delete_ok'{message_count = 2},
                  amqp_channel:call(Ch, #'queue.delete'{queue = QuorumQ})),
     ok = rabbit_ct_client_helpers:close_channel(Ch).

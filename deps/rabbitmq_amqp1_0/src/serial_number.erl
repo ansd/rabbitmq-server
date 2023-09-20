@@ -60,14 +60,14 @@ usort(L) ->
                         end
                 end, L).
 
-%% Takes a list with unique and sorted serial numbers
-%% (e.g. via serial_number:usort/1) and returns
-%% tuples {First, Last} representing contiguous serial numbers.
+%% Takes a list of serial numbers and returns tuples
+%% {First, Last} representing contiguous serial numbers.
 -spec ranges([serial_number()]) ->
     [{First :: serial_number(), Last :: serial_number()}].
 ranges([]) ->
     [];
-ranges([First | Rest]) ->
+ranges(SerialNumbers) ->
+    [First | Rest] = usort(SerialNumbers),
     ranges0(Rest, [{First, First}]).
 
 ranges0([], Acc) ->
