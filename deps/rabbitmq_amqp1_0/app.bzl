@@ -154,3 +154,12 @@ def test_suite_beam_files(name = "test_suite_beam_files"):
         app_name = "rabbitmq_amqp1_0",
         erlc_opts = "//:test_erlc_opts",
     )
+    erlang_bytecode(
+        name = "auth_SUITE_beam_files",
+        testonly = True,
+        srcs = ["test/auth_SUITE.erl"],
+        outs = ["test/auth_SUITE.beam"],
+        app_name = "rabbitmq_amqp1_0",
+        erlc_opts = "//:test_erlc_opts",
+        deps = ["//deps/amqp10_common:erlang_app", "//deps/amqp_client:erlang_app"],
+    )

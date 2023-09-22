@@ -112,7 +112,7 @@ open_connection(ConnectionConfig0) ->
     ConnectionConfig2 = ConnectionConfig1#{sasl => amqp10_client_connection:encrypt_sasl(Sasl)},
     amqp10_client_connection:open(ConnectionConfig2).
 
-%% @doc Opens a connection using a connection_config map
+%% @doc Closes a connection.
 %% This is asynchronous and will notify completion to the caller using
 %% an amqp10_event of the following format:
 %% {amqp10_event, {connection, ConnectionPid, {closed, Why}}}

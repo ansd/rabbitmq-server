@@ -25,6 +25,7 @@
 %% Just make these constant for the time being.
 -define(INCOMING_CREDIT, 65_536).
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
+-define(TOPIC_PERMISSION_CACHE, topic_permission_cache).
 -define(UINT(N), {uint, N}).
 
 % [2.8.4]
@@ -214,13 +215,13 @@ handle_cast({frame, Frame, FlowPid},
             noreply(State);
         {stop, _, _} = Stop ->
             Stop
-        catch exit:Reason = #'v1_0.error'{} ->
-            %% TODO shut down nicely like rabbit_channel
+    catch exit:Reason = #'v1_0.error'{} ->
+              %% TODO shut down nicely like rabbit_channel
             End = #'v1_0.end'{error = Reason},
             rabbit_log:warning("Closing session for connection ~p: ~tp",
                                [ReaderPid, Reason]),
             ok = rabbit_amqp1_0_writer:send_command_sync(WriterPid, Ch, End),
-            {stop, normal, State0};
+            {stop, {shutdown, Reason}, State0};
           exit:normal ->
               {stop, normal, State0};
           _:Reason:Stacktrace ->
@@ -563,7 +564,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                      ?V_1_0_SENDER_SETTLE_MODE_UNSETTLED -> false;
                      _ -> ?DEFAULT_SEND_SETTLED
                  end,
-    case ensure_source(Source, Vhost) of
+    case ensure_source(Source, Vhost, User) of
         {ok, QNameBin} ->
             CTag = handle_to_ctag(HandleInt),
             Args = source_filters_to_consumer_args(Source) ++
@@ -571,6 +572,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                                       {<<"drain">>,  bool, false}]}],
             Spec = #{no_ack => SndSettled,
                      channel_pid => self(),
+                     %%TODO check if limiter required for consumer credit
                      limiter_pid => none,
                      limiter_active => false,
                      prefetch_count => ?MAX_SESSION_WINDOW_SIZE,
@@ -580,7 +582,6 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                      ok_msg => undefined,
                      acting_user => Username},
             QName = rabbit_misc:r(Vhost, queue, QNameBin),
-            %% read access to queue required for basic.consume
             check_read_permitted(QName, User),
             case rabbit_amqqueue:with(
                    QName,
@@ -1302,7 +1303,8 @@ incoming_link_transfer(
                  send_settle_mode = SSM,
                  recv_settle_mode = RSM} = Link0,
   #state{queue_states = QStates0,
-         incoming_unsettled_map = U0
+         incoming_unsettled_map = U0,
+         user = User
         } = State0) ->
     #incoming_link{delivery_id = DeliveryId} = set_delivery_id(DeliveryId0, Link0),
     MsgBin = iolist_to_binary(lists:reverse([MsgPart | MsgAcc])),
@@ -1310,16 +1312,18 @@ incoming_link_transfer(
     ?DEBUG("Inbound content:~n  ~tp",
            [[amqp10_framing:pprint(Section) || Section <- Sections]]),
     Anns0 = #{exchange => XNameBin},
-    %% maybe overwrite routing_keys=[Subject] put by mc_amqpl
     Anns = case LinkRKey of
                undefined -> Anns0;
                _ -> Anns0#{routing_keys => [LinkRKey]}
            end,
     Mc = mc:init(mc_amqp, Sections, Anns),
+    RoutingKeys = mc:get_annotation(routing_keys, Mc),
+    RoutingKey = routing_key(RoutingKeys, XName),
     % Mc1 = rabbit_message_interceptor:intercept(Mc),
     % rabbit_global_counters:messages_received(ProtoVer, 1),
     case rabbit_exchange:lookup(XName) of
         {ok, Exchange} ->
+            check_write_permitted_on_topic(Exchange, User, RoutingKey),
             RoutedQNames = rabbit_exchange:route(Exchange, Mc, #{return_binding_keys => true}),
             % rabbit_trace:tap_in(Msg, QNames, ConnName, Username, TraceState),
             EffectiveSendSettleMode = effective_send_settle_mode(Settled, SSM),
@@ -1413,9 +1417,11 @@ ensure_target(#'v1_0.target'{address = Address,
         {utf8, Destination} ->
             case rabbit_routing_util:parse_endpoint(Destination, true) of
                 {ok, Dest} ->
-                    QNameBin = ensure_terminus(target, Dest, Vhost, Durable),
+                    QNameBin = ensure_terminus(target, Dest, Vhost, User, Durable),
                     {XNameList1, RK} = rabbit_routing_util:parse_routing(Dest),
                     XName = rabbit_misc:r(Vhost, exchange, list_to_binary(XNameList1)),
+                    {ok, X} = rabbit_exchange:lookup(XName),
+                    check_internal_exchange(X),
                     check_write_permitted(XName, User),
                     RoutingKey = case RK of
                                      undefined -> undefined;
@@ -1518,15 +1524,17 @@ handle_outgoing_link_flow_control(
 default(undefined, Default) -> Default;
 default(Thing,    _Default) -> Thing.
 
-ensure_source(#'v1_0.source'{dynamic = true}, _Vhost) ->
+ensure_source(#'v1_0.source'{dynamic = true}, _, _) ->
     protocol_error(?V_1_0_AMQP_ERROR_NOT_IMPLEMENTED, "Dynamic sources not supported", []);
 ensure_source(#'v1_0.source'{address = Address,
-                             durable = Durable}, Vhost) ->
+                             durable = Durable},
+              Vhost,
+              User = #user{username = Username}) ->
     case Address of
         {utf8, SourceAddr} ->
             case rabbit_routing_util:parse_endpoint(SourceAddr, false) of
                 {ok, Src} ->
-                    QNameBin = ensure_terminus(source, Src, Vhost, Durable),
+                    QNameBin = ensure_terminus(source, Src, Vhost, User, Durable),
                     %%TODO remove dependency on rabbit_routing_util
                     %% and always operator on binaries
                     case rabbit_routing_util:parse_routing(Src) of
@@ -1541,8 +1549,11 @@ ensure_source(#'v1_0.source'{address = Address,
                             Binding = #binding{source = XName,
                                                destination = QName,
                                                key = RoutingKey},
-                            %% TODO authorisation checks
-                            case rabbit_binding:add(Binding, <<"todo">>) of
+                            check_write_permitted(QName, User),
+                            check_read_permitted(XName, User),
+                            {ok, X} = rabbit_exchange:lookup(XName),
+                            check_read_permitted_on_topic(X, User, RoutingKey),
+                            case rabbit_binding:add(Binding, Username) of
                                 ok ->
                                     {ok, QNameBin};
                                 {error, _} = Err ->
@@ -1616,21 +1627,21 @@ validate_attach(
 validate_attach(#'v1_0.attach'{}) ->
     ok.
 
-ensure_terminus(Type, {exchange, {XNameList, _RoutingKey}}, Vhost, Durability) ->
+ensure_terminus(Type, {exchange, {XNameList, _RoutingKey}}, Vhost, User, Durability) ->
     ok = exit_if_absent(exchange, Vhost, XNameList),
     case Type of
         target -> undefined;
-        source -> declare_queue(generate_queue_name(), Vhost, Durability)
+        source -> declare_queue(generate_queue_name(), Vhost, User, Durability)
     end;
-ensure_terminus(target, {topic, _bindingkey}, _, _) ->
+ensure_terminus(target, {topic, _bindingkey}, _, _, _) ->
     %% exchange amq.topic exists
     undefined;
-ensure_terminus(source, {topic, _BindingKey}, Vhost, Durability) ->
+ensure_terminus(source, {topic, _BindingKey}, Vhost, User, Durability) ->
     %% exchange amq.topic exists
-    declare_queue(generate_queue_name(), Vhost, Durability);
-ensure_terminus(_, {queue, QNameList}, Vhost, Durability) ->
-    declare_queue(list_to_binary(QNameList), Vhost, Durability);
-ensure_terminus(_, {amqqueue, QNameList}, Vhost, _) ->
+    declare_queue(generate_queue_name(), Vhost, User, Durability);
+ensure_terminus(_, {queue, QNameList}, Vhost, User, Durability) ->
+    declare_queue(list_to_binary(QNameList), Vhost, User, Durability);
+ensure_terminus(_, {amqqueue, QNameList}, Vhost, _, _) ->
     %% Target "/amq/queue/" is handled specially due to AMQP legacy:
     %% "Queue names starting with "amq." are reserved for pre-declared and
     %% standardised queues. The client MAY declare a queue starting with "amq."
@@ -1655,11 +1666,10 @@ exit_if_absent(Type, Vhost, Name) ->
 generate_queue_name() ->
     rabbit_guid:binary(rabbit_guid:gen_secure(), "amq.gen").
 
-declare_queue(QNameBin, Vhost, TerminusDurability) ->
-    %% configure access to queue required for queue.declare
-    % check_resource_access(User, QName, configure, AuthzCtx)
-    % rabbit_vhost_limit:is_over_queue_limit(VHost)
-    QName = #resource{name = QNameBin} = rabbit_misc:r(Vhost, queue, QNameBin),
+declare_queue(QNameBin, Vhost, User = #user{username = Username}, TerminusDurability) ->
+    QName = rabbit_misc:r(Vhost, queue, QNameBin),
+    check_configure_permitted(QName, User),
+    %%TODO rabbit_vhost_limit:is_over_queue_limit(VHost)
     rabbit_core_metrics:queue_declared(QName),
     Q0 = amqqueue:new(QName,
                       _Pid = none,
@@ -1668,7 +1678,7 @@ declare_queue(QNameBin, Vhost, TerminusDurability) ->
                       _QOwner = none,
                       _QArgs = [],
                       Vhost,
-                      #{}, % #{user => Username},
+                      #{user => Username},
                       rabbit_classic_queue),
     case rabbit_queue_type:declare(Q0, node()) of
         {new, _Q}  ->
@@ -1719,43 +1729,6 @@ queue_is_durable(undefined) ->
     %% [3.5.3]
     queue_is_durable(?V_1_0_TERMINUS_DURABILITY_NONE).
 
-%%% TODO move copied code to some common module
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% BEGIN copy from rabbit_channel %%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% check_configure_permitted(Resource, User) ->
-%     check_resource_access(User, Resource, configure).
-
-check_write_permitted(Resource, User) ->
-    check_resource_access(User, Resource, write).
-
-check_read_permitted(Resource, User) ->
-    check_resource_access(User, Resource, read).
-
-check_resource_access(User, Resource, Perm) ->
-    V = {Resource, Perm},
-
-    Cache = case get(permission_cache) of
-                undefined -> [];
-                Other     -> Other
-            end,
-    case lists:member(V, Cache) of
-        true ->
-            ok;
-        false ->
-            try rabbit_access_control:check_resource_access(User, Resource, Perm, _Context = #{}) of
-                ok ->
-                    CacheTail = lists:sublist(Cache, ?MAX_PERMISSION_CACHE_SIZE-1),
-                    put(permission_cache, [V | CacheTail])
-            catch
-                exit:#amqp_error{name = access_refused,
-                                 explanation = Msg} ->
-                    protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
-                                   "access refused: ~ts",
-                                   [Msg])
-            end
-    end.
-
 %% "The two endpoints are not REQUIRED to use the same handle. This means a peer
 %% is free to independently chose its handle when a link endpoint is associated
 %% with the session. The locally chosen handle is referred to as the output handle.
@@ -1764,46 +1737,80 @@ check_resource_access(User, Resource, Perm) ->
 output_handle(InputHandle) ->
     _Outputhandle = InputHandle.
 
-% check_write_permitted_on_topic(Resource, User, RoutingKey) ->
-%     check_topic_authorisation(Resource, User, RoutingKey, write).
+routing_key(undefined, XName) ->
+    protocol_error(?V_1_0_AMQP_ERROR_INVALID_FIELD,
+                   "Publishing to ~ts failed since no routing key was provided",
+                   [rabbit_misc:rs(XName)]);
+routing_key([RoutingKey], _XName) ->
+    RoutingKey.
 
-% check_read_permitted_on_topic(Resource, User, RoutingKey) ->
-%     check_topic_authorisation(Resource, User, RoutingKey, read).
+check_internal_exchange(#exchange{internal = true,
+                                  name = XName}) ->
+    protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
+                   "attach to internal ~ts is forbidden",
+                   [rabbit_misc:rs(XName)]);
+check_internal_exchange(_) ->
+    ok.
 
-% check_topic_authorisation(#exchange{name = Name = #resource{virtual_host = VHost}, type = topic},
-%                           User = #user{username = Username},
-%                           RoutingKey, Permission) ->
-%     Resource = Name#resource{kind = topic},
-%     VariableMap = #{<<"vhost">> => VHost, <<"username">> => Username},
-%     Context = #{routing_key  => RoutingKey,
-%                 variable_map => VariableMap},
-%     Cache = case get(topic_permission_cache) of
-%                 undefined -> [];
-%                 Other     -> Other
-%             end,
-%     case lists:member({Resource, Context, Permission}, Cache) of
-%         true ->
-%             ok;
-%         false -> try rabbit_access_control:check_topic_access(User, Resource, Permission, Context) of
-%                      ok ->
-%                          CacheTail = lists:sublist(Cache, ?MAX_PERMISSION_CACHE_SIZE-1),
-%                          put(topic_permission_cache, [{Resource, Context, Permission} | CacheTail])
-%                  catch
-%                      exit:#amqp_error{name = access_refused,
-%                                       explanation = Msg} ->
-%                          protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
-%                                         "topic access refused: ~ts",
-%                                         [Msg])
-%                  end
+check_write_permitted(Resource, User) ->
+    check_resource_access(Resource, User, write).
 
-%     end;
-% check_topic_authorisation(_, _, _, _) ->
+check_read_permitted(Resource, User) ->
+    check_resource_access(Resource, User, read).
+
+check_configure_permitted(Resource, User) ->
+    check_resource_access(Resource, User, configure).
+
+check_resource_access(Resource, User, Perm) ->
+    Context = #{},
+    ok = try rabbit_access_control:check_resource_access(User, Resource, Perm, Context)
+         catch exit:#amqp_error{name = access_refused,
+                                explanation = Msg} ->
+                   protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS, Msg, [])
+         end.
+
+check_write_permitted_on_topic(Resource, User, RoutingKey) ->
+    check_topic_authorisation(Resource, User, RoutingKey, write).
+
+check_read_permitted_on_topic(Resource, User, RoutingKey) ->
+    check_topic_authorisation(Resource, User, RoutingKey, read).
+
+check_topic_authorisation(#exchange{type = topic,
+                                    name = XName = #resource{virtual_host = VHost}},
+                          User = #user{username = Username},
+                          RoutingKey,
+                          Permission) ->
+    Resource = XName#resource{kind = topic},
+    CacheElem = {Resource, RoutingKey, Permission},
+    Cache = case get(?TOPIC_PERMISSION_CACHE) of
+                undefined -> [];
+                List -> List
+            end,
+    case lists:member(CacheElem, Cache) of
+        true ->
+            ok;
+        false ->
+            VariableMap = #{<<"vhost">> => VHost,
+                            <<"username">> => Username},
+            Context = #{routing_key => RoutingKey,
+                        variable_map => VariableMap},
+            try rabbit_access_control:check_topic_access(User, Resource, Permission, Context) of
+                ok ->
+                    CacheTail = lists:sublist(Cache, ?MAX_PERMISSION_CACHE_SIZE-1),
+                    put(?TOPIC_PERMISSION_CACHE, [CacheElem | CacheTail])
+            catch
+                exit:#amqp_error{name = access_refused,
+                                 explanation = Msg} ->
+                    protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS, Msg, [])
+            end
+    end;
+check_topic_authorisation(_, _, _, _) ->
+    ok.
+
+%%TODO every rabbit.channel_tick_interval:
+% put(permission_cache_can_expire, rabbit_access_control:permission_cache_can_expire(User)),
+% If permission_cache_can_expire:
+% clear cache AND check permissions on all links
+% clear_permission_cache() ->
+%     erase(?TOPIC_PERMISSION_CACHE),
 %     ok.
-
-% clear_permission_cache() -> erase(permission_cache),
-%                             erase(topic_permission_cache),
-%                             ok.
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% END copy from rabbit_channel %%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

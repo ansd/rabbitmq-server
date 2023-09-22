@@ -52,7 +52,8 @@ groups() ->
        server_closes_link_exchange,
        link_target_classic_queue_deleted,
        link_target_quorum_queue_deleted,
-       target_queues_deleted_accepted
+       target_queues_deleted_accepted,
+       no_routing_key
       ]},
 
      {cluster_size_3, [shuffle],
@@ -667,12 +668,11 @@ amqp091_to_amqp10_header_conversion(Session, Ch, QName, Address) ->
                       {<<"int">>, long, 101},
                       {<<"bool">>, bool, false}],
 
-    amqp_channel:cast(Ch, 
-        #'basic.publish'{exchange = <<"">>, routing_key = QName},
-        #amqp_msg{props = #'P_basic'{
-            headers = Amqp091Headers}, 
-            payload = <<"foobar">> }
-        ),
+    amqp_channel:cast(
+      Ch,
+      #'basic.publish'{routing_key = QName},
+      #amqp_msg{props = #'P_basic'{headers = Amqp091Headers},
+                payload = <<"foobar">>}),
 
     {ok, [Msg]} = drain_queue(Session, Address, 1),
     Amqp10MA = amqp10_msg:message_annotations(Msg),
@@ -970,6 +970,30 @@ target_queues_deleted_accepted(Config) ->
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection).
 
+%% Set routing key neither in target address nor in message subject.
+no_routing_key(Config) ->
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/exchange/amq.direct">>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    Msg = amqp10_msg:new(<<0>>, <<1>>, true),
+    ok = amqp10_client:send_msg(Sender, Msg),
+    receive
+        {amqp10_event,
+         {session, Session,
+          {ended,
+           #'v1_0.error'{
+              condition = ?V_1_0_AMQP_ERROR_INVALID_FIELD,
+              description = {utf8, <<"Publishing to exchange 'amq.direct' in vhost '/' "
+                                     "failed since no routing key was provided">>}}}}} -> ok
+    after 5000 -> flush(missing_ended),
+                  ct:fail("did not receive expected error")
+    end,
+    ok = amqp10_client:close_connection(Connection).
+
 rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
     %% Drop q2 and q3.
     3 = length(Qs),
@@ -1154,7 +1178,7 @@ connection_config(Config) ->
 flush(Prefix) ->
     receive
         Msg ->
-            ct:pal("~ts flushed: ~w~n", [Prefix, Msg]),
+            ct:pal("~ts flushed: ~p~n", [Prefix, Msg]),
             flush(Prefix)
     after 1 ->
               ok

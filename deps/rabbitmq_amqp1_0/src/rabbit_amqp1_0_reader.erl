@@ -294,8 +294,14 @@ handle_dependent_exit(ChPid, Reason, State) ->
             maybe_close(handle_exception(control_throttle(State), Channel, R))
     end.
 
-termination_kind(normal) -> controlled;
-termination_kind(_)      -> uncontrolled.
+termination_kind(normal) ->
+    controlled;
+termination_kind(shutdown) ->
+    controlled;
+termination_kind({shutdown, _}) ->
+    controlled;
+termination_kind(_) ->
+    uncontrolled.
 
 maybe_close(State = #v1{connection_state = closing}) ->
     close(undefined, State);
