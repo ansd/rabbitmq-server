@@ -16,9 +16,13 @@
           export_all]).
 
 -import(rabbit_ct_broker_helpers,
-        [rpc/4, rpc/5]).
+        [rpc/4, rpc/5,
+         get_node_config/3]).
 -import(rabbit_ct_helpers,
         [eventually/1, eventually/3]).
+-import(event_recorder,
+        [assert_event_type/2,
+         assert_event_prop/2]).
 
 all() ->
     [
@@ -53,7 +57,8 @@ groups() ->
        link_target_classic_queue_deleted,
        link_target_quorum_queue_deleted,
        target_queues_deleted_accepted,
-       no_routing_key
+       no_routing_key,
+       events
       ]},
 
      {cluster_size_3, [shuffle],
@@ -994,6 +999,42 @@ no_routing_key(Config) ->
     end,
     ok = amqp10_client:close_connection(Connection).
 
+events(Config) ->
+    ok = event_recorder:start(Config),
+    open_and_close_connection(Config),
+    [E0, E1, E2] = event_recorder:get_events(Config),
+    ok = event_recorder:stop(Config),
+
+    assert_event_type(user_authentication_success, E0),
+    Protocol = {protocol, {'AMQP', {1, 0}}},
+    assert_event_prop([{name, <<"guest">>},
+                       {auth_mechanism, <<"PLAIN">>},
+                       {ssl, false},
+                       Protocol],
+                      E0),
+
+    assert_event_type(connection_created, E1),
+    Node = get_node_config(Config, 0, nodename),
+    assert_event_prop(
+      [Protocol,
+       {node, Node},
+       {vhost, <<"/">>},
+       {user, <<"guest">>},
+       {type, network}],
+      E1),
+    Props = E1#event.props,
+    Name = proplists:lookup(name, Props),
+    Pid = proplists:lookup(pid, Props),
+    ClientProperties = proplists:lookup(client_properties, Props),
+
+    assert_event_type(connection_closed, E2),
+    assert_event_prop(
+      [{node, Node},
+       Name,
+       Pid,
+       ClientProperties],
+      E2).
+
 rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
     %% Drop q2 and q3.
     3 = length(Qs),
@@ -1005,27 +1046,27 @@ rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
 
 auth_attempt_metrics(Config) ->
     open_and_close_connection(Config),
-    [Attempt] = rpc(Config, 0, rabbit_core_metrics, get_auth_attempts, []),
-    ?assertEqual(false, proplists:is_defined(remote_address, Attempt)),
-    ?assertEqual(false, proplists:is_defined(username, Attempt)),
-    ?assertEqual(proplists:get_value(protocol, Attempt), <<"amqp10">>),
-    ?assertEqual(proplists:get_value(auth_attempts, Attempt), 1),
-    ?assertEqual(proplists:get_value(auth_attempts_failed, Attempt), 0),
-    ?assertEqual(proplists:get_value(auth_attempts_succeeded, Attempt), 1),
-    rpc(Config, 0, rabbit_core_metrics, reset_auth_attempt_metrics, []),
-    ok = rpc(Config, 0, application, set_env, [rabbit, track_auth_attempt_source, true]),
+    [Attempt1] = rpc(Config, rabbit_core_metrics, get_auth_attempts, []),
+    ?assertEqual(false, proplists:is_defined(remote_address, Attempt1)),
+    ?assertEqual(false, proplists:is_defined(username, Attempt1)),
+    ?assertEqual(<<"amqp10">>, proplists:get_value(protocol, Attempt1)),
+    ?assertEqual(1, proplists:get_value(auth_attempts, Attempt1)),
+    ?assertEqual(0, proplists:get_value(auth_attempts_failed, Attempt1)),
+    ?assertEqual(1, proplists:get_value(auth_attempts_succeeded, Attempt1)),
+
+    rpc(Config, rabbit_core_metrics, reset_auth_attempt_metrics, []),
+    ok = rpc(Config, application, set_env, [rabbit, track_auth_attempt_source, true]),
     open_and_close_connection(Config),
-    Attempts = rpc(Config, 0, rabbit_core_metrics, get_auth_attempts_by_source, []),
-    [Attempt1] = lists:filter(fun(Props) ->
+    Attempts = rpc(Config, rabbit_core_metrics, get_auth_attempts_by_source, []),
+    [Attempt2] = lists:filter(fun(Props) ->
                                       proplists:is_defined(remote_address, Props)
                               end, Attempts),
-    ?assertEqual(proplists:get_value(remote_address, Attempt1), <<>>),
-    ?assertEqual(proplists:get_value(username, Attempt1), <<"guest">>),
-    ?assertEqual(proplists:get_value(protocol, Attempt), <<"amqp10">>),
-    ?assertEqual(proplists:get_value(auth_attempts, Attempt1), 1),
-    ?assertEqual(proplists:get_value(auth_attempts_failed, Attempt1), 0),
-    ?assertEqual(proplists:get_value(auth_attempts_succeeded, Attempt1), 1),
-    ok.
+    ?assertEqual(<<>>, proplists:get_value(remote_address, Attempt2)),
+    ?assertEqual(<<"guest">>, proplists:get_value(username, Attempt2)),
+    ?assertEqual(<<"amqp10">>, proplists:get_value(protocol, Attempt2)),
+    ?assertEqual(1, proplists:get_value(auth_attempts, Attempt2)),
+    ?assertEqual(0, proplists:get_value(auth_attempts_failed, Attempt2)),
+    ?assertEqual(1, proplists:get_value(auth_attempts_succeeded, Attempt2)).
 
 last_queue_confirms(Config) ->
     ClassicQ = <<"my classic queue">>,
@@ -1187,8 +1228,14 @@ flush(Prefix) ->
 open_and_close_connection(Config) ->
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
-    {ok, _} = amqp10_client:begin_session(Connection),
-    ok = amqp10_client:close_connection(Connection).
+    receive {amqp10_event, {connection, Connection, opened}} -> ok
+    after 5000 -> ct:fail(opened_timeout)
+    end,
+
+    ok = amqp10_client:close_connection(Connection),
+    receive {amqp10_event, {connection, Connection, {closed, normal}}} -> ok
+    after 5000 -> ct:fail(closed_timeout)
+    end.
 
 % before we can send messages we have to wait for credit from the server
 wait_for_credit(Sender) ->

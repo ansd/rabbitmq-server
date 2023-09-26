@@ -43,12 +43,13 @@
 
 -record(v1_connection,
         {name :: binary(),
+         vhost :: rabbit_types:option(rabbit_types:vhost()),
          host,
          peer_host,
          port,
          peer_port,
          connected_at,
-         user :: none | rabbit_types:user(),
+         user :: rabbit_types:option(rabbit_types:user()),
          timeout_sec, frame_max, auth_mechanism, auth_state,
          hostname,
          properties :: rabbit_types:option({map, list(tuple())})
@@ -80,6 +81,7 @@ unpack_from_0_9_1(
                              last_blocked_by = none,
                              last_blocked_at = never},
         connection = #v1_connection{name = ConnectionName,
+                                    vhost = none,
                                     host = Host,
                                     peer_host = PeerHost,
                                     port = Port,
@@ -261,10 +263,14 @@ update_last_blocked_by(Throttle) ->
 %% error handling / termination
 
 close(Error, State = #v1{sock = Sock,
-                         connection = #v1_connection{
-                                         name = Name,
-                                         timeout_sec = TimeoutSec}}) ->
+                         connection = #v1_connection{timeout_sec = TimeoutSec}}) ->
     Self = self(),
+    ok = rabbit_amqp1_0:unregister_connection(Self),
+
+    %% Client properties will be emitted in the connection_closed event by rabbit_reader.
+    ClientProperties = i(client_properties, State),
+    put(client_properties, ClientProperties),
+
     Seconds = if TimeoutSec > 0 andalso
                  TimeoutSec < ?CLOSING_TIMEOUT ->
                      TimeoutSec;
@@ -273,12 +279,7 @@ close(Error, State = #v1{sock = Sock,
               end,
     Millis = Seconds * 1000,
     _TRef = erlang:send_after(Millis, Self, terminate_connection),
-    ok = rabbit_core_metrics:connection_closed(Self),
-    ok = rabbit_event:notify(connection_closed,
-                             [{name, Name},
-                              {pid, Self},
-                              {node, node()}]),
-    ok = rabbit_amqp1_0:unregister_connection(Self),
+
     ok = send_on_channel0(Sock, #'v1_0.close'{error = Error}),
     State#v1{connection_state = closed}.
 
@@ -443,10 +444,12 @@ handle_1_0_connection_frame(
                     HelperSupPid, Sock,
                     ClientHeartbeatSec, SendFun,
                     ReceiverHeartbeatSec, ReceiveFun),
+    Vhost = vhost(Hostname),
     State1 = State0#v1{connection_state = running,
                        connection = Connection#v1_connection{
+                                      vhost = Vhost,
                                       frame_max = FrameMax,
-                                      hostname  = Hostname,
+                                      hostname = Hostname,
                                       properties = Properties},
                        heartbeater = Heartbeater},
     State2 = start_writer(State1),
@@ -457,7 +460,7 @@ handle_1_0_connection_frame(
                   end,
     rabbit_log:debug("AMQP 1.0 connection.open frame: hostname = ~ts, "
                      "extracted vhost = ~ts, idle_timeout = ~tp" ,
-                     [HostnameVal, vhost(Hostname), HeartbeatSec * 1000]),
+                     [HostnameVal, Vhost, HeartbeatSec * 1000]),
     %% TODO enforce channel_max
     ok = send_on_channel0(
            Sock,
@@ -469,7 +472,7 @@ handle_1_0_connection_frame(
     Conserve = rabbit_alarm:register(Self, {?MODULE, conserve_resources, []}),
     State = State2#v1{throttle = Throttle#throttle{alarmed_by = Conserve}},
 
-    Infos = infos(?EVENT_KEYS, State),
+    Infos = infos(?CONNECTION_EVENT_KEYS, State),
     ok = rabbit_core_metrics:connection_created(
            proplists:get_value(pid, Infos),
            Infos),
@@ -702,11 +705,11 @@ auth_phase_1_0(Response,
                                               auth_state     = AuthState},
                        sock = Sock}) ->
     case AuthMechanism:handle_response(Response, AuthState) of
-        {refused, User, Msg, Args} ->
+        {refused, Username, Msg, Args} ->
             %% We don't trust the client at this point - force them to wait
             %% for a bit before sending the sasl outcome frame
             %% so they can't DOS us with repeated failed logins etc.
-            rabbit_core_metrics:auth_attempt_failed(<<>>, User, amqp10),
+            auth_fail(Username, State),
             timer:sleep(?SILENT_CLOSE_DELAY * 1000),
             Outcome = #'v1_0.sasl_outcome'{code = {ubyte, 1}},
             ok = send_on_channel0(Sock, Outcome, rabbit_amqp1_0_sasl),
@@ -714,7 +717,7 @@ auth_phase_1_0(Response,
               ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS, "~ts login refused: ~ts",
               [Name, io_lib:format(Msg, Args)]);
         {protocol_error, Msg, Args} ->
-            rabbit_core_metrics:auth_attempt_failed(<<>>, <<>>, amqp10),
+            auth_fail(none, State),
             protocol_error(?V_1_0_AMQP_ERROR_DECODE_ERROR, Msg, Args);
         {challenge, Challenge, AuthState1} ->
             rabbit_core_metrics:auth_attempt_succeeded(<<>>, <<>>, amqp10),
@@ -728,9 +731,9 @@ auth_phase_1_0(Response,
                         "AMQP 1.0 connection ~tp: user '~ts' authenticated",
                         [self(), Username]),
                     rabbit_core_metrics:auth_attempt_succeeded(<<>>, Username, amqp10),
-                    ok;
+                    notify_auth(user_authentication_success, Username, State);
                 not_allowed ->
-                    rabbit_core_metrics:auth_attempt_failed(<<>>, Username, amqp10),
+                    auth_fail(Username, State),
                     protocol_error(
                       ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
                       "user '~ts' can only connect via localhost",
@@ -738,11 +741,32 @@ auth_phase_1_0(Response,
             end,
             Outcome = #'v1_0.sasl_outcome'{code = {ubyte, 0}},
             ok = send_on_channel0(Sock, Outcome, rabbit_amqp1_0_sasl),
-            switch_callback(
-              State#v1{connection_state = waiting_amqp0100,
-                       connection = Connection#v1_connection{user = User}},
-              handshake, 8)
+            State1 = State#v1{connection_state = waiting_amqp0100,
+                              connection = Connection#v1_connection{user = User}},
+            switch_callback(State1, handshake, 8)
     end.
+
+
+auth_fail(Username, State) ->
+    rabbit_core_metrics:auth_attempt_failed(<<>>, Username, amqp10),
+    notify_auth(user_authentication_failure, Username, State).
+
+notify_auth(EventType, Username, State) ->
+    Name = case Username of
+               none -> [];
+               _ -> [{name, Username}]
+           end,
+    AuthEventItems = lists:filtermap(
+                       fun(Item = name) ->
+                               {true, {connection_name, i(Item, State)}};
+                          (Item) ->
+                               case i(Item, State) of
+                                   '' -> false;
+                                   Val -> {true, {Item, Val}}
+                               end
+                       end, ?AUTH_EVENT_KEYS),
+    EventProps = Name ++ AuthEventItems,
+    rabbit_event:notify(EventType, EventProps).
 
 track_channel(ChannelNum, SessionPid, State) ->
     rabbit_log:debug("AMQP 1.0 created session process ~p for channel number ~b",
@@ -824,7 +848,7 @@ i(pid, #v1{}) ->
 i(type, #v1{}) ->
     network;
 i(protocol, #v1{}) ->
-    {'AMQP', "1.0"};
+    {'AMQP', {1, 0}};
 i(connection, #v1{connection = Val}) ->
     Val;
 i(node, #v1{}) ->
@@ -848,6 +872,8 @@ i(connection_state, #v1{connection_state = Val}) ->
 i(connected_at, #v1{connection = #v1_connection{connected_at = Val}}) ->
     Val;
 i(name, #v1{connection = #v1_connection{name = Val}}) ->
+    Val;
+i(vhost, #v1{connection = #v1_connection{vhost = Val}}) ->
     Val;
 % i(host, #v1{connection = #v1_connection{hostname = {utf8, Val}}}) ->
 %     Val;

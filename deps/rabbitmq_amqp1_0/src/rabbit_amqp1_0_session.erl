@@ -1796,7 +1796,7 @@ check_topic_authorisation(#exchange{type = topic,
                         variable_map => VariableMap},
             try rabbit_access_control:check_topic_access(User, Resource, Permission, Context) of
                 ok ->
-                    CacheTail = lists:sublist(Cache, ?MAX_PERMISSION_CACHE_SIZE-1),
+                    CacheTail = lists:sublist(Cache, ?MAX_PERMISSION_CACHE_SIZE - 1),
                     put(?TOPIC_PERMISSION_CACHE, [CacheElem | CacheTail])
             catch
                 exit:#amqp_error{name = access_refused,

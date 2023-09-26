@@ -18,6 +18,9 @@
         [rpc/4]).
 -import(rabbit_ct_helpers,
         [eventually/1]).
+-import(event_recorder,
+        [assert_event_type/2,
+         assert_event_prop/2]).
 
 all() ->
     [
@@ -33,7 +36,8 @@ groups() ->
        send_to_topic,
        send_to_topic_using_subject,
        attach_source_topic,
-       attach_target_internal_exchange
+       attach_target_internal_exchange,
+       authn_failure_event
       ]
      }
     ].
@@ -346,6 +350,35 @@ attach_target_internal_exchange(Config) ->
     ok = amqp10_client:close_connection(Connection),
     #'exchange.delete_ok'{} = amqp_channel:call(Ch, #'exchange.delete'{exchange = XName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch).
+
+authn_failure_event(Config) ->
+    ok = event_recorder:start(Config),
+
+    Host = ?config(rmq_hostname, Config),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    Vhost = ?config(test_vhost, Config),
+    User = ?config(test_user, Config),
+    OpnConf = #{address => Host,
+                port => Port,
+                container_id => <<"my container">>,
+                sasl => {plain, User, <<"wrong password">>},
+                hostname => <<"vhost:", Vhost/binary>>},
+
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    receive {amqp10_event, {connection, Connection, {closed, sasl_auth_failure}}} -> ok
+    after 5000 -> flush(missing_closed),
+                  ct:fail("did not receive sasl_auth_failure")
+    end,
+
+    [E | _] = event_recorder:get_events(Config),
+    ok = event_recorder:stop(Config),
+
+    assert_event_type(user_authentication_failure, E),
+    assert_event_prop([{name, <<"test user">>},
+                       {auth_mechanism, <<"PLAIN">>},
+                       {ssl, false},
+                       {protocol, {'AMQP', {1, 0}}}],
+                      E).
 
 connection_config(Config) ->
     Vhost = ?config(test_vhost, Config),

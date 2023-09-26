@@ -365,7 +365,7 @@ start_connection(Parent, HelperSup, RanchRef, Deb, Sock) ->
             end
     catch
         Ex ->
-          log_connection_exception(dynamic_connection_name(Name), Ex)
+            log_connection_exception(dynamic_connection_name(Name), Ex)
     after
         %% We don't call gen_tcp:close/1 here since it waits for
         %% pending output to be sent, which results in unnecessary

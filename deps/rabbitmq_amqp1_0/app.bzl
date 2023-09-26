@@ -163,3 +163,12 @@ def test_suite_beam_files(name = "test_suite_beam_files"):
         erlc_opts = "//:test_erlc_opts",
         deps = ["//deps/amqp10_common:erlang_app", "//deps/amqp_client:erlang_app"],
     )
+    erlang_bytecode(
+        name = "test_event_recorder_beam",
+        testonly = True,
+        srcs = ["test/event_recorder.erl"],
+        outs = ["test/event_recorder.beam"],
+        app_name = "rabbitmq_amqp1_0",
+        erlc_opts = "//:test_erlc_opts",
+        deps = ["//deps/rabbit_common:erlang_app"],
+    )
