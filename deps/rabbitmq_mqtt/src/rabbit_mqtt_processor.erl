@@ -1444,7 +1444,7 @@ consume(Q, QoS, #state{
                              channel_pid => self(),
                              limiter_pid => none,
                              limiter_active => false,
-                             prefetch_count => Prefetch,
+                             mode => {simple_prefetch, Prefetch},
                              consumer_tag => ?CONSUMER_TAG,
                              exclusive_consume => false,
                              args => [],

@@ -566,19 +566,15 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                  end,
     case ensure_source(Source, Vhost, User) of
         {ok, QNameBin} ->
-            CTag = handle_to_ctag(HandleInt),
-            Args = source_filters_to_consumer_args(Source) ++
-            [{<<"x-credit">>, table, [{<<"credit">>, long, 0},
-                                      {<<"drain">>,  bool, false}]}],
             Spec = #{no_ack => SndSettled,
                      channel_pid => self(),
                      %%TODO check if limiter required for consumer credit
                      limiter_pid => none,
                      limiter_active => false,
-                     prefetch_count => ?MAX_SESSION_WINDOW_SIZE,
-                     consumer_tag => CTag,
+                     mode => credited,
+                     consumer_tag => handle_to_ctag(HandleInt),
                      exclusive_consume => false,
-                     args => Args,
+                     args => source_filters_to_consumer_args(Source),
                      ok_msg => undefined,
                      acting_user => Username},
             QName = rabbit_misc:r(Vhost, queue, QNameBin),
@@ -1457,6 +1453,7 @@ handle_outgoing_link_flow_control(
     ?UINT(DeliveryCountRcv) = default(DeliveryCountRcv0, ?UINT(DeliveryCountSnd)),
     Drain = default(Drain0, false),
     %% See section 2.6.7
+    %%TODO use serial number arithmetic since delivery-count is a sequence number
     LinkCreditSnd = DeliveryCountRcv + LinkdCreditRcv - DeliveryCountSnd,
     Ctag = handle_to_ctag(HandleInt),
     QName = rabbit_misc:r(Vhost, queue, QNameBin),

@@ -58,7 +58,10 @@ groups() ->
        link_target_quorum_queue_deleted,
        target_queues_deleted_accepted,
        no_routing_key,
-       events
+       events,
+       sync_get_classic_queue,
+       sync_get_quorum_queue,
+       sync_get_stream
       ]},
 
      {cluster_size_3, [shuffle],
@@ -1034,6 +1037,101 @@ events(Config) ->
        Pid,
        ClientProperties],
       E2).
+
+sync_get_classic_queue(Config) ->
+    sync_get(<<"classic">>, Config).
+
+sync_get_quorum_queue(Config) ->
+    sync_get(<<"quorum">>, Config).
+
+sync_get_stream(Config) ->
+    sync_get(<<"stream">>, Config).
+
+%% Test synchronous get, figure 2.43
+sync_get(QType, Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+
+    %% Attach a sender and a receiver to the queue.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session,
+                       <<"test-receiver">>,
+                       Address,
+                       unsettled),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing attched")
+    end,
+    flush(receiver_attached),
+
+    %% Grant 1 credit to the sending queue.
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never),
+
+    %% Since the queue has no messages yet, we shouldn't receive any message.
+    receive {amqp10_msg, _, _} = Unexp1 -> ct:fail("received unexpected message ~p", [Unexp1])
+    after 50 -> ok
+    end,
+
+    %% Let's send 3 messages to the queue.
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag1">>, <<"m1">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag2">>, <<"m2">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag3">>, <<"m3">>, true)),
+
+    %% Since we previously granted only 1 credit, we should get only the 1st message.
+    receive {amqp10_msg, Receiver, Msg1} ->
+                ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1))
+    after 5000 -> ct:fail("missing m1")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive {amqp10_msg, _, _} = Unexp2 -> ct:fail("received unexpected message ~p", [Unexp2])
+    after 50 -> ok
+    end,
+
+    %% Synchronously get the 2nd message.
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never),
+    receive {amqp10_msg, Receiver, Msg2} ->
+                ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2))
+    after 5000 -> ct:fail("missing m2")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive {amqp10_msg, _, _} = Unexp3 -> ct:fail("received unexpected message ~p", [Unexp3])
+    after 50 -> ok
+    end,
+
+    %% Synchronously get the 3rd message.
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never),
+    receive {amqp10_msg, Receiver, Msg3} ->
+                ?assertEqual([<<"m3">>], amqp10_msg:body(Msg3))
+    after 5000 -> ct:fail("missing m3")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive {amqp10_msg, _, _} = Unexp4 -> ct:fail("received unexpected message ~p", [Unexp4])
+    after 50 -> ok
+    end,
+
+    ok = amqp10_client:detach_link(Sender),
+    ok = amqp10_client:detach_link(Receiver),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch).
 
 rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
     %% Drop q2 and q3.

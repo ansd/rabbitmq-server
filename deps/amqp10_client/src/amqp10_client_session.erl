@@ -288,7 +288,7 @@ mapped(cast, #'v1_0.attach'{name = {utf8, Name},
     {next_state, mapped, State};
 mapped(cast, #'v1_0.detach'{handle = {uint, InHandle},
                             error = Err},
-        #state{links = Links, link_handle_index = LHI} = State0) ->
+       #state{links = Links, link_handle_index = LHI} = State0) ->
     with_link(InHandle, State0,
               fun (#link{output_handle = OutHandle} = Link, State) ->
                       Reason = reason(Err),
@@ -315,8 +315,8 @@ mapped(cast, #'v1_0.flow'{handle = {uint, InHandle}} = Flow,
     State1 = State#state{links = Links1},
     {next_state, mapped, State1};
 mapped(cast, {#'v1_0.transfer'{handle = {uint, InHandle},
-                         more = true} = Transfer, Payload},
-                         #state{links = Links} = State0) ->
+                               more = true} = Transfer, Payload},
+       #state{links = Links} = State0) ->
 
     {ok, #link{output_handle = OutHandle} = Link} =
         find_link_by_input_handle(InHandle, State0),
@@ -327,9 +327,9 @@ mapped(cast, {#'v1_0.transfer'{handle = {uint, InHandle},
               State0#state{links = Links#{OutHandle => Link1}}),
     {next_state, mapped, State};
 mapped(cast, {#'v1_0.transfer'{handle = {uint, InHandle},
-                         delivery_id = MaybeDeliveryId,
-                         settled = Settled} = Transfer0, Payload0},
-                         #state{incoming_unsettled = Unsettled0} = State0) ->
+                               delivery_id = MaybeDeliveryId,
+                               settled = Settled} = Transfer0, Payload0},
+       #state{incoming_unsettled = Unsettled0} = State0) ->
 
     {ok, #link{target = {pid, TargetPid},
                output_handle = OutHandle,

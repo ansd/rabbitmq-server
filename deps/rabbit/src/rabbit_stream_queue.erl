@@ -72,10 +72,12 @@
 -type msg() :: term(). %% TODO: refine
 
 -record(stream, {credit :: integer(),
-                 max :: non_neg_integer(),
                  start_offset = 0 :: non_neg_integer(),
                  listening_offset = 0 :: non_neg_integer(),
                  log :: undefined | osiris_log:state(),
+                 %% These messages were already read ahead from the Osiris log.
+                 %% They are buffered until the consumer has more credits to consume them.
+                 read_ahead_msgs = [] :: [rabbit_amqqueue:qmsg()],
                  reader_options :: map()}).
 
 -record(stream_client, {stream_id :: string(),
@@ -86,7 +88,7 @@
                         correlation = #{} :: #{appender_seq() => {msg_id(), msg()}},
                         soft_limit :: non_neg_integer(),
                         slow = false :: boolean(),
-                        readers = #{} :: #{term() => #stream{}},
+                        readers = #{} :: #{rabbit_types:ctag() => #stream{}},
                         writer_id :: binary(),
                         filtering_supported :: boolean()
                        }).
@@ -263,7 +265,7 @@ format(Q, Ctx) ->
              {state, down}]
     end.
 
-consume(Q, #{prefetch_count := 0}, _)
+consume(Q, #{mode := {simple_prefetch, 0}}, _)
   when ?amqqueue_is_stream(Q) ->
     {protocol_error, precondition_failed, "consumer prefetch count is not set for '~ts'",
      [rabbit_misc:rs(amqqueue:get_name(Q))]};
@@ -283,7 +285,7 @@ consume(Q, Spec,
         {LocalPid, QState} when is_pid(LocalPid) ->
             #{no_ack := NoAck,
               channel_pid := ChPid,
-              prefetch_count := ConsumerPrefetchCount,
+              mode := Mode,
               consumer_tag := ConsumerTag,
               exclusive_consume := ExclusiveConsume,
               args := Args,
@@ -302,6 +304,10 @@ consume(Q, Spec,
                             {protocol_error, precondition_failed,
                              "Filtering is not supported", []};
                         _ ->
+                            ConsumerPrefetchCount = case Mode of
+                                                        {simple_prefetch, C} -> C;
+                                                        _ -> 0
+                                                    end,
                             rabbit_core_metrics:consumer_created(ChPid, ConsumerTag,
                                                                  ExclusiveConsume,
                                                                  not NoAck, QName,
@@ -311,8 +317,7 @@ consume(Q, Spec,
                             %% begins sending
                             maybe_send_reply(ChPid, OkMsg),
                             _ = rabbit_stream_coordinator:register_local_member_listener(Q),
-                            begin_stream(QState, ConsumerTag, OffsetSpec,
-                                         ConsumerPrefetchCount, FilterSpec)
+                            begin_stream(QState, ConsumerTag, OffsetSpec, Mode, FilterSpec)
                     end
             end;
         {undefined, _} ->
@@ -404,7 +409,7 @@ query_local_pid(#stream_client{stream_id = StreamId} = State) ->
 begin_stream(#stream_client{name = QName,
                             readers = Readers0,
                             local_pid = LocalPid} = State,
-             Tag, Offset, Max, Options)
+             Tag, Offset, Mode, Options)
   when is_pid(LocalPid) ->
     CounterSpec = {{?MODULE, QName, Tag, self()}, []},
     {ok, Seg0} = osiris:init_reader(LocalPid, Offset, CounterSpec, Options),
@@ -417,11 +422,14 @@ begin_stream(#stream_client{name = QName,
                       {timestamp, _} -> NextOffset;
                       _ -> Offset
                   end,
-    Str0 = #stream{credit = Max,
+    Credit = case Mode of
+                 {simple_prefetch, N} -> N;
+                 credited -> 0
+             end,
+    Str0 = #stream{credit = Credit,
                    start_offset = StartOffset,
                    listening_offset = NextOffset,
                    log = Seg0,
-                   max = Max,
                    reader_options = Options},
     {ok, State#stream_client{local_pid = LocalPid,
                              readers = Readers0#{Tag => Str0}}}.
@@ -447,35 +455,34 @@ credit(QName, CTag, Credit, Drain, #stream_client{readers = Readers0,
                                                   name = Name,
                                                   local_pid = LocalPid} = State) ->
     {Readers1, Msgs} = case Readers0 of
-                          #{CTag := #stream{credit = Credit0} = Str0} ->
-                               %%TODO why
-                               %% credit = Credit0 + Credit
-                               %% instead of
-                               %% credit = Credit
-                               %% ?
-                               %% AMQP 1.0 calculates the current link credit.
-                              Str1 = Str0#stream{credit = Credit0 + Credit},
-                              {Str, Msgs0} = stream_entries(QName, Name, LocalPid, Str1),
-                              {Readers0#{CTag => Str}, Msgs0};
+                          #{CTag := Str0} ->
+                               Str1 = Str0#stream{credit = Credit},
+                               {Str, Msgs0} = stream_entries(QName, Name, LocalPid, Str1),
+                               {Readers0#{CTag => Str}, Msgs0};
                           _ ->
                               {Readers0, []}
                       end,
-    {Readers, Actions} =
-        case Drain of
-            true ->
-                case Readers1 of
-                    #{CTag := #stream{credit = Credit1} = Str2} ->
-                        {Readers0#{CTag => Str2#stream{credit = 0}},
-                         [{send_drained, {CTag, Credit1}}]};
-                    _ ->
-                        {Readers1, []}
-                end;
-            false ->
-                {Readers1, []}
-        end,
+    {Readers, Actions} = case Drain of
+                             true ->
+                                 case Readers1 of
+                                     #{CTag := #stream{credit = Credit1} = Str2} ->
+                                         {Readers0#{CTag => Str2#stream{credit = 0}},
+                                          [{send_drained, {CTag, Credit1}}]};
+                                     _ ->
+                                         {Readers1, []}
+                                 end;
+                             false ->
+                                 {Readers1, []}
+                         end,
+    NumMsgs = length(Msgs),
+    %%TODO Available is wrong:
+    %% As an approximation we could query the committed offset and subtract
+    %% the (next offset - 1) from that. Both should be cheap to query.
+    Available = NumMsgs,
     {State#stream_client{readers = Readers},
-     [{send_credit_reply, CTag, Credit, length(Msgs)},
-      {deliver, CTag, true, Msgs}] ++ Actions}.
+     [{deliver, CTag, true, Msgs},
+      {send_credit_reply, CTag, Credit - NumMsgs, Available}
+     ] ++ Actions}.
 
 deliver(QSs, Msg, Options) ->
     lists:foldl(
@@ -622,6 +629,7 @@ settle(QName, _, CTag, MsgIds, #stream_client{readers = Readers0,
     {Readers, Msgs} = case Readers0 of
                           #{CTag := #stream{credit = Credit0} = Str0} ->
                               Str1 = Str0#stream{credit = Credit0 + Credit},
+                              %%TODO settle shouldn't directly increase credit?
                               {Str, Msgs0} = stream_entries(QName, Name, LocalPid, Str1),
                               {Readers0#{CTag => Str}, Msgs0};
                           _ ->
@@ -1073,6 +1081,24 @@ stream_entries(QName, Name, LocalPid, Str) ->
 
 stream_entries(QName, Name, LocalPid,
                #stream{credit = Credit,
+                       read_ahead_msgs = Buf0} = Str0, MsgIn)
+  when Credit > 0 andalso Buf0 =/= [] ->
+    BufLen = length(Buf0),
+    case Credit =< BufLen of
+        true ->
+            %% We can serve all entries from the buffer.
+            {BufMsgs, Buf} = lists:split(Credit, Buf0),
+            Str = Str0#stream{credit = 0,
+                              read_ahead_msgs = Buf},
+            {Str, MsgIn ++ BufMsgs};
+        false ->
+            %% We can serve some entries from the buffer.
+            Str = Str0#stream{credit = Credit - BufLen,
+                              read_ahead_msgs = []},
+            stream_entries(QName, Name, LocalPid, Str, MsgIn ++ Buf0)
+    end;
+stream_entries(QName, Name, LocalPid,
+               #stream{credit = Credit,
                        start_offset = StartOffs,
                        listening_offset = LOffs,
                        log = Seg0} = Str0, MsgIn)
@@ -1092,17 +1118,27 @@ stream_entries(QName, Name, LocalPid,
             rabbit_log:debug("stream client: error reading chunk ~w", [Err]),
             exit(Err);
         {Records, Seg} ->
-            Msgs = [begin
-                        Msg0 = binary_to_msg(QName, B),
-                        Msg = mc:set_annotation(<<"x-stream-offset">>, O, Msg0),
-                        {Name, LocalPid, O, false, Msg}
-                    end || {O, B} <- Records,
-                           O >= StartOffs],
+            Msgs0 = [begin
+                         Msg0 = binary_to_msg(QName, B),
+                         Msg = mc:set_annotation(<<"x-stream-offset">>, O, Msg0),
+                         {Name, LocalPid, O, false, Msg}
+                     end || {O, B} <- Records,
+                            O >= StartOffs],
 
-            NumMsgs = length(Msgs),
-
-            Str = Str0#stream{credit = Credit - NumMsgs,
-                              log = Seg},
+            NumMsgs = length(Msgs0),
+            {Str, Msgs} = case Credit >= NumMsgs of
+                              true ->
+                                  {Str0#stream{credit = Credit - NumMsgs,
+                                               log = Seg}, Msgs0};
+                              false ->
+                                  %% Consumer doesn't have sufficient credit.
+                                  %% Buffer the remaining messages.
+                                  [] = Str0#stream.read_ahead_msgs, % assertion
+                                  {Msgs1, Buf} = lists:split(Credit, Msgs0),
+                                  {Str0#stream{credit = 0,
+                                               read_ahead_msgs = Buf,
+                                               log = Seg}, Msgs1}
+                          end,
             case Str#stream.credit < 1 of
                 true ->
                     %% we are done here
@@ -1150,7 +1186,7 @@ capabilities() ->
       queue_arguments => [<<"x-max-length-bytes">>, <<"x-queue-type">>,
                           <<"x-max-age">>, <<"x-stream-max-segment-size-bytes">>,
                           <<"x-initial-cluster-size">>, <<"x-queue-leader-locator">>],
-      consumer_arguments => [<<"x-stream-offset">>, <<"x-credit">>],
+      consumer_arguments => [<<"x-stream-offset">>],
       server_named => false}.
 
 notify_decorators(Q) when ?is_amqqueue(Q) ->

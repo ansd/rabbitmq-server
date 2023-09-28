@@ -237,16 +237,17 @@ consume(Q, Spec, State0) when ?amqqueue_is_classic(Q) ->
       channel_pid := ChPid,
       limiter_pid := LimiterPid,
       limiter_active := LimiterActive,
-      prefetch_count := ConsumerPrefetchCount,
+      mode := Mode,
       consumer_tag := ConsumerTag,
       exclusive_consume := ExclusiveConsume,
-      args := Args,
+      args := Args0,
       ok_msg := OkMsg,
       acting_user :=  ActingUser} = Spec,
+    {PrefetchCount, Args} = parse_consumer_mode(Mode, Args0),
     case delegate:invoke(QPid,
                          {gen_server2, call,
                           [{basic_consume, NoAck, ChPid, LimiterPid,
-                            LimiterActive, ConsumerPrefetchCount, ConsumerTag,
+                            LimiterActive, PrefetchCount, ConsumerTag,
                             ExclusiveConsume, Args, OkMsg, ActingUser},
                            infinity]}) of
         ok ->
@@ -256,6 +257,15 @@ consume(Q, Spec, State0) when ?amqqueue_is_classic(Q) ->
         Err ->
             Err
     end.
+
+%% Ideally, the classic queue process should parse the new consumer mode format.
+%% However, to avoid introducing a feature flag, we convert here to the old format.
+parse_consumer_mode(credited, Args) ->
+    OldFormat = {<<"x-credit">>, table, [{<<"credit">>, long, 0},
+                                         {<<"drain">>,  bool, false}]},
+    {0, [OldFormat | Args]};
+parse_consumer_mode({simple_prefetch, PrefetchCount}, Args) ->
+    {PrefetchCount, Args}.
 
 cancel(Q, ConsumerTag, OkMsg, ActingUser, State) ->
     QPid = amqqueue:get_pid(Q),

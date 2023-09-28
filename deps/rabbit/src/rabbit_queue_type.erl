@@ -117,7 +117,7 @@
                           channel_pid := pid(),
                           limiter_pid => pid() | none,
                           limiter_active => boolean(),
-                          prefetch_count => non_neg_integer(),
+                          mode := credited | {simple_prefetch, non_neg_integer()},
                           consumer_tag := rabbit_types:ctag(),
                           exclusive_consume => boolean(),
                           args => rabbit_framing:amqp_table(),
