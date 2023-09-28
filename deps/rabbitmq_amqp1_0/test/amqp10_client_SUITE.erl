@@ -61,7 +61,10 @@ groups() ->
        events,
        sync_get_classic_queue,
        sync_get_quorum_queue,
-       sync_get_stream
+       sync_get_stream,
+       sync_get_2_classic_queue,
+       sync_get_2_quorum_queue,
+       sync_get_2_stream
       ]},
 
      {cluster_size_3, [shuffle],
@@ -978,6 +981,15 @@ target_queues_deleted_accepted(Config) ->
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection).
 
+rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
+    %% Drop q2 and q3.
+    3 = length(Qs),
+    Q1 = lists:filter(fun({Q, _RouteInos}) ->
+                              amqqueue:get_name(Q) =:= rabbit_misc:r(<<"/">>, queue, <<"q1">>)
+                      end, Qs),
+    1 = length(Q1),
+    meck:passthrough([Q1, Msg, Opts, QTypeState]).
+
 %% Set routing key neither in target address nor in message subject.
 no_routing_key(Config) ->
     OpnConf = connection_config(Config),
@@ -1133,14 +1145,94 @@ sync_get(QType, Config) ->
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch).
 
-rabbit_queue_type_deliver_to_q1(Qs, Msg, Opts, QTypeState) ->
-    %% Drop q2 and q3.
-    3 = length(Qs),
-    Q1 = lists:filter(fun({Q, _RouteInos}) ->
-                              amqqueue:get_name(Q) =:= rabbit_misc:r(<<"/">>, queue, <<"q1">>)
-                      end, Qs),
-    1 = length(Q1),
-    meck:passthrough([Q1, Msg, Opts, QTypeState]).
+sync_get_2_classic_queue(Config) ->
+    sync_get_2(<<"classic">>, Config).
+
+sync_get_2_quorum_queue(Config) ->
+    sync_get_2(<<"quorum">>, Config).
+
+sync_get_2_stream(Config) ->
+    sync_get_2(<<"stream">>, Config).
+
+%% Synchronously get 2 messages from queue.
+sync_get_2(QType, Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+
+    %% Attach a sender and a receiver to the queue.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session,
+                       <<"test-receiver">>,
+                       Address,
+                       unsettled),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing attched")
+    end,
+    flush(receiver_attached),
+
+    %% Grant 2 credits to the sending queue.
+    ok = amqp10_client:flow_link_credit(Receiver, 2, never),
+
+    %% Let's send 5 messages to the queue.
+    [ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, true)) ||
+     Bin <- [<<"m1">>, <<"m2">>, <<"m3">>, <<"m4">>, <<"m5">>]],
+
+    %% We should receive exactly 2 messages.
+    receive {amqp10_msg, Receiver, Msg1} -> ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1))
+    after 5000 -> ct:fail("missing m1")
+    end,
+    receive {amqp10_msg, Receiver, Msg2} -> ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2))
+    after 5000 -> ct:fail("missing m2")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive {amqp10_msg, _, _} = Unexp1 -> ct:fail("received unexpected message ~p", [Unexp1])
+    after 50 -> ok
+    end,
+
+    %% Grant 2 more credits to the sending queue.
+    ok = amqp10_client:flow_link_credit(Receiver, 2, never),
+    %% Again, we should receive exactly 2 messages.
+    receive {amqp10_msg, Receiver, Msg3} -> ?assertEqual([<<"m3">>], amqp10_msg:body(Msg3))
+    after 5000 -> ct:fail("missing m3")
+    end,
+    receive {amqp10_msg, Receiver, Msg4} -> ?assertEqual([<<"m4">>], amqp10_msg:body(Msg4))
+    after 5000 -> ct:fail("missing m4")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive {amqp10_msg, _, _} = Unexp2 -> ct:fail("received unexpected message ~p", [Unexp2])
+    after 50 -> ok
+    end,
+
+    %% Grant 2 more credits to the sending queue.
+    ok = amqp10_client:flow_link_credit(Receiver, 2, never),
+
+    %% We should receive the last (5th) message.
+    receive {amqp10_msg, Receiver, Msg5} -> ?assertEqual([<<"m5">>], amqp10_msg:body(Msg5))
+    after 5000 -> ct:fail("missing m5")
+    end,
+
+    ok = amqp10_client:detach_link(Sender),
+    ok = amqp10_client:detach_link(Receiver),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch).
 
 auth_attempt_metrics(Config) ->
     open_and_close_connection(Config),
