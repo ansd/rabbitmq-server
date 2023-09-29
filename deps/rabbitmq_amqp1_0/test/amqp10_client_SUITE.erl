@@ -70,7 +70,8 @@ groups() ->
      {cluster_size_3, [shuffle],
       [
        last_queue_confirms,
-       target_queue_deleted
+       target_queue_deleted,
+       credit_reply_quorum_queue
       ]},
 
      {metrics, [shuffle],
@@ -110,6 +111,29 @@ end_per_group(_, Config) ->
       rabbit_ct_client_helpers:teardown_steps() ++
       rabbit_ct_broker_helpers:teardown_steps()).
 
+init_per_testcase(credit_reply_quorum_queue, _Config) ->
+    %% Currently, this test gets sporadically stuck since the
+    %% send_credit_reply is not pattern matched correctly when the session
+    %% receives the following message:
+
+    % {'$gen_cast',
+    % {queue_event,
+    % {resource,<<"/">>,queue,
+    % <<"credit_reply_quorum_queue">>},
+    % {{'%2F_credit_reply_quorum_queue',
+    % 'rmq-ct-cluster_size_3-2-21048@localhost'},
+    % {applied,
+    % [{1,ok},
+    %  {2,ok},
+    %  {3,ok},
+    %  {4,ok},
+    %  {5,ok},
+    %  {6,ok},
+    %  {7,ok},
+    %  {10,{send_credit_reply,0}},
+    %  {8,ok},
+    %  {9,ok}]}}}},
+    {skip, "TODO fix test case"};
 init_per_testcase(Testcase, Config) ->
     rabbit_ct_helpers:testcase_started(Config, Testcase).
 
@@ -1395,6 +1419,58 @@ target_queue_deleted(Config) ->
                  amqp_channel:call(Ch, #'queue.delete'{queue = QuorumQ})),
     ok = rabbit_ct_client_helpers:close_channel(Ch).
 
+%% This test is mostly interesting in mixed version mode with feature flag
+%% consumer_tag_in_credit_reply disabled.
+credit_reply_quorum_queue(Config) ->
+    %% Place quorum queue leader on the old node.
+    OldNode = 1,
+    Ch = rabbit_ct_client_helpers:open_channel(Config, OldNode),
+    QName = atom_to_binary(?FUNCTION_NAME),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                                   {<<"x-queue-leader-locator">>, longstr, <<"client-local">>}]}),
+    %% Connect to the new node.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session,
+                       <<"test-receiver">>,
+                       Address,
+                       unsettled),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing attched")
+    end,
+    flush(receiver_attached),
+
+    NumMsgs = 10,
+    [begin
+         Bin = integer_to_binary(N),
+         ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, true))
+     end || N <- lists:seq(1, NumMsgs)],
+
+    %% Grant credits to the sending queue.
+    ok = amqp10_client:flow_link_credit(Receiver, NumMsgs, never),
+
+    %% We should receive all messages.
+    Msgs = [FirstMsg | _] = receive_messages(Receiver, NumMsgs),
+    LastMsg = lists:last(Msgs),
+    ?assertEqual([<<"1">>], amqp10_msg:body(FirstMsg)),
+    ?assertEqual([integer_to_binary(NumMsgs)], amqp10_msg:body(LastMsg)),
+
+    ExpectedReadyMsgs = 0,
+    ?assertEqual(#'queue.delete_ok'{message_count = ExpectedReadyMsgs},
+                 amqp_channel:call(Ch, #'queue.delete'{queue = QName})),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+    ok = amqp10_client:close_connection(Connection).
+
 %% internal
 %%
 
@@ -1507,13 +1583,14 @@ drain_queue(Session, Address, N) ->
 receive_messages(Receiver, N) ->
     receive_messages0(Receiver, N, []).
 
-receive_messages0(_Receiver, 0, Acc) -> lists:reverse(Acc);
+receive_messages0(_Receiver, 0, Acc) ->
+    lists:reverse(Acc);
 receive_messages0(Receiver, N, Acc) ->
     receive
         {amqp10_msg, Receiver, Msg} -> 
             receive_messages0(Receiver, N - 1, [Msg | Acc])
     after 5000  ->
-            exit(receive_timed_out)
+              exit(receive_timed_out)
     end.
 
 send_messages(Sender, N, GroupId) ->

@@ -1175,7 +1175,10 @@ handle_queue_actions(Actions, State0) ->
                         handle = ?UINT(Handle),
                         delivery_count = ?UINT(Count),
                         link_credit = ?UINT(0),
-                        %% TODO Why do we set available to 0?
+                        %% TODO Setting available to 0 is wrong.
+                        %% The queue's reply should contain the number of ready messages because
+                        %% even though the queue just drained all available link-credit,
+                        %% there might well still be ready messages in the queue.
                         available = ?UINT(0),
                         drain = true},
               {[Flow | Reply], S};

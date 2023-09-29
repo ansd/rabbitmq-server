@@ -632,6 +632,19 @@ settle(#resource{kind = queue} = QRef, Op, CTag, MsgIds, Ctxs) ->
             end
     end.
 
+%%TODO We should pass here an additional boolean parameter SendCreditReply
+%% which is true if the FLOW's 'echo' field is true.
+%% Because only then should the queue send a credit reply and the AMQP 1.0 session
+%% reply with a FLOW to the AMQP 1.0 client.
+%% This might require a feature flag for classic queues and
+%% a new rabbit_fifo version with a modified #credit{} Ra command for quorum queues.
+%%
+%% TODO We could merge queue actions send_credit_reply and send_drained into a single queue action.
+%% From the point of view of the session proc, they contain the same information (the former with drain=false,
+%% the latter with drain=true) and the session actions are exactly the same: Send a FLOW to the 1.0 client
+%% (respecting the order of deliveries received before and after).
+%% Therefore, the single queue action will contain fields drain, available, consumer_tag, credit.
+%% Only the delivery-count is held in the session process state.
 -spec credit(amqqueue:amqqueue() | queue_name(),
              rabbit_types:ctag(), credit(),
              boolean(), state()) -> {ok, state(), actions()}.
