@@ -22,7 +22,7 @@
          handle_event/3,
          deliver/3,
          settle/5,
-         credit/5,
+         credit/7,
          dequeue/5,
          info/2,
          queue_length/1,
@@ -451,38 +451,42 @@ cancel(_Q, ConsumerTag, OkMsg, ActingUser, #stream_client{readers = Readers0,
             {ok, State}
     end.
 
-credit(QName, CTag, Credit, Drain, #stream_client{readers = Readers0,
-                                                  name = Name,
-                                                  local_pid = LocalPid} = State) ->
-    {Readers1, Msgs} = case Readers0 of
-                          #{CTag := Str0} ->
-                               Str1 = Str0#stream{credit = Credit},
-                               {Str, Msgs0} = stream_entries(QName, Name, LocalPid, Str1),
-                               {Readers0#{CTag => Str}, Msgs0};
-                          _ ->
-                              {Readers0, []}
-                      end,
-    {Readers, Actions} = case Drain of
-                             true ->
-                                 case Readers1 of
-                                     #{CTag := #stream{credit = Credit1} = Str2} ->
-                                         {Readers0#{CTag => Str2#stream{credit = 0}},
-                                          [{send_drained, {CTag, Credit1}}]};
-                                     _ ->
-                                         {Readers1, []}
-                                 end;
-                             false ->
-                                 {Readers1, []}
-                         end,
-    NumMsgs = length(Msgs),
-    %%TODO Available is wrong:
-    %% As an approximation we could query the committed offset and subtract
+credit(QName, CTag, Credit0, Drain, Reply, _LinkStateProperties,
+       #stream_client{readers = Readers0,
+                      name = Name,
+                      local_pid = LocalPid} = State0) ->
+    {Readers, Msgs, Credit} = case Readers0 of
+                                  #{CTag := Str0} ->
+                                      Str1 = Str0#stream{credit = Credit0},
+                                      {Str2 = #stream{credit = Credit1}, Msgs0} = stream_entries(
+                                                                                    QName, Name, LocalPid, Str1),
+                                      Str = case Drain of
+                                                true -> Str2#stream{credit = 0};
+                                                false -> Str2
+                                            end,
+                                      {Readers0#{CTag => Str}, Msgs0, Credit1};
+                                  _ ->
+                                      {Readers0, [], Credit0}
+                              end,
+    State = State0#stream_client{readers = Readers},
+    Actions0 = case Reply orelse
+                    Drain andalso Credit > 0 of
+                   true ->
+                       Available = available_messages(CTag, State),
+                       [{credit_reply, CTag, Credit, Available, Drain, #{}}];
+                   false ->
+                       []
+               end,
+    Actions = case Msgs of
+                  [] -> Actions0;
+                  _ -> [{deliver, CTag, true, Msgs} | Actions0]
+              end,
+    {State, Actions}.
+
+available_messages(_CTag, _State) ->
+    %%TODO As an approximation, query the committed offset and subtract
     %% the (next offset - 1) from that. Both should be cheap to query.
-    Available = NumMsgs,
-    {State#stream_client{readers = Readers},
-     [{deliver, CTag, true, Msgs},
-      {send_credit_reply, CTag, Credit - NumMsgs, Available}
-     ] ++ Actions}.
+    100.
 
 deliver(QSs, Msg, Options) ->
     lists:foldl(

@@ -17,6 +17,8 @@
         is_list(H) orelse
         (is_map(H) andalso is_map_key(size, H))).
 
+-define(DELIVERY_SEND_MSG_OPTS, [local, ra_event]).
+
 -type optimised_tuple(A, B) :: nonempty_improper_list(A, B).
 
 -type option(T) :: undefined | T.

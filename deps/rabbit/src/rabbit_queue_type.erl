@@ -43,7 +43,7 @@
          module/2,
          deliver/4,
          settle/5,
-         credit/5,
+         credit/7,
          dequeue/5,
          fold_state/3,
          is_policy_applicable/2,
@@ -68,9 +68,8 @@
 -type queue_type() :: rabbit_classic_queue | rabbit_quorum_queue | rabbit_stream_queue.
 %% Link credit can be negative, see AMQP 1.0 [2.6.7].
 -type credit() :: integer().
-
--export_type([queue_type/0,
-              credit/0]).
+%% https://www.amqp.org/specification/1.0/link-state-properties
+-type link_state_properties() :: #{binary() => term()}.
 
 -define(STATE, ?MODULE).
 
@@ -88,7 +87,9 @@
     %% fully to the queue
     {settled, Success :: boolean(), [msg_tag()]} |
     {deliver, rabbit_types:ctag(), boolean(), [rabbit_amqqueue:qmsg()]} |
-    {block | unblock, QueueName :: term()}.
+    {block | unblock, QueueName :: term()} |
+    {credit_reply, rabbit_types:ctag(), credit(), Available :: non_neg_integer(),
+     Drain :: boolean(), link_state_properties()}.
 
 -type actions() :: [action()].
 
@@ -113,11 +114,12 @@
 
 -opaque state() :: #?STATE{}.
 
+-type consume_mode() :: credited | {simple_prefetch, non_neg_integer()}.
 -type consume_spec() :: #{no_ack := boolean(),
                           channel_pid := pid(),
                           limiter_pid => pid() | none,
                           limiter_active => boolean(),
-                          mode := credited | {simple_prefetch, non_neg_integer()},
+                          mode := consume_mode(),
                           consumer_tag := rabbit_types:ctag(),
                           exclusive_consume => boolean(),
                           args => rabbit_framing:amqp_table(),
@@ -130,11 +132,15 @@
 -type settle_op() :: 'complete' | 'requeue' | 'discard'.
 
 -export_type([state/0,
+              consume_mode/0,
               consume_spec/0,
               delivery_options/0,
               action/0,
               actions/0,
-              settle_op/0]).
+              settle_op/0,
+              queue_type/0,
+              credit/0,
+              link_state_properties/0]).
 
 -callback is_enabled() -> boolean().
 
@@ -210,8 +216,9 @@
     {queue_state(), actions()} |
     {'protocol_error', Type :: atom(), Reason :: string(), Args :: term()}.
 
--callback credit(queue_name(), rabbit_types:ctag(),
-                 credit(), Drain :: boolean(), queue_state()) ->
+-callback credit(queue_name(), rabbit_types:ctag(), credit(),
+                 Drain :: boolean(), Reply :: boolean(),
+                 link_state_properties(), queue_state()) ->
     {queue_state(), actions()}.
 
 -callback dequeue(queue_name(), NoAck :: boolean(), LimiterPid :: pid(),
@@ -632,26 +639,14 @@ settle(#resource{kind = queue} = QRef, Op, CTag, MsgIds, Ctxs) ->
             end
     end.
 
-%%TODO We should pass here an additional boolean parameter SendCreditReply
-%% which is true if the FLOW's 'echo' field is true.
-%% Because only then should the queue send a credit reply and the AMQP 1.0 session
-%% reply with a FLOW to the AMQP 1.0 client.
-%% This might require a feature flag for classic queues and
-%% a new rabbit_fifo version with a modified #credit{} Ra command for quorum queues.
-%%
-%% TODO We could merge queue actions send_credit_reply and send_drained into a single queue action.
-%% From the point of view of the session proc, they contain the same information (the former with drain=false,
-%% the latter with drain=true) and the session actions are exactly the same: Send a FLOW to the 1.0 client
-%% (respecting the order of deliveries received before and after).
-%% Therefore, the single queue action will contain fields drain, available, consumer_tag, credit.
-%% Only the delivery-count is held in the session process state.
 -spec credit(amqqueue:amqqueue() | queue_name(),
-             rabbit_types:ctag(), credit(),
-             boolean(), state()) -> {ok, state(), actions()}.
-credit(Q, CTag, Credit, Drain, Ctxs) ->
+             rabbit_types:ctag(), credit(), boolean(), boolean(),
+             link_state_properties(), state()) ->
+    {ok, state(), actions()}.
+credit(Q, CTag, Credit, Drain, Reply, Properties, Ctxs) ->
     #ctx{state = State0,
          module = Mod} = Ctx = get_ctx(Q, Ctxs),
-    {State, Actions} = Mod:credit(qref(Q), CTag, Credit, Drain, State0),
+    {State, Actions} = Mod:credit(qref(Q), CTag, Credit, Drain, Reply, Properties, State0),
     {ok, set_ctx(Q, Ctx#ctx{state = State}, Ctxs), Actions}.
 
 -spec dequeue(amqqueue:amqqueue(), boolean(),

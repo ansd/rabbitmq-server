@@ -25,7 +25,7 @@
          delete_immediately/1]).
 -export([state_info/1, info/2, stat/1, infos/1, infos/2]).
 -export([settle/5, dequeue/5, consume/3, cancel/5]).
--export([credit/5]).
+-export([credit/7]).
 -export([purge/1]).
 -export([stateless_deliver/2, deliver/3]).
 -export([dead_letter_publish/5]).
@@ -788,8 +788,12 @@ settle(_QName, requeue, CTag, MsgIds, QState) ->
 settle(_QName, discard, CTag, MsgIds, QState) ->
     rabbit_fifo_client:discard(quorum_ctag(CTag), MsgIds, QState).
 
-credit(_QName, CTag, Credit, Drain, QState) ->
-    rabbit_fifo_client:credit(quorum_ctag(CTag), Credit, Drain, QState).
+-spec credit(rabbit_amqqueue:name(), rabbit_types:ctag(), rabbit_queue_type:credit(),
+             Drain :: boolean(), Reply :: boolean(),
+             rabbit_queue_type:link_state_properties(), rabbit_fifo_client:state()) ->
+    {rabbit_fifo_client:state(), rabbit_queue_type:actions()}.
+credit(_QName, CTag, Credit, Drain, Reply, Properties, QState) ->
+    rabbit_fifo_client:credit(quorum_ctag(CTag), Credit, Drain, Reply, Properties, QState).
 
 -spec dequeue(rabbit_amqqueue:name(), NoAck :: boolean(), pid(),
               rabbit_types:ctag(), rabbit_fifo_client:state()) ->

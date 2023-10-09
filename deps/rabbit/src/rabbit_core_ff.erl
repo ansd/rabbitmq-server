@@ -148,3 +148,9 @@
                          post_enable =>
                          {rabbit_khepri, khepri_db_migration_post_enable}}
      }}).
+
+-rabbit_feature_flag(
+   {credit_api_v2,
+    #{desc          => "Credit API v2 between queue clients and queue processes",
+      stability     => stable
+     }}).

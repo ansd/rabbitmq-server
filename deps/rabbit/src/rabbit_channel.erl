@@ -1710,19 +1710,6 @@ handle_method(#'channel.flow'{active = true}, _, State) ->
 handle_method(#'channel.flow'{active = false}, _, _State) ->
     rabbit_misc:protocol_error(not_implemented, "active=false", []);
 
-handle_method(#'basic.credit'{consumer_tag = CTag,
-                              credit       = Credit,
-                              drain        = Drain},
-              _, State = #ch{consumer_mapping = Consumers,
-                             queue_states = QStates0}) ->
-    case maps:find(CTag, Consumers) of
-        {ok, {Q, _CParams}} ->
-            {ok, QStates, Actions} = rabbit_queue_type:credit(Q, CTag, Credit, Drain, QStates0),
-            {noreply, handle_queue_actions(Actions, State#ch{queue_states = QStates})};
-        error -> rabbit_misc:precondition_failed(
-                   "unknown consumer tag '~ts'", [CTag])
-    end;
-
 handle_method(_MethodRecord, _Content, _State) ->
     rabbit_misc:protocol_error(
       command_invalid, "unimplemented method", []).
@@ -2768,12 +2755,11 @@ handle_consumer_timed_out(Timeout,#pending_ack{delivery_tag = DeliveryTag},
 				[Channel, Timeout], none),
     handle_exception(Ex, State).
 
-handle_queue_actions(Actions, #ch{cfg = #conf{writer_pid = WriterPid}} = State0) ->
+handle_queue_actions(Actions, State) ->
     lists:foldl(
-      fun
-          ({settled, QRef, MsgSeqNos}, S0) ->
+      fun({settled, QRef, MsgSeqNos}, S0) ->
               confirm(MsgSeqNos, QRef, S0);
-          ({rejected, _QRef, MsgSeqNos}, S0) ->
+         ({rejected, _QRef, MsgSeqNos}, S0) ->
               {U, Rej} =
               lists:foldr(
                 fun(SeqNo, {U1, Acc}) ->
@@ -2786,28 +2772,17 @@ handle_queue_actions(Actions, #ch{cfg = #conf{writer_pid = WriterPid}} = State0)
                 end, {S0#ch.unconfirmed, []}, MsgSeqNos),
               S = S0#ch{unconfirmed = U},
               record_rejects(Rej, S);
-          ({deliver, CTag, AckRequired, Msgs}, S0) ->
+         ({deliver, CTag, AckRequired, Msgs}, S0) ->
               handle_deliver(CTag, AckRequired, Msgs, S0);
-          ({queue_down, QRef}, S0) ->
+         ({queue_down, QRef}, S0) ->
               handle_consuming_queue_down_or_eol(QRef, S0);
-          ({block, QName}, S0) ->
+         ({block, QName}, S0) ->
               credit_flow:block(QName),
               S0;
-          ({unblock, QName}, S0) ->
+         ({unblock, QName}, S0) ->
               credit_flow:unblock(QName),
-              S0;
-          %% TODO channel needs to understand this new format if Native AMQP is hidden behind a feature flag
-          % ({send_credit_reply, Ctag, Credit, Avail}, S0) ->
-          ({send_credit_reply, Avail}, S0) ->
-              ok = rabbit_writer:send_command(WriterPid,
-                                              #'basic.credit_ok'{available = Avail}),
-              S0;
-          ({send_drained, {CTag, Credit}}, S0) ->
-              ok = rabbit_writer:send_command(WriterPid,
-                                              #'basic.credit_drained'{consumer_tag = CTag,
-                                                                      credit_drained = Credit}),
               S0
-      end, State0, Actions).
+      end, State, Actions).
 
 handle_eol(QName, State0) ->
     State1 = handle_consuming_queue_down_or_eol(QName, State0),

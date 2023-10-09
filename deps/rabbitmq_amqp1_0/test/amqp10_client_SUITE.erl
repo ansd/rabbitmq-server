@@ -64,7 +64,10 @@ groups() ->
        sync_get_stream,
        sync_get_2_classic_queue,
        sync_get_2_quorum_queue,
-       sync_get_2_stream
+       sync_get_2_stream,
+       timed_get_classic_queue,
+       timed_get_quorum_queue,
+       timed_get_stream
       ]},
 
      {cluster_size_3, [shuffle],
@@ -111,6 +114,16 @@ end_per_group(_, Config) ->
       rabbit_ct_client_helpers:teardown_steps() ++
       rabbit_ct_broker_helpers:teardown_steps()).
 
+init_per_testcase(T = message_headers_conversion, Config) ->
+    case rabbit_ct_broker_helpers:rpc(
+           Config, rabbit_feature_flags, is_enabled, [credit_api_v2]) of
+        true ->
+            rabbit_ct_helpers:testcase_started(Config, T);
+        false ->
+            {skip, "Quorum queues are known to behave incorrectly with feature flag "
+             "credit_api_v2 disabled because they send a send_drained queue event "
+             "before sending all available messages."}
+    end;
 init_per_testcase(credit_reply_quorum_queue, _Config) ->
     %% Currently, this test gets sporadically stuck since the
     %% send_credit_reply is not pattern matched correctly when the session
@@ -1253,6 +1266,78 @@ sync_get_2(QType, Config) ->
 
     ok = amqp10_client:detach_link(Sender),
     ok = amqp10_client:detach_link(Receiver),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch).
+
+timed_get_classic_queue(Config) ->
+    timed_get(<<"classic">>, Config).
+
+timed_get_quorum_queue(Config) ->
+    timed_get(<<"quorum">>, Config).
+
+timed_get_stream(Config) ->
+    timed_get(<<"stream">>, Config).
+
+%% Synchronous get with a timeout
+timed_get(QType, Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+
+    %% Attach a sender and a receiver to the queue.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session,
+                       <<"test-receiver">>,
+                       Address,
+                       unsettled),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing attched")
+    end,
+    flush(receiver_attached),
+
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never, false),
+
+    Timeout = 10,
+    receive Unexpected0 -> ct:fail("received unexpected ~p", [Unexpected0])
+    after Timeout -> ok
+    end,
+
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never, true),
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"my tag">>, <<"my msg">>, true)),
+
+    %% Since our consumer didn't grant any new credit, we shouldn't receive the message we
+    %% just sent.
+    receive Unexpected1 -> ct:fail("received unexpected ~p", [Unexpected1])
+    after 50 -> ok
+    end,
+
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never, true),
+    receive {amqp10_msg, Receiver, Msg1} -> ?assertEqual([<<"my msg">>], amqp10_msg:body(Msg1))
+    after 5000 -> ct:fail("missing 'my msg'")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+
+    ok = amqp10_client:detach_link(Receiver),
+    ok = amqp10_client:detach_link(Sender),
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection),
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),

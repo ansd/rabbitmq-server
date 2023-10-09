@@ -361,7 +361,7 @@ mapped(cast, {#'v1_0.transfer'{handle = {uint, InHandle},
             {next_state, mapped, State1};
         {credit_exhausted, State} ->
             TargetPid ! {amqp10_msg, LinkRef, Msg},
-            ok = notify_link(Link, credit_exhausted),
+            notify_credit_exhausted(Link),
             {next_state, mapped, State};
         {transfer_limit_exceeded, State} ->
             logger:warning("transfer_limit_exceeded for link ~tp", [Link]),
@@ -787,13 +787,23 @@ handle_link_flow(#'v1_0.flow'{delivery_count = MaybeTheirDC,
 
     {ok, Link#link{link_credit = LinkCredit}};
 handle_link_flow(#'v1_0.flow'{delivery_count = TheirDC,
+                              link_credit = {uint, TheirCredit},
                               available = Available,
                               drain = Drain},
-                 Link = #link{role = receiver}) ->
-
-    {ok, Link#link{delivery_count = unpack(TheirDC),
-                   available = unpack(Available),
-                   drain = Drain}}.
+                 Link0 = #link{role = receiver}) ->
+    Link = case Drain andalso TheirCredit =< 0 of
+               true ->
+                   notify_credit_exhausted(Link0),
+                   Link0#link{delivery_count = unpack(TheirDC),
+                              link_credit = 0,
+                              available = unpack(Available),
+                              drain = Drain};
+               false ->
+                   Link0#link{delivery_count = unpack(TheirDC),
+                              available = unpack(Available),
+                              drain = Drain}
+           end,
+    {ok, Link}.
 
 -spec find_link_by_input_handle(link_handle(), #state{}) ->
     {ok, #link{}} | not_found.
@@ -926,12 +936,10 @@ book_transfer_received(Settled,
                          next_incoming_id = NID+1,
                          remote_outgoing_window = ROW-1},
     case Link1 of
-        #link{link_credit = 0,
-              % only notify of credit exhaustion when
-              % not using auto flow.
-              auto_flow = never} ->
+        #link{link_credit = 0 } ->
             {credit_exhausted, State1};
-        _ -> {ok, State1}
+        _ ->
+            {ok, State1}
     end.
 
 auto_flow(#link{link_credit_unsettled = LCU,
@@ -979,6 +987,12 @@ socket_send(Sock, Data) ->
         {error, _Reason} ->
             throw({stop, normal})
     end.
+
+%% Only notify of credit exhaustion when not using auto flow.
+notify_credit_exhausted(Link = #link{auto_flow = never}) ->
+    ok = notify_link(Link, credit_exhausted);
+notify_credit_exhausted(_Link) ->
+    ok.
 
 -dialyzer({no_fail_call, socket_send0/2}).
 socket_send0({tcp, Socket}, Data) ->
@@ -1095,7 +1109,8 @@ handle_link_flow_receiver_test() ->
     Flow = #'v1_0.flow'{handle = {uint, Handle},
                         delivery_count = {uint, SenderDC},
                         available = 99,
-                        drain = true % what to do?
+                        drain = true, % what to do?
+                        link_credit = {uint, 0}
                        },
     {ok, Outcome} = handle_link_flow(Flow, Link),
     % see section 2.6.7

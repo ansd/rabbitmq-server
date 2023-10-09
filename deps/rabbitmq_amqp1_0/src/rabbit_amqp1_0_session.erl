@@ -13,6 +13,7 @@
 -include("rabbit_amqp1_0.hrl").
 
 -define(HIBERNATE_AFTER, 6_000).
+-define(CREDIT_REPLY_TIMEOUT, 30_000).
 -define(MAX_SESSION_WINDOW_SIZE, 65_535).
 -define(DEFAULT_MAX_HANDLE, 16#ffffffff).
 -define(INIT_TXFR_COUNT, 0).
@@ -1150,37 +1151,33 @@ handle_queue_actions(Actions, State0) ->
                                        handle_deliver(CTag, AckRequired, Msg, S)
                                end, S0, Msgs),
               {Reply, S1};
-          ({send_credit_reply, Ctag, LinkCreditSnd, Available},
-           {Reply, S = #state{outgoing_links = OutgoingLinks}}) ->
-              Handle = ctag_to_handle(Ctag),
-              #outgoing_link{delivery_count = DeliveryCountSnd} = maps:get(Handle, OutgoingLinks),
-              Flow = #'v1_0.flow'{
-                        handle = ?UINT(Handle),
-                        delivery_count = ?UINT(DeliveryCountSnd),
-                        link_credit = ?UINT(LinkCreditSnd),
-                        available = ?UINT(Available),
-                        drain = false},
-              {[Flow | Reply], S};
-          ({send_drained, {CTag, CreditDrained}},
+          ({credit_reply, Ctag, Credit0, Available, Drain, _LinkStateProperties},
            {Reply, S0 = #state{outgoing_links = OutgoingLinks0}}) ->
-              Handle = ctag_to_handle(CTag),
+              Handle = ctag_to_handle(Ctag),
+              %%TODO The order of deliveries and credit replies sent by a queue must always be maintained
+              %% when relaying these via TRANSFER and FLOW frames to the 1.0 client.
+              %% Since TRANSFERs are subject to session flow control and buffered we must not yet
+              %% send this FLOW frame.
               Link = #outgoing_link{delivery_count = Count0} = maps:get(Handle, OutgoingLinks0),
-              %%TODO delivery-count is a 32-bit RFC-1982 serial number [2.7.4]
-              Count = Count0 + CreditDrained,
-              OutgoingLinks = maps:update(Handle,
-                                          Link#outgoing_link{delivery_count = Count},
-                                          OutgoingLinks0),
-              S = S0#state{outgoing_links = OutgoingLinks},
+              {Count, Credit, S} = case Drain of
+                                       true ->
+                                           %%TODO delivery-count is a 32-bit RFC-1982 serial number [2.7.4]
+                                           Count1 = Count0 + Credit0,
+                                           OutgoingLinks = maps:update(
+                                                             Handle,
+                                                             Link#outgoing_link{delivery_count = Count1},
+                                                             OutgoingLinks0),
+                                           S1 = S0#state{outgoing_links = OutgoingLinks},
+                                           {Count1, 0, S1};
+                                       false ->
+                                           {Count0, Credit0, S0}
+                                   end,
               Flow = #'v1_0.flow'{
                         handle = ?UINT(Handle),
                         delivery_count = ?UINT(Count),
-                        link_credit = ?UINT(0),
-                        %% TODO Setting available to 0 is wrong.
-                        %% The queue's reply should contain the number of ready messages because
-                        %% even though the queue just drained all available link-credit,
-                        %% there might well still be ready messages in the queue.
-                        available = ?UINT(0),
-                        drain = true},
+                        link_credit = ?UINT(Credit),
+                        available = ?UINT(Available),
+                        drain = Drain},
               {[Flow | Reply], S};
           ({block, _QName}, Acc) ->
               %%TODO
@@ -1440,86 +1437,124 @@ incoming_flow(#incoming_link{ delivery_count = Count }, Handle) ->
                  delivery_count = ?UINT(Count),
                  link_credit    = ?UINT(?INCOMING_CREDIT)}.
 
-%%%%%%%%%%%%%%%%%%%%%
-%%% Outgoing Link %%%
-%%%%%%%%%%%%%%%%%%%%%
-
 handle_outgoing_link_flow_control(
   #outgoing_link{delivery_count = DeliveryCountSnd,
                  queue = QNameBin},
-  #'v1_0.flow'{handle = Handle = ?UINT(HandleInt),
+  #'v1_0.flow'{handle = ?UINT(HandleInt),
                delivery_count = DeliveryCountRcv0,
-               link_credit    = ?UINT(LinkdCreditRcv),
-               drain          = Drain0},
+               link_credit = ?UINT(LinkdCreditRcv),
+               drain = Drain0,
+               echo = Echo0,
+               properties = Properties0},
   #state{vhost = Vhost,
          queue_states = QStates0} = State0) ->
     ?UINT(DeliveryCountRcv) = default(DeliveryCountRcv0, ?UINT(DeliveryCountSnd)),
-    Drain = default(Drain0, false),
     %% See section 2.6.7
     %%TODO use serial number arithmetic since delivery-count is a sequence number
     LinkCreditSnd = DeliveryCountRcv + LinkdCreditRcv - DeliveryCountSnd,
     Ctag = handle_to_ctag(HandleInt),
     QName = rabbit_misc:r(Vhost, queue, QNameBin),
-    {ok, QStates, Actions} = rabbit_queue_type:credit(QName, Ctag, LinkCreditSnd, Drain, QStates0),
+    Drain = default(Drain0, false),
+    Echo = default(Echo0, false),
+    Properties = default(Properties0, #{}),
+    {ok, QStates, Actions} = rabbit_queue_type:credit(
+                               QName, Ctag, LinkCreditSnd,
+                               Drain, Echo, Properties, QStates0),
     State1 = State0#state{queue_states = QStates},
-    {Reply0, State} = handle_queue_actions(Actions, State1),
-    %% TODO Prior to Native AMQP crediting was a synchronous call into the queue processs.
-    %% This means for every received FLOW, a single slow queue will block the entire AMQP Session.
-    %% There is no need to respond with a FLOW unless the 'echo' field is set.
-    %% For the Native AMQP PoC, we keep this synchronous behaviour.
-    %% However, for productive Native AMQP, the queue should include the consumer tag (and link_credit) into
-    %% the credit reply st. the AMQP session can correlate the credit reply to the outgoing link handle and
-    %% (possibly) reply with a FLOW when handling the queue action.
-    %% => add feature flag
-    %% => for backwards compat (when ff disabled) transform below into new queue_event here, and call
-    %% handle_queue_event()
-    Reply = case lists:any(fun(Action) ->
-                                   element(1, Action) =:= send_credit_reply
-                           end, Actions) of
-                true ->
-                    %% stream queue returned send_credit_reply action
-                    Reply0;
-                false ->
-                    Available = receive {'$gen_cast',{queue_event,
-                                                      {resource, Vhost, queue, QNameBin},
-                                                      {send_credit_reply, Avail}}} ->
-                                            %% from classic queue
-                                            Avail;
-                                        {'$gen_cast',{queue_event,
-                                                      {resource, Vhost, queue, QNameBin},
-                                                      {_QuorumQueue,
-                                                       {applied,
-                                                        [{_RaIdx,
-                                                          {send_credit_reply, Avail}}]}}}} ->
-                                            %% from quorum queue queue when Drain=false
-                                            Avail;
-                                        {'$gen_cast',{queue_event,
-                                                      {resource, Vhost, queue, QNameBin},
-                                                      {_QuorumQueue,
-                                                       {applied,
-                                                        [{_RaIdx,
-                                                          {multi,
-                                                           [{send_credit_reply, _Avail0},
-                                                            {send_drained, {Ctag, Avail1}}]}}]}}}} ->
-                                            %% from quorum queue queue when Drain=true
-                                            Avail1
-                                end,
-                    case Available of
-                        -1 ->
-                            %% We don't know - probably because this flow relates
-                            %% to a handle that does not yet exist
-                            %% TODO is this an error?
-                            Reply0;
-                        _  ->
-                            Reply0 ++ #'v1_0.flow'{
-                                         handle         = Handle,
-                                         delivery_count = ?UINT(DeliveryCountSnd),
-                                         link_credit    = ?UINT(LinkCreditSnd),
-                                         available      = ?UINT(Available),
-                                         drain          = Drain}
-                    end
-            end,
-    {ok, Reply, State}.
+    {Replies0, State2} = handle_queue_actions(Actions, State1),
+    case rabbit_feature_flags:is_enabled(credit_api_v2) of
+        true ->
+            %% We'll handle the credit_reply queue event async later
+            %% thanks to the queue event containing the consumer tag.
+            {ok, Replies0, State2};
+        false ->
+            {Replies, State} = process_credit_reply_sync(
+                                 Ctag, QName, LinkCreditSnd, State2),
+            {ok, Replies0 ++ Replies, State}
+    end.
+
+%% The AMQP 0.9.1 credit extension was poorly designed because a consumer granting
+%% credits to a queue has to synchronously wait for a credit reply from the queue:
+%% https://github.com/rabbitmq/rabbitmq-server/blob/b9566f4d02f7ceddd2f267a92d46affd30fb16c8/deps/rabbitmq_codegen/credit_extension.json#L43
+%% This blocks our entire AMQP 1.0 session process. Since the credit reply from the
+%% queue did not contain the consumr tag prior to feature flag credit_api_v2, we
+%% must behave here the same way as non-native AMQP 1.0: We wait until the queue
+%% sends us a credit reply sucht that we can correlate that reply with our consumer tag.
+process_credit_reply_sync(
+  Ctag, QName, Credit, State = #state{queue_states = QStates}) ->
+    case rabbit_queue_type:module(QName, QStates) of
+        {ok, rabbit_classic_queue} ->
+            receive {'$gen_cast',
+                     {queue_event,
+                      QName,
+                      {send_credit_reply, Avail}}} ->
+                        %% Convert to credit_api_v2 action.
+                        Action = {credit_reply, Ctag, Credit, Avail, false, #{}},
+                        handle_queue_actions([Action], State)
+            after ?CREDIT_REPLY_TIMEOUT ->
+                      credit_reply_timeout(classic, QName)
+            end;
+        {ok, rabbit_quorum_queue} ->
+            process_credit_reply_sync_quorum_queue(
+              Ctag, QName, Credit, State, []);
+        {ok, rabbit_stream_queue} ->
+            %% Stream is the exception in that the stream client
+            %% directly returns the credit_reply action.
+            {[], State};
+        {error, not_found} ->
+            {[], State}
+    end.
+
+process_credit_reply_sync_quorum_queue(
+  Ctag, QName, Credit, State0, Replies0) ->
+    receive {'$gen_cast',
+             {queue_event,
+              QName,
+              {QuorumQueue,
+               {applied,
+                Applied0}}}} ->
+
+                {Applied, ReceivedCreditReply}
+                = lists:mapfoldl(
+                    %% Convert v1 send_credit_reply to credit_api_v2 action.
+                    %% Available refers to *after* and Credit refers to *before*
+                    %% quorum queue sends messages.
+                    %% We therefore keep the same wrong behaviour of RabbitMQ 3.x.
+                    fun({RaIdx, {send_credit_reply, Available}}, _) ->
+                            Action = {credit_reply, Ctag, Credit, Available, false, #{}},
+                            {{RaIdx, Action}, true};
+                       ({RaIdx, {multi, [{send_credit_reply, Available},
+                                         {send_drained, _} = SendDrained]}}, _) ->
+                            Action = {credit_reply, Ctag, Credit, Available, false, #{}},
+                            {{RaIdx, {multi, [Action, SendDrained]}}, true};
+                       (E, Acc) ->
+                            {E, Acc}
+                    end, false, Applied0),
+
+                Evt = {queue_event, QName, {QuorumQueue, {applied, Applied}}},
+                %% send_drained action must be processed by
+                %% rabbit_fifo_client to advance the delivery count.
+                {Replies1, State} = handle_queue_event(Evt, State0),
+                Replies = Replies0 ++ Replies1,
+                case ReceivedCreditReply of
+                    true ->
+                        {Replies, State};
+                    false ->
+                        process_credit_reply_sync_quorum_queue(
+                          Ctag, QName, Credit, State, Replies)
+                end
+    after ?CREDIT_REPLY_TIMEOUT ->
+              credit_reply_timeout(quorum, QName)
+    end.
+
+-spec credit_reply_timeout(atom(), rabbit_types:rabbit_amqqueue_name()) ->
+    no_return().
+credit_reply_timeout(QType, QName) ->
+    Fmt = "Timed out waiting for credit reply from ~s ~s. "
+    "Hint: Enable feature flag credit_api_v2",
+    Args = [QType, rabbit_misc:rs(QName)],
+    rabbit_log:error(Fmt, Args),
+    protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR, Fmt, Args).
 
 default(undefined, Default) -> Default;
 default(Thing,    _Default) -> Thing.
