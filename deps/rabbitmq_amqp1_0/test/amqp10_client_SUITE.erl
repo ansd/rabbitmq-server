@@ -67,7 +67,9 @@ groups() ->
        sync_get_2_stream,
        timed_get_classic_queue,
        timed_get_quorum_queue,
-       timed_get_stream
+       timed_get_stream,
+       single_active_consumer_classic_queue,
+       single_active_consumer_quorum_queue
       ]},
 
      {cluster_size_3, [shuffle],
@@ -1284,11 +1286,11 @@ timed_get_stream(Config) ->
 timed_get(QType, Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
 
     %% Attach a sender and a receiver to the queue.
     OpnConf = connection_config(Config),
@@ -1342,6 +1344,97 @@ timed_get(QType, Config) ->
     ok = amqp10_client:close_connection(Connection),
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch).
+
+single_active_consumer_classic_queue(Config) ->
+    single_active_consumer(<<"classic">>, Config).
+
+single_active_consumer_quorum_queue(Config) ->
+    single_active_consumer(<<"quorum">>, Config).
+
+single_active_consumer(QType, Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-single-active-consumer">>, bool, true},
+                                                  {<<"x-queue-type">>, longstr, QType}]}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+
+    %% Attach 1 sender and 2 receivers to the queue.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+
+    %% The 1st consumer will become active.
+    {ok, Receiver1} = amqp10_client:attach_receiver_link(
+                        Session,
+                        <<"test-receiver-1">>,
+                        Address,
+                        unsettled),
+    receive {amqp10_event, {link, Receiver1, attached}} -> ok
+    after 5000 -> ct:fail("missing attched")
+    end,
+    ok = amqp10_client:flow_link_credit(Receiver1, 2, never),
+
+    %% The 2nd consumer will become inactive.
+    {ok, Receiver2} = amqp10_client:attach_receiver_link(
+                        Session,
+                        <<"test-receiver-2">>,
+                        Address,
+                        unsettled),
+    receive {amqp10_event, {link, Receiver2, attached}} -> ok
+    after 5000 -> ct:fail("missing attched")
+    end,
+    ok = amqp10_client:flow_link_credit(Receiver2, 2, never),
+
+    NumMsgs = 5,
+    [begin
+         Bin = integer_to_binary(N),
+         ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, true))
+     end || N <- lists:seq(1, NumMsgs)],
+
+    %% Only the active consumer should receive messages.
+    receive {amqp10_msg, Receiver1, Msg1} -> ?assertEqual([<<"1">>], amqp10_msg:body(Msg1))
+    after 5000 -> ct:fail("missing 1st msg")
+    end,
+    receive {amqp10_msg, Receiver1, Msg2} -> ?assertEqual([<<"2">>], amqp10_msg:body(Msg2))
+    after 5000 -> ct:fail("missing 2nd msg")
+    end,
+    receive {amqp10_event, {link, Receiver1, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive Unexpected0 -> ct:fail("received unexpected ~p", [Unexpected0])
+    after 10 -> ok
+    end,
+
+    %% Cancelling the active consumer should cause the inactive to become active.
+    ok = amqp10_client:detach_link(Receiver1),
+    receive {amqp10_event, {link, Receiver1, {detached, normal}}} -> ok
+    after 5000 -> ct:fail("missing detached")
+    end,
+    receive {amqp10_msg, Receiver2, Msg3} -> ?assertEqual([<<"3">>], amqp10_msg:body(Msg3))
+    after 5000 -> ct:fail("missing 3rd msg")
+    end,
+    receive {amqp10_msg, Receiver2, Msg4} -> ?assertEqual([<<"4">>], amqp10_msg:body(Msg4))
+    after 5000 -> ct:fail("missing 4th msg")
+    end,
+    receive {amqp10_event, {link, Receiver2, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive Unexpected1 -> ct:fail("received unexpected ~p", [Unexpected1])
+    after 10 -> ok
+    end,
+
+    ok = amqp10_client:detach_link(Receiver2),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
+    delete_queue(Config, QName).
 
 auth_attempt_metrics(Config) ->
     open_and_close_connection(Config),

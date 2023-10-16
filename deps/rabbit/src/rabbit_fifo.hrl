@@ -198,7 +198,7 @@
          dlx = rabbit_fifo_dlx:init() :: rabbit_fifo_dlx:state(),
          msg_bytes_enqueue = 0 :: non_neg_integer(),
          msg_bytes_checkout = 0 :: non_neg_integer(),
-         %% waiting consumers, one is picked active consumer is cancelled or dies
+         %% one is picked if active consumer is cancelled or dies
          %% used only when single active consumer is on
          waiting_consumers = [] :: [{consumer_id(), consumer()}],
          last_active :: option(non_neg_integer()),

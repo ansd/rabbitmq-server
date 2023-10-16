@@ -278,7 +278,7 @@ apply(#{index := Idx} = Meta,
             {State00, ok, []}
     end;
 apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
-                    drain = Drain, consumer_id = ConsumerId},
+                    drain = Drain, consumer_id = ConsumerId = {CTag, CPid}},
       #?MODULE{consumers = Cons0,
                service_queue = ServiceQueue0,
                waiting_consumers = Waiting0} = State0) ->
@@ -298,7 +298,6 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
              State2, ok, Effects} = checkout(Meta, State0, State1, []),
             Available = messages_ready(State2),
             CreditReplyV1 = {send_credit_reply, Available},
-            {CTag, CPid} = ConsumerId,
             {RespV1, State} = case Drain andalso PostCred > 0 of
                                   true ->
                                       %% "advance the delivery-count as much as possible, consuming all link-credit"
@@ -332,7 +331,11 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
                     {State, RespV1, Effects}
             end;
         _ when Waiting0 /= [] ->
-            %% there are waiting consuemrs
+            %%TODO next time when we bump the machine version:
+            %% 1. Do not put consumer at head of waiting_consumers if NewCredit == 0
+            %%    to reduce likelihood of activating a 0 credit consumer.
+            %% 2. Support Drain == true, i.e. advance delivery-count, consuming all link-credit since there
+            %%    are no messages available for an inactive consumer and send credit_reply with Drain=true.
             case lists:keytake(ConsumerId, 1, Waiting0) of
                 {value, {_, Con0 = #consumer{delivery_count = DelCnt}}, Waiting} ->
                     %% the consumer is a waiting one
@@ -341,8 +344,17 @@ apply(Meta, #credit{credit = NewCredit, delivery_count = RemoteDelCnt,
                     Con = Con0#consumer{credit = C},
                     State = State0#?MODULE{waiting_consumers =
                                            [{ConsumerId, Con} | Waiting]},
-                    %% TODO send credit_reply for feature flag credit_api_v2
-                    {State, {send_credit_reply, messages_ready(State)}};
+                    %% No messages are available for inactive consumers.
+                    Available = 0,
+                    case rabbit_feature_flags:is_enabled(credit_api_v2) of
+                        true ->
+                            {State, ok,
+                             {send_msg, CPid,
+                              {credit_reply, CTag, C, Available, false, #{}},
+                              ?DELIVERY_SEND_MSG_OPTS}};
+                        false ->
+                            {State, {send_credit_reply, Available}}
+                    end;
                 false ->
                     {State0, ok}
             end;
