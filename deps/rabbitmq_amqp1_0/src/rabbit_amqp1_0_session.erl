@@ -17,7 +17,6 @@
 -define(MAX_SESSION_WINDOW_SIZE, 65_535).
 -define(DEFAULT_MAX_HANDLE, 16#ffffffff).
 -define(INIT_TXFR_COUNT, 0).
--define(DEFAULT_SEND_SETTLED, false).
 %% [3.4]
 -define(OUTCOMES, [?V_1_0_SYMBOL_ACCEPTED,
                    ?V_1_0_SYMBOL_REJECTED,
@@ -560,11 +559,15 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                       outgoing_links = OutgoingLinks0} = State0) ->
 
     ok = validate_attach(Attach),
-    SndSettled = case SndSettleMode of
-                     ?V_1_0_SENDER_SETTLE_MODE_SETTLED -> true;
-                     ?V_1_0_SENDER_SETTLE_MODE_UNSETTLED -> false;
-                     _ -> ?DEFAULT_SEND_SETTLED
-                 end,
+    {SndSettled, EffectiveSndSettleMode}
+    = case SndSettleMode of
+          ?V_1_0_SENDER_SETTLE_MODE_SETTLED ->
+              {true, SndSettleMode};
+          _ ->
+              %% In the future, we might want to support sender settle mode mixed where
+              %% we would expect a settlement from the client only for durable messages.
+              {false, ?V_1_0_SENDER_SETTLE_MODE_UNSETTLED}
+      end,
     case ensure_source(Source, Vhost, User) of
         {ok, QNameBin} ->
             Spec = #{no_ack => SndSettled,
@@ -590,10 +593,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                                                     name = LinkName,
                                                     handle = OutputHandle,
                                                     initial_delivery_count = ?UINT(?INIT_TXFR_COUNT),
-                                                    snd_settle_mode = case SndSettled of
-                                                                          true -> ?V_1_0_SENDER_SETTLE_MODE_SETTLED;
-                                                                          false -> ?V_1_0_SENDER_SETTLE_MODE_UNSETTLED
-                                                                      end,
+                                                    snd_settle_mode = EffectiveSndSettleMode,
                                                     rcv_settle_mode = RcvSettleMode,
                                                     %% The queue process monitors our session process. When our session process terminates
                                                     %% (abnormally) any messages checked out to our session process will be requeued.

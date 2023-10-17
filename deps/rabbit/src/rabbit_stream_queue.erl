@@ -73,6 +73,7 @@
 
 -record(stream, {mode :: rabbit_queue_type:consume_mode(),
                  credit :: rabbit_queue_type:credit(),
+                 ack :: boolean(),
                  start_offset = 0 :: non_neg_integer(),
                  listening_offset = 0 :: non_neg_integer(),
                  log :: undefined | osiris_log:state(),
@@ -268,12 +269,13 @@ format(Q, Ctx) ->
 
 consume(Q, #{mode := {simple_prefetch, 0}}, _)
   when ?amqqueue_is_stream(Q) ->
-    {protocol_error, precondition_failed, "consumer prefetch count is not set for '~ts'",
+    {protocol_error, precondition_failed, "consumer prefetch count is not set for stream ~ts",
      [rabbit_misc:rs(amqqueue:get_name(Q))]};
-consume(Q, #{no_ack := true}, _)
+consume(Q, #{no_ack := true,
+             mode := {simple_prefetch, _}}, _)
   when ?amqqueue_is_stream(Q) ->
     {protocol_error, not_implemented,
-     "automatic acknowledgement not supported by stream queues ~ts",
+     "automatic acknowledgement not supported by stream ~ts",
      [rabbit_misc:rs(amqqueue:get_name(Q))]};
 consume(Q, #{limiter_active := true}, _State)
   when ?amqqueue_is_stream(Q) ->
@@ -309,16 +311,15 @@ consume(Q, Spec,
                                                         {simple_prefetch, C} -> C;
                                                         _ -> 0
                                                     end,
-                            rabbit_core_metrics:consumer_created(ChPid, ConsumerTag,
-                                                                 ExclusiveConsume,
-                                                                 not NoAck, QName,
-                                                                 ConsumerPrefetchCount,
-                                                                 false, up, Args),
+                            AckRequired = not NoAck,
+                            rabbit_core_metrics:consumer_created(
+                              ChPid, ConsumerTag, ExclusiveConsume, AckRequired,
+                              QName, ConsumerPrefetchCount, false, up, Args),
                             %% reply needs to be sent before the stream
                             %% begins sending
                             maybe_send_reply(ChPid, OkMsg),
                             _ = rabbit_stream_coordinator:register_local_member_listener(Q),
-                            begin_stream(QState, ConsumerTag, OffsetSpec, Mode, FilterSpec)
+                            begin_stream(QState, ConsumerTag, OffsetSpec, Mode, AckRequired, FilterSpec)
                     end
             end;
         {undefined, _} ->
@@ -410,7 +411,7 @@ query_local_pid(#stream_client{stream_id = StreamId} = State) ->
 begin_stream(#stream_client{name = QName,
                             readers = Readers0,
                             local_pid = LocalPid} = State,
-             Tag, Offset, Mode, Options)
+             Tag, Offset, Mode, AckRequired, Options)
   when is_pid(LocalPid) ->
     CounterSpec = {{?MODULE, QName, Tag, self()}, []},
     {ok, Seg0} = osiris:init_reader(LocalPid, Offset, CounterSpec, Options),
@@ -429,6 +430,7 @@ begin_stream(#stream_client{name = QName,
              end,
     Str0 = #stream{mode = Mode,
                    credit = Credit,
+                   ack = AckRequired,
                    start_offset = StartOffset,
                    listening_offset = NextOffset,
                    log = Seg0,
@@ -456,31 +458,30 @@ credit(QName, CTag, Credit0, Drain, Reply, _LinkStateProperties,
        #stream_client{readers = Readers0,
                       name = Name,
                       local_pid = LocalPid} = State0) ->
-    {Readers, Msgs, Credit} = case Readers0 of
-                                  #{CTag := Str0} ->
-                                      Str1 = Str0#stream{credit = Credit0},
-                                      {Str2 = #stream{credit = Credit1}, Msgs0} = stream_entries(
-                                                                                    QName, Name, LocalPid, Str1),
-                                      Str = case Drain of
-                                                true -> Str2#stream{credit = 0};
-                                                false -> Str2
-                                            end,
-                                      {Readers0#{CTag => Str}, Msgs0, Credit1};
-                                  _ ->
-                                      {Readers0, [], Credit0}
-                              end,
+    {Readers, DeliverActions, Credit}
+    = case Readers0 of
+          #{CTag := Str0} ->
+              Str1 = Str0#stream{credit = Credit0},
+              {Str2 = #stream{credit = Credit1,
+                              ack = Ack}, Msgs} = stream_entries(
+                                                    QName, Name, LocalPid, Str1),
+              Str = case Drain of
+                        true -> Str2#stream{credit = 0};
+                        false -> Str2
+                    end,
+              {Readers0#{CTag => Str}, [{deliver, CTag, Ack, Msgs}], Credit1};
+          _ ->
+              {Readers0, [], Credit0}
+      end,
     State = State0#stream_client{readers = Readers},
-    Actions0 = case Reply orelse
-                    Drain andalso Credit > 0 of
-                   true ->
-                       Available = available_messages(CTag, State),
-                       [{credit_reply, CTag, Credit, Available, Drain, #{}}];
-                   false ->
-                       []
-               end,
-    Actions = case Msgs of
-                  [] -> Actions0;
-                  _ -> [{deliver, CTag, true, Msgs} | Actions0]
+    Actions = case Reply orelse
+                   Drain andalso Credit > 0 of
+                  true ->
+                      Available = available_messages(CTag, State),
+                      DeliverActions ++
+                      [{credit_reply, CTag, Credit, Available, Drain, #{}}];
+                  false ->
+                      DeliverActions
               end,
     {State, Actions}.
 
@@ -576,15 +577,12 @@ handle_event(QName, {osiris_offset, _From, _Offs},
                                     name = Name}) ->
     %% offset isn't actually needed as we use the atomic to read the
     %% current committed
-    {Readers, TagMsgs} = maps:fold(
+    {Readers, Actions} = maps:fold(
                            fun (Tag, Str0, {Acc, TM}) ->
                                    {Str, Msgs} = stream_entries(QName, Name, LocalPid, Str0),
-                                   {Acc#{Tag => Str}, [{Tag, LocalPid, Msgs} | TM]}
+                                   {Acc#{Tag => Str}, [{deliver, Tag, Str#stream.ack, Msgs} | TM]}
                            end, {#{}, []}, Readers0),
-    Ack = true,
-    Deliveries = [{deliver, Tag, Ack, OffsetMsg}
-                  || {Tag, _LeaderPid, OffsetMsg} <- TagMsgs],
-    {ok, State#stream_client{readers = Readers}, Deliveries};
+    {ok, State#stream_client{readers = Readers}, Actions};
 handle_event(_QName, {stream_leader_change, Pid}, State) ->
     {ok, update_leader_pid(Pid, State), []};
 handle_event(_QName, {stream_local_member_change, Pid}, #stream_client{local_pid = P} = State)
@@ -631,6 +629,7 @@ settle(QName, _, CTag, MsgIds, #stream_client{readers = Readers0,
                                               name = Name} = State) ->
     case Readers0 of
         #{CTag := #stream{mode = {simple_prefetch, _MaxCredit},
+                          ack = Ack,
                           credit = Credit0} = Str0} ->
             %% all settle reasons will "give credit" to the stream queue
             Credit = length(MsgIds),
@@ -638,7 +637,7 @@ settle(QName, _, CTag, MsgIds, #stream_client{readers = Readers0,
             {Str, Msgs} = stream_entries(QName, Name, LocalPid, Str1),
             Readers = maps:update(CTag, Str, Readers0),
             {State#stream_client{readers = Readers},
-             [{deliver, CTag, true, Msgs}]};
+             [{deliver, CTag, Ack, Msgs}]};
         _ ->
             {State, []}
     end.

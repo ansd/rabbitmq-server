@@ -59,12 +59,15 @@ groups() ->
        target_queues_deleted_accepted,
        no_routing_key,
        events,
-       sync_get_classic_queue,
-       sync_get_quorum_queue,
-       sync_get_stream,
-       sync_get_2_classic_queue,
-       sync_get_2_quorum_queue,
-       sync_get_2_stream,
+       sync_get_unsettled_classic_queue,
+       sync_get_unsettled_quorum_queue,
+       sync_get_unsettled_stream,
+       sync_get_unsettled_2_classic_queue,
+       sync_get_unsettled_2_quorum_queue,
+       sync_get_unsettled_2_stream,
+       sync_get_settled_classic_queue,
+       sync_get_settled_quorum_queue,
+       sync_get_settled_stream,
        timed_get_classic_queue,
        timed_get_quorum_queue,
        timed_get_stream,
@@ -1089,17 +1092,18 @@ events(Config) ->
        ClientProperties],
       E2).
 
-sync_get_classic_queue(Config) ->
-    sync_get(<<"classic">>, Config).
+sync_get_unsettled_classic_queue(Config) ->
+    sync_get_unsettled(<<"classic">>, Config).
 
-sync_get_quorum_queue(Config) ->
-    sync_get(<<"quorum">>, Config).
+sync_get_unsettled_quorum_queue(Config) ->
+    sync_get_unsettled(<<"quorum">>, Config).
 
-sync_get_stream(Config) ->
-    sync_get(<<"stream">>, Config).
+sync_get_unsettled_stream(Config) ->
+    sync_get_unsettled(<<"stream">>, Config).
 
-%% Test synchronous get, figure 2.43
-sync_get(QType, Config) ->
+%% Test synchronous get, figure 2.43 with sender settle mode unsettled.
+sync_get_unsettled(QType, Config) ->
+    SenderSettleMode = unsettled,
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
     #'queue.declare_ok'{} =  amqp_channel:call(
@@ -1108,7 +1112,7 @@ sync_get(QType, Config) ->
                                       durable = true,
                                       arguments = [{<<"x-queue-type">>, longstr, QType}]}),
 
-    %% Attach a sender and a receiver to the queue.
+    %% Attach 1 sender and 1 receiver to the queue.
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
     {ok, Session} = amqp10_client:begin_session_sync(Connection),
@@ -1117,12 +1121,9 @@ sync_get(QType, Config) ->
                      Session, <<"test-sender">>, Address),
     ok = wait_for_credit(Sender),
     {ok, Receiver} = amqp10_client:attach_receiver_link(
-                       Session,
-                       <<"test-receiver">>,
-                       Address,
-                       unsettled),
+                       Session, <<"test-receiver">>, Address, SenderSettleMode),
     receive {amqp10_event, {link, Receiver, attached}} -> ok
-    after 5000 -> ct:fail("missing attched")
+    after 5000 -> ct:fail("missing attached")
     end,
     flush(receiver_attached),
 
@@ -1131,7 +1132,7 @@ sync_get(QType, Config) ->
 
     %% Since the queue has no messages yet, we shouldn't receive any message.
     receive {amqp10_msg, _, _} = Unexp1 -> ct:fail("received unexpected message ~p", [Unexp1])
-    after 20 -> ok
+    after 10 -> ok
     end,
 
     %% Let's send 4 messages to the queue.
@@ -1150,7 +1151,7 @@ sync_get(QType, Config) ->
     after 5000 -> ct:fail("expected credit_exhausted")
     end,
     receive {amqp10_msg, _, _} = Unexp2 -> ct:fail("received unexpected message ~p", [Unexp2])
-    after 20 -> ok
+    after 10 -> ok
     end,
 
     %% Synchronously get the 2nd message.
@@ -1164,7 +1165,7 @@ sync_get(QType, Config) ->
     after 5000 -> ct:fail("expected credit_exhausted")
     end,
     receive {amqp10_msg, _, _} = Unexp3 -> ct:fail("received unexpected message ~p", [Unexp3])
-    after 20 -> ok
+    after 10 -> ok
     end,
 
     %% Accept the first 2 messages.
@@ -1172,7 +1173,7 @@ sync_get(QType, Config) ->
     ok = amqp10_client:accept_msg(Receiver, M2),
     %% Settlements should not top up credit. We are still out of credits.
     receive {amqp10_msg, _, _} = Unexp4 -> ct:fail("received unexpected message ~p", [Unexp4])
-    after 20 -> ok
+    after 10 -> ok
     end,
 
     %% Synchronously get the 3rd message.
@@ -1185,7 +1186,7 @@ sync_get(QType, Config) ->
     after 5000 -> ct:fail("expected credit_exhausted")
     end,
     receive {amqp10_msg, _, _} = Unexp5 -> ct:fail("received unexpected message ~p", [Unexp5])
-    after 20 -> ok
+    after 10 -> ok
     end,
 
     ok = amqp10_client:detach_link(Sender),
@@ -1195,17 +1196,18 @@ sync_get(QType, Config) ->
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch).
 
-sync_get_2_classic_queue(Config) ->
-    sync_get_2(<<"classic">>, Config).
+sync_get_unsettled_2_classic_queue(Config) ->
+    sync_get_unsettled_2(<<"classic">>, Config).
 
-sync_get_2_quorum_queue(Config) ->
-    sync_get_2(<<"quorum">>, Config).
+sync_get_unsettled_2_quorum_queue(Config) ->
+    sync_get_unsettled_2(<<"quorum">>, Config).
 
-sync_get_2_stream(Config) ->
-    sync_get_2(<<"stream">>, Config).
+sync_get_unsettled_2_stream(Config) ->
+    sync_get_unsettled_2(<<"stream">>, Config).
 
 %% Synchronously get 2 messages from queue.
-sync_get_2(QType, Config) ->
+sync_get_unsettled_2(QType, Config) ->
+    SenderSettleMode = unsettled,
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
     #'queue.declare_ok'{} =  amqp_channel:call(
@@ -1226,9 +1228,9 @@ sync_get_2(QType, Config) ->
                        Session,
                        <<"test-receiver">>,
                        Address,
-                       unsettled),
+                       SenderSettleMode),
     receive {amqp10_event, {link, Receiver, attached}} -> ok
-    after 5000 -> ct:fail("missing attched")
+    after 5000 -> ct:fail("missing attached")
     end,
     flush(receiver_attached),
 
@@ -1284,6 +1286,86 @@ sync_get_2(QType, Config) ->
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch).
 
+sync_get_settled_classic_queue(Config) ->
+    sync_get_settled(<<"classic">>, Config).
+
+sync_get_settled_quorum_queue(Config) ->
+    sync_get_settled(<<"quorum">>, Config).
+
+sync_get_settled_stream(Config) ->
+    sync_get_settled(<<"stream">>, Config).
+
+%% Test synchronous get, figure 2.43 with sender settle mode settled.
+sync_get_settled(QType, Config) ->
+    SenderSettleMode = settled,
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+
+    %% Attach 1 sender and 1 receivers to the queue.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"my receiver">>, Address, SenderSettleMode),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing attached")
+    end,
+    flush(receiver_attached),
+
+    %% Grant 1 credit to the sending queue.
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never),
+
+    %% Since the queue has no messages yet, we shouldn't receive any message.
+    receive {amqp10_msg, _, _} = Unexp1 -> ct:fail("received unexpected message ~p", [Unexp1])
+    after 10 -> ok
+    end,
+
+    %% Let's send 3 messages to the queue.
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag1">>, <<"m1">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag2">>, <<"m2">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag3">>, <<"m3">>, true)),
+
+    %% Since we previously granted only 1 credit, we should get only the 1st message.
+    receive {amqp10_msg, Receiver, Msg1} ->
+                ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1))
+    after 5000 -> ct:fail("missing m1")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive {amqp10_msg, _, _} = Unexp2 -> ct:fail("received unexpected message ~p", [Unexp2])
+    after 10 -> ok
+    end,
+
+    %% Synchronously get the 2nd message.
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never),
+    receive {amqp10_msg, Receiver, Msg2} ->
+                ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2))
+    after 5000 -> ct:fail("missing m2")
+    end,
+    receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
+    after 5000 -> ct:fail("expected credit_exhausted")
+    end,
+    receive {amqp10_msg, _, _} = Unexp3 -> ct:fail("received unexpected message ~p", [Unexp3])
+    after 10 -> ok
+    end,
+
+    ok = amqp10_client:detach_link(Sender),
+    ok = amqp10_client:detach_link(Receiver),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch).
+
 timed_get_classic_queue(Config) ->
     timed_get(<<"classic">>, Config).
 
@@ -1317,7 +1399,7 @@ timed_get(QType, Config) ->
                        Address,
                        unsettled),
     receive {amqp10_event, {link, Receiver, attached}} -> ok
-    after 5000 -> ct:fail("missing attched")
+    after 5000 -> ct:fail("missing attached")
     end,
     flush(receiver_attached),
 
@@ -1389,7 +1471,7 @@ single_active_consumer(QType, Config) ->
                         Address,
                         unsettled),
     receive {amqp10_event, {link, Receiver1, attached}} -> ok
-    after 5000 -> ct:fail("missing attched")
+    after 5000 -> ct:fail("missing attached")
     end,
     ok = amqp10_client:flow_link_credit(Receiver1, 2, never),
 
@@ -1400,7 +1482,7 @@ single_active_consumer(QType, Config) ->
                         Address,
                         unsettled),
     receive {amqp10_event, {link, Receiver2, attached}} -> ok
-    after 5000 -> ct:fail("missing attched")
+    after 5000 -> ct:fail("missing attached")
     end,
     ok = amqp10_client:flow_link_credit(Receiver2, 2, never),
 
@@ -1635,7 +1717,7 @@ credit_reply_quorum_queue(Config) ->
                        Address,
                        unsettled),
     receive {amqp10_event, {link, Receiver, attached}} -> ok
-    after 5000 -> ct:fail("missing attched")
+    after 5000 -> ct:fail("missing attached")
     end,
     flush(receiver_attached),
 
