@@ -1131,37 +1131,48 @@ sync_get(QType, Config) ->
 
     %% Since the queue has no messages yet, we shouldn't receive any message.
     receive {amqp10_msg, _, _} = Unexp1 -> ct:fail("received unexpected message ~p", [Unexp1])
-    after 50 -> ok
+    after 20 -> ok
     end,
 
-    %% Let's send 3 messages to the queue.
+    %% Let's send 4 messages to the queue.
     ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag1">>, <<"m1">>, true)),
     ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag2">>, <<"m2">>, true)),
     ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag3">>, <<"m3">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag4">>, <<"m4">>, true)),
 
     %% Since we previously granted only 1 credit, we should get only the 1st message.
-    receive {amqp10_msg, Receiver, Msg1} ->
-                ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1))
-    after 5000 -> ct:fail("missing m1")
-    end,
+    M1 = receive {amqp10_msg, Receiver, Msg1} ->
+                     ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1)),
+                     Msg1
+         after 5000 -> ct:fail("missing m1")
+         end,
     receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
     after 5000 -> ct:fail("expected credit_exhausted")
     end,
     receive {amqp10_msg, _, _} = Unexp2 -> ct:fail("received unexpected message ~p", [Unexp2])
-    after 50 -> ok
+    after 20 -> ok
     end,
 
     %% Synchronously get the 2nd message.
     ok = amqp10_client:flow_link_credit(Receiver, 1, never),
-    receive {amqp10_msg, Receiver, Msg2} ->
-                ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2))
-    after 5000 -> ct:fail("missing m2")
-    end,
+    M2 = receive {amqp10_msg, Receiver, Msg2} ->
+                     ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2)),
+                     Msg2
+         after 5000 -> ct:fail("missing m2")
+         end,
     receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
     after 5000 -> ct:fail("expected credit_exhausted")
     end,
     receive {amqp10_msg, _, _} = Unexp3 -> ct:fail("received unexpected message ~p", [Unexp3])
-    after 50 -> ok
+    after 20 -> ok
+    end,
+
+    %% Accept the first 2 messages.
+    ok = amqp10_client:accept_msg(Receiver, M1),
+    ok = amqp10_client:accept_msg(Receiver, M2),
+    %% Settlements should not top up credit. We are still out of credits.
+    receive {amqp10_msg, _, _} = Unexp4 -> ct:fail("received unexpected message ~p", [Unexp4])
+    after 20 -> ok
     end,
 
     %% Synchronously get the 3rd message.
@@ -1173,8 +1184,8 @@ sync_get(QType, Config) ->
     receive {amqp10_event, {link, Receiver, credit_exhausted}} -> ok
     after 5000 -> ct:fail("expected credit_exhausted")
     end,
-    receive {amqp10_msg, _, _} = Unexp4 -> ct:fail("received unexpected message ~p", [Unexp4])
-    after 50 -> ok
+    receive {amqp10_msg, _, _} = Unexp5 -> ct:fail("received unexpected message ~p", [Unexp5])
+    after 20 -> ok
     end,
 
     ok = amqp10_client:detach_link(Sender),

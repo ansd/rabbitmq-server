@@ -71,7 +71,8 @@
 -type msg_id() :: non_neg_integer().
 -type msg() :: term(). %% TODO: refine
 
--record(stream, {credit :: integer(),
+-record(stream, {mode :: rabbit_queue_type:consume_mode(),
+                 credit :: rabbit_queue_type:credit(),
                  start_offset = 0 :: non_neg_integer(),
                  listening_offset = 0 :: non_neg_integer(),
                  log :: undefined | osiris_log:state(),
@@ -426,13 +427,13 @@ begin_stream(#stream_client{name = QName,
                  {simple_prefetch, N} -> N;
                  credited -> 0
              end,
-    Str0 = #stream{credit = Credit,
+    Str0 = #stream{mode = Mode,
+                   credit = Credit,
                    start_offset = StartOffset,
                    listening_offset = NextOffset,
                    log = Seg0,
                    reader_options = Options},
-    {ok, State#stream_client{local_pid = LocalPid,
-                             readers = Readers0#{Tag => Str0}}}.
+    {ok, State#stream_client{readers = Readers0#{Tag => Str0}}}.
 
 cancel(_Q, ConsumerTag, OkMsg, ActingUser, #stream_client{readers = Readers0,
                                                           name = QName} = State) ->
@@ -626,20 +627,21 @@ recover(_VHost, Queues) ->
       end, {[], []}, Queues).
 
 settle(QName, _, CTag, MsgIds, #stream_client{readers = Readers0,
-                                                     local_pid = LocalPid,
-                                                     name = Name} = State) ->
-    %% all settle reasons will "give credit" to the stream queue
-    Credit = length(MsgIds),
-    {Readers, Msgs} = case Readers0 of
-                          #{CTag := #stream{credit = Credit0} = Str0} ->
-                              Str1 = Str0#stream{credit = Credit0 + Credit},
-                              %%TODO settle shouldn't directly increase credit?
-                              {Str, Msgs0} = stream_entries(QName, Name, LocalPid, Str1),
-                              {Readers0#{CTag => Str}, Msgs0};
-                          _ ->
-                              {Readers0, []}
-                      end,
-    {State#stream_client{readers = Readers}, [{deliver, CTag, true, Msgs}]}.
+                                              local_pid = LocalPid,
+                                              name = Name} = State) ->
+    case Readers0 of
+        #{CTag := #stream{mode = {simple_prefetch, _MaxCredit},
+                          credit = Credit0} = Str0} ->
+            %% all settle reasons will "give credit" to the stream queue
+            Credit = length(MsgIds),
+            Str1 = Str0#stream{credit = Credit0 + Credit},
+            {Str, Msgs} = stream_entries(QName, Name, LocalPid, Str1),
+            Readers = maps:update(CTag, Str, Readers0),
+            {State#stream_client{readers = Readers},
+             [{deliver, CTag, true, Msgs}]};
+        _ ->
+            {State, []}
+    end.
 
 info(Q, all_keys) ->
     info(Q, ?INFO_KEYS);
