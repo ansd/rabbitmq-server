@@ -323,7 +323,11 @@ flow_link_credit(Ref, Credit, RenewWhenBelow) ->
                        Drain :: boolean()) -> ok.
 flow_link_credit(#link_ref{role = receiver, session = Session,
                            link_handle = Handle},
-                 Credit, RenewWhenBelow, Drain) ->
+                 Credit, RenewWhenBelow, Drain)
+  when RenewWhenBelow =:= never orelse
+       is_integer(RenewWhenBelow) andalso
+       RenewWhenBelow > 0 andalso
+       RenewWhenBelow =< Credit ->
     Flow = #'v1_0.flow'{link_credit = {uint, Credit},
                         drain = Drain},
     ok = amqp10_client_session:flow(Session, Handle, Flow, RenewWhenBelow).

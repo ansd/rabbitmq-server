@@ -79,7 +79,13 @@ groups() ->
       [
        last_queue_confirms,
        target_queue_deleted,
-       credit_reply_quorum_queue
+       credit_reply_quorum_queue,
+       async_notify_settled_classic_queue,
+       async_notify_settled_quorum_queue,
+       async_notify_settled_stream,
+       async_notify_unsettled_classic_queue,
+       async_notify_unsettled_quorum_queue,
+       async_notify_unsettled_stream
       ]},
 
      {metrics, [shuffle],
@@ -1677,8 +1683,8 @@ target_queue_deleted(Config) ->
 %% consumer_tag_in_credit_reply disabled.
 credit_reply_quorum_queue(Config) ->
     %% Place quorum queue leader on the old version node.
-    OldNode = 1,
-    Ch = rabbit_ct_client_helpers:open_channel(Config, OldNode),
+    OldVersionNode = 1,
+    Ch = rabbit_ct_client_helpers:open_channel(Config, OldVersionNode),
     QName = atom_to_binary(?FUNCTION_NAME),
     #'queue.declare_ok'{} =  amqp_channel:call(
                                Ch, #'queue.declare'{
@@ -1723,6 +1729,89 @@ credit_reply_quorum_queue(Config) ->
     ExpectedReadyMsgs = 0,
     ?assertEqual(#'queue.delete_ok'{message_count = ExpectedReadyMsgs},
                  amqp_channel:call(Ch, #'queue.delete'{queue = QName})),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+    ok = amqp10_client:close_connection(Connection).
+
+async_notify_settled_classic_queue(Config) ->
+    async_notify(settled, <<"classic">>, Config).
+
+async_notify_settled_quorum_queue(Config) ->
+    async_notify(settled, <<"quorum">>, Config).
+
+async_notify_settled_stream(Config) ->
+    async_notify(settled, <<"stream">>, Config).
+
+async_notify_unsettled_classic_queue(Config) ->
+    async_notify(unsettled, <<"classic">>, Config).
+
+async_notify_unsettled_quorum_queue(Config) ->
+    async_notify(unsettled, <<"quorum">>, Config).
+
+async_notify_unsettled_stream(Config) ->
+    async_notify(unsettled, <<"stream">>, Config).
+
+%% Test asynchronous notification, figure 2.45.
+async_notify(SenderSettleMode, QType, Config) ->
+    Ch = rabbit_ct_client_helpers:open_channel(Config, 1),
+    QName = atom_to_binary(?FUNCTION_NAME),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+
+    %% Attach 1 sender and 1 receiver to the queue.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"test-receiver">>, Address, SenderSettleMode),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing attached")
+    end,
+    flush(receiver_attached),
+
+    %% Initially, grant 10 credits to the sending queue.
+    %% Whenever credits drops below 5, renew back to 10.
+    ok = amqp10_client:flow_link_credit(Receiver, 10, 5),
+
+    %% Let's send 30 messages to the queue.
+    NumMsgs = 30,
+    [begin
+         Bin = integer_to_binary(N),
+         ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, true))
+     end || N <- lists:seq(1, NumMsgs)],
+
+    %% We should receive all messages.
+    Msgs = receive_messages(Receiver, NumMsgs),
+    FirstMsg = hd(Msgs),
+    LastMsg = lists:last(Msgs),
+    ?assertEqual([<<"1">>], amqp10_msg:body(FirstMsg)),
+    ?assertEqual([integer_to_binary(NumMsgs)], amqp10_msg:body(LastMsg)),
+
+    case SenderSettleMode of
+        settled ->
+            ok;
+        unsettled ->
+            ok = amqp10_client_session:disposition(
+                   Session,
+                   receiver,
+                   amqp10_msg:delivery_id(FirstMsg),
+                   amqp10_msg:delivery_id(LastMsg),
+                   true,
+                   accepted)
+    end,
+
+    %% No further messages should be delivered.
+    receive Unexpected -> ct:fail({received_unexpected_message, Unexpected})
+    after 50 -> ok
+    end,
+
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch),
     ok = amqp10_client:close_connection(Connection).
 
@@ -1845,7 +1934,7 @@ receive_messages0(Receiver, N, Acc) ->
         {amqp10_msg, Receiver, Msg} -> 
             receive_messages0(Receiver, N - 1, [Msg | Acc])
     after 5000  ->
-              exit(receive_timed_out)
+              exit({timeout, {num_received, length(Acc)}, {num_missing, N}})
     end.
 
 send_messages(Sender, N, GroupId) ->

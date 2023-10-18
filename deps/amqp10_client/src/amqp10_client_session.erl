@@ -108,7 +108,6 @@
          target :: link_target(),
          delivery_count = 0 :: non_neg_integer(),
          link_credit = 0 :: non_neg_integer(),
-         link_credit_unsettled = 0 :: non_neg_integer(),
          available = 0 :: non_neg_integer(),
          drain = false :: boolean(),
          partial_transfers :: undefined | {#'v1_0.transfer'{}, [binary()]},
@@ -336,7 +335,7 @@ mapped(cast, {#'v1_0.transfer'{handle = {uint, InHandle},
                ref = LinkRef} = Link0} =
         find_link_by_input_handle(InHandle, State0),
 
-    {Transfer, Payload, Link} = complete_partial_transfer(Transfer0, Payload0, Link0),
+    {Transfer, Payload, Link1} = complete_partial_transfer(Transfer0, Payload0, Link0),
     Msg = decode_as_msg(Transfer, Payload),
 
     % stash the DeliveryId - not sure for what yet
@@ -351,23 +350,22 @@ mapped(cast, {#'v1_0.transfer'{handle = {uint, InHandle},
     % notify when credit is exhausted (link_credit = 0)
     % detach the Link with a transfer-limit-exceeded error code if further
     % transfers are received
-    case book_transfer_received(Settled,
-                                State0#state{incoming_unsettled = Unsettled},
-                                Link) of
-        {ok, State} ->
+    case book_transfer_received(State0#state{incoming_unsettled = Unsettled},
+                                Link1) of
+        {ok, Link2, State} ->
             % deliver
             TargetPid ! {amqp10_msg, LinkRef, Msg},
-            State1 = auto_flow(Link, State),
+            State1 = auto_flow(Link2, State),
             {next_state, mapped, State1};
-        {credit_exhausted, State} ->
+        {credit_exhausted, Link2, State} ->
             TargetPid ! {amqp10_msg, LinkRef, Msg},
-            notify_credit_exhausted(Link),
+            notify_credit_exhausted(Link2),
             {next_state, mapped, State};
-        {transfer_limit_exceeded, State} ->
-            logger:warning("transfer_limit_exceeded for link ~tp", [Link]),
-            Link1 = detach_with_error_cond(Link, State,
+        {transfer_limit_exceeded, Link2, State} ->
+            logger:warning("transfer_limit_exceeded for link ~tp", [Link2]),
+            Link = detach_with_error_cond(Link2, State,
                                            ?V_1_0_LINK_ERROR_TRANSFER_LIMIT_EXCEEDED),
-            {next_state, mapped, update_link(Link1, State)}
+            {next_state, mapped, update_link(Link, State)}
     end;
 
 
@@ -449,35 +447,18 @@ mapped({call, From},
 
 mapped({call, From},
        {disposition, Role, First, Last, Settled0, DeliveryState},
-       #state{incoming_unsettled = Unsettled0,
-              links = Links0} = State0) ->
-    Disposition =
-    begin
-        DS = translate_delivery_state(DeliveryState),
-        #'v1_0.disposition'{role = translate_role(Role),
-                            first = {uint, First},
-                            last = {uint, Last},
-                            settled = Settled0,
-                            state = DS}
-    end,
-
+       #state{incoming_unsettled = Unsettled0} = State0) ->
     Ks = lists:seq(First, Last),
-    Settled = maps:values(maps:with(Ks, Unsettled0)),
-    Links = lists:foldl(fun (H, Acc) ->
-                                #{H := #link{link_credit_unsettled = LCU} = L} = Acc,
-                                Acc#{H => L#link{link_credit_unsettled = LCU-1}}
-                        end, Links0, Settled),
     Unsettled = maps:without(Ks, Unsettled0),
-    State = lists:foldl(fun(H, S) ->
-                                #{H := L} = Links,
-                                auto_flow(L, S)
-                        end,
-                        State0#state{incoming_unsettled = Unsettled,
-                                     links = Links},
-                        lists:usort(Settled)),
+    State = State0#state{incoming_unsettled = Unsettled},
 
+    Disposition = #'v1_0.disposition'{
+                     role = translate_role(Role),
+                     first = {uint, First},
+                     last = {uint, Last},
+                     settled = Settled0,
+                     state = translate_delivery_state(DeliveryState)},
     Res = send(Disposition, State),
-
     {keep_state, State, [{reply, From, Res}]};
 
 mapped({call, From}, {attach, Attach}, State) ->
@@ -580,8 +561,7 @@ send_flow(Send, OutHandle,
     #{OutHandle := #link{output_handle = H,
                          role = receiver,
                          delivery_count = DeliveryCount,
-                         available = Available,
-                         link_credit_unsettled = LCU} = Link} = Links,
+                         available = Available} = Link} = Links,
     Flow = Flow0#'v1_0.flow'{handle = uint(H),
                              link_credit = uint(Credit),
                              next_incoming_id = uint(NII),
@@ -593,9 +573,6 @@ send_flow(Send, OutHandle,
     ok = Send(Flow, State),
     State#state{links = Links#{OutHandle =>
                                Link#link{link_credit = Credit,
-                                         % need to add on the current LCU
-                                         % to ensure we don't overcredit
-                                         link_credit_unsettled = LCU + Credit,
                                          auto_flow = AutoFlow}}}.
 
 build_frames(Channel, Trf, Bin, MaxPayloadSize, Acc)
@@ -911,45 +888,36 @@ book_partial_transfer_received(#state{next_incoming_id = NID,
     State#state{next_incoming_id = NID+1,
                 remote_outgoing_window = ROW-1}.
 
-book_transfer_received(_Settled,
-                       State = #state{connection_config =
+book_transfer_received(State = #state{connection_config =
                                       #{transfer_limit_margin := Margin}},
-                       #link{link_credit = Margin}) ->
-    {transfer_limit_exceeded, State};
-book_transfer_received(Settled,
-                       #state{next_incoming_id = NID,
+                       #link{link_credit = Margin} = Link) ->
+    {transfer_limit_exceeded, Link, State};
+book_transfer_received(#state{next_incoming_id = NID,
                               remote_outgoing_window = ROW,
                               links = Links} = State,
                        #link{output_handle = OutHandle,
                              delivery_count = DC,
-                             link_credit = LC,
-                             link_credit_unsettled = LCU0} = Link) ->
-    LCU = case Settled of
-              true -> LCU0-1;
-              _ -> LCU0
-          end,
-
+                             link_credit = LC} = Link) ->
     Link1 = Link#link{delivery_count = DC+1,
-                      link_credit = LC-1,
-                      link_credit_unsettled = LCU},
+                      link_credit = LC-1},
     State1 = State#state{links = Links#{OutHandle => Link1},
                          next_incoming_id = NID+1,
                          remote_outgoing_window = ROW-1},
     case Link1 of
         #link{link_credit = 0 } ->
-            {credit_exhausted, State1};
+            {credit_exhausted, Link1, State1};
         _ ->
-            {ok, State1}
+            {ok, Link1, State1}
     end.
 
-auto_flow(#link{link_credit_unsettled = LCU,
+auto_flow(#link{link_credit = LC,
                 auto_flow = {auto, Limit, Credit},
                 output_handle = OutHandle}, State)
-  when LCU =< Limit ->
+  when LC < Limit ->
     send_flow(fun send/2, OutHandle,
               #'v1_0.flow'{link_credit = {uint, Credit}},
               Limit, State);
-auto_flow(_Link, State) ->
+auto_flow(_, State) ->
     State.
 
 update_link(Link = #link{output_handle = OutHandle},
