@@ -129,29 +129,6 @@ init_per_testcase(T = message_headers_conversion, Config) ->
              "credit_api_v2 disabled because they send a send_drained queue event "
              "before sending all available messages."}
     end;
-init_per_testcase(credit_reply_quorum_queue, _Config) ->
-    %% Currently, this test gets sporadically stuck since the
-    %% send_credit_reply is not pattern matched correctly when the session
-    %% receives the following message:
-
-    % {'$gen_cast',
-    % {queue_event,
-    % {resource,<<"/">>,queue,
-    % <<"credit_reply_quorum_queue">>},
-    % {{'%2F_credit_reply_quorum_queue',
-    % 'rmq-ct-cluster_size_3-2-21048@localhost'},
-    % {applied,
-    % [{1,ok},
-    %  {2,ok},
-    %  {3,ok},
-    %  {4,ok},
-    %  {5,ok},
-    %  {6,ok},
-    %  {7,ok},
-    %  {10,{send_credit_reply,0}},
-    %  {8,ok},
-    %  {9,ok}]}}}},
-    {skip, "TODO fix test case"};
 init_per_testcase(Testcase, Config) ->
     rabbit_ct_helpers:testcase_started(Config, Testcase).
 
@@ -754,6 +731,12 @@ multiple_sessions(Config) ->
                         Session1, <<"receiver link 1">>, Q1, settled, configuration),
     {ok, Receiver2} = amqp10_client:attach_receiver_link(
                         Session2, <<"receiver link 2">>, Q2, settled, configuration),
+    receive {amqp10_event, {link, Receiver1, attached}} -> ok
+    after 5000 -> ct:fail("missing attached")
+    end,
+    receive {amqp10_event, {link, Receiver2, attached}} -> ok
+    after 5000 -> ct:fail("missing attached")
+    end,
     NMsgsPerSender = 20,
     NMsgsPerReceiver = NMsgsPerSender * 2, % due to fanout
     ok = amqp10_client:flow_link_credit(Receiver1, NMsgsPerReceiver, never),
@@ -1693,7 +1676,7 @@ target_queue_deleted(Config) ->
 %% This test is mostly interesting in mixed version mode with feature flag
 %% consumer_tag_in_credit_reply disabled.
 credit_reply_quorum_queue(Config) ->
-    %% Place quorum queue leader on the old node.
+    %% Place quorum queue leader on the old version node.
     OldNode = 1,
     Ch = rabbit_ct_client_helpers:open_channel(Config, OldNode),
     QName = atom_to_binary(?FUNCTION_NAME),
@@ -1731,7 +1714,8 @@ credit_reply_quorum_queue(Config) ->
     ok = amqp10_client:flow_link_credit(Receiver, NumMsgs, never),
 
     %% We should receive all messages.
-    Msgs = [FirstMsg | _] = receive_messages(Receiver, NumMsgs),
+    Msgs = receive_messages(Receiver, NumMsgs),
+    FirstMsg = hd(Msgs),
     LastMsg = lists:last(Msgs),
     ?assertEqual([<<"1">>], amqp10_msg:body(FirstMsg)),
     ?assertEqual([integer_to_binary(NumMsgs)], amqp10_msg:body(LastMsg)),

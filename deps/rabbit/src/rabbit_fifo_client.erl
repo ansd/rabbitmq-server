@@ -574,7 +574,9 @@ handle_ra_event(_QName, _From,
                 true -> add_delivery_count(Credit, Tag, State0);
                 false -> State0
             end,
-    %%TODO filter out Action if local echo state is false and not Drain!
+    %%TODO filter out Action if local echo state is false and not Drain or
+    %% introduce new #credit_v2{} command that contains an additional Reply boolean when
+    %% we go with a new fifo version.
     {ok, State, [Action]};
 handle_ra_event(_QName, _, {machine, {queue_status, Status}},
                 #state{} = State) ->
