@@ -71,6 +71,9 @@ groups() ->
        timed_get_classic_queue,
        timed_get_quorum_queue,
        timed_get_stream,
+       stop_classic_queue,
+       stop_quorum_queue,
+       stop_stream,
        single_active_consumer_classic_queue,
        single_active_consumer_quorum_queue
       ]},
@@ -1364,7 +1367,7 @@ timed_get_quorum_queue(Config) ->
 timed_get_stream(Config) ->
     timed_get(<<"stream">>, Config).
 
-%% Synchronous get with a timeout
+%% Synchronous get with a timeout, figure 2.44.
 timed_get(QType, Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
@@ -1426,6 +1429,88 @@ timed_get(QType, Config) ->
     ok = amqp10_client:close_connection(Connection),
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch).
+
+stop_classic_queue(Config) ->
+    stop(<<"classic">>, Config).
+
+stop_quorum_queue(Config) ->
+    stop(<<"quorum">>, Config).
+
+stop_stream(Config) ->
+    stop(<<"stream">>, Config).
+
+%% Test stopping a link, figure 2.46.
+stop(QType, Config) ->
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    QName = atom_to_binary(?FUNCTION_NAME),
+    #'queue.declare_ok'{} =  amqp_channel:call(
+                               Ch, #'queue.declare'{
+                                      queue = QName,
+                                      durable = true,
+                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    %% Attach 1 sender and 1 receiver to the queue.
+    OpnConf0 = connection_config(Config),
+    NumSent = 300,
+    %% Allow in flight messages to be received after stopping the link.
+    OpnConf = OpnConf0#{transfer_limit_margin => -NumSent},
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"test-receiver">>, Address, settled),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail("missing attached")
+    end,
+    flush(receiver_attached),
+
+    ok = amqp10_client:flow_link_credit(Receiver, 10, 5),
+
+    %% Send 300 messages.
+    [begin
+         Bin = integer_to_binary(N),
+         ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, true))
+     end || N <- lists:seq(1, NumSent)],
+
+    %% Let's await the first 20 messages.
+    NumReceived = 20,
+    Msgs = receive_messages(Receiver, NumReceived),
+
+    %% Stop the link.
+    %% "Stopping the transfers on a given link is accomplished by updating
+    %% the link-credit to be zero and sending the updated flow state." [2.6.10]
+    ok = amqp10_client:stop_receiver_link(Receiver),
+    %% "It is possible that some transfers could be in flight at the time the flow
+    %% state is sent, so incoming transfers could still arrive on the link." [2.6.10]
+    NumInFlight = count_received_messages(Receiver),
+
+    ct:pal("After receiving the first ~b messages and stopping the link, "
+           "we received ~b more in flight messages", [NumReceived, NumInFlight]),
+    ?assert(NumInFlight > 0,
+            "expected some in flight messages, but there were actually none"),
+    ?assert(NumInFlight < NumSent - NumReceived,
+            "expected the link to stop, but actually received all messages"),
+
+    %% Check that contents of the first 20 messages are correct.
+    FirstMsg = hd(Msgs),
+    LastMsg = lists:last(Msgs),
+    ?assertEqual([<<"1">>], amqp10_msg:body(FirstMsg)),
+    ?assertEqual([integer_to_binary(NumReceived)], amqp10_msg:body(LastMsg)),
+
+    %% Let's resume the link.
+    ok = amqp10_client:flow_link_credit(Receiver, 50, 40),
+
+    %% We expect to receive all remaining messages.
+    NumRemaining = NumSent - NumReceived - NumInFlight,
+    ct:pal("Waiting for the remaining ~b messages", [NumRemaining]),
+    Msgs1 = receive_messages(Receiver, NumRemaining),
+    ?assertEqual([integer_to_binary(NumSent)], amqp10_msg:body(lists:last(Msgs1))),
+
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+    ok = amqp10_client:close_connection(Connection).
 
 single_active_consumer_classic_queue(Config) ->
     single_active_consumer(<<"classic">>, Config).
@@ -1935,6 +2020,17 @@ receive_messages0(Receiver, N, Acc) ->
             receive_messages0(Receiver, N - 1, [Msg | Acc])
     after 5000  ->
               exit({timeout, {num_received, length(Acc)}, {num_missing, N}})
+    end.
+
+count_received_messages(Receiver) ->
+    count_received_messages0(Receiver, 0).
+
+count_received_messages0(Receiver, Count) ->
+    receive
+        {amqp10_msg, Receiver, _Msg} ->
+            count_received_messages0(Receiver, Count + 1)
+    after 200 ->
+              Count
     end.
 
 send_messages(Sender, N, GroupId) ->

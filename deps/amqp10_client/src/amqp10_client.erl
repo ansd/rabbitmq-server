@@ -35,7 +35,7 @@
          settle_msg/3,
          flow_link_credit/3,
          flow_link_credit/4,
-         echo/1,
+         stop_receiver_link/1,
          link_handle/1,
          get_msg/1,
          get_msg/2,
@@ -332,14 +332,14 @@ flow_link_credit(#link_ref{role = receiver, session = Session,
                         drain = Drain},
     ok = amqp10_client_session:flow(Session, Handle, Flow, RenewWhenBelow).
 
-%% @doc Request that the sender's flow state is echoed back
-%% This may be used to determine when the Link has finally quiesced.
-%% see §2.6.10 of the spec
-echo(#link_ref{role = receiver, session = Session,
-               link_handle = Handle}) ->
+%% @doc Stop a receiving link.
+%% See AMQP 1.0 spec §2.6.10.
+stop_receiver_link(#link_ref{role = receiver,
+                             session = Session,
+                             link_handle = Handle}) ->
     Flow = #'v1_0.flow'{link_credit = {uint, 0},
                         echo = true},
-    ok = amqp10_client_session:flow(Session, Handle, Flow, 0).
+    ok = amqp10_client_session:flow(Session, Handle, Flow, never).
 
 %%% messages
 
