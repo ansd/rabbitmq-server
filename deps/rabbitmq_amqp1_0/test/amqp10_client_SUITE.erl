@@ -175,11 +175,11 @@ reliable_send_receive(QType, Outcome, Config) ->
 
     QName = <<QType/binary, OutcomeBin/binary>>,
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
     ok = rabbit_ct_client_helpers:close_channel(Ch),
 
     %% reliable send and consume
@@ -223,11 +223,11 @@ reliable_send_receive(QType, Outcome, Config) ->
 sender_settle_mode_unsettled(Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
 
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
@@ -262,7 +262,7 @@ sender_settle_mode_unsettled_fanout(Config) ->
     QNames = [<<"q1">>, <<"q2">>, <<"q3">>],
     Ch = rabbit_ct_client_helpers:open_channel(Config),
     [begin
-         #'queue.declare_ok'{} =  amqp_channel:call(Ch, #'queue.declare'{queue = QName}),
+         #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName}),
          #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{queue = QName,
                                                                   exchange = <<"amq.fanout">>})
      end || QName <- QNames],
@@ -303,11 +303,11 @@ sender_settle_mode_unsettled_fanout(Config) ->
 sender_settle_mode_mixed(Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
 
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
@@ -347,14 +347,14 @@ sender_settle_mode_mixed(Config) ->
 quorum_queue_rejects(Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>},
-                                                   {<<"x-max-length">>, long, 1},
-                                                   {<<"x-overflow">>, longstr, <<"reject-publish">>}
-                                                  ]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                                  {<<"x-max-length">>, long, 1},
+                                                  {<<"x-overflow">>, longstr, <<"reject-publish">>}
+                                                 ]}),
 
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
@@ -813,11 +813,11 @@ server_closes_link_stream(Config) ->
 server_closes_link(QType, Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
     ok = rabbit_ct_client_helpers:close_channel(Ch),
 
     OpnConf = connection_config(Config),
@@ -859,7 +859,7 @@ server_closes_link(QType, Config) ->
 server_closes_link_exchange(Config) ->
     XName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'exchange.declare_ok'{} =  amqp_channel:call(Ch, #'exchange.declare'{exchange = XName}),
+    #'exchange.declare_ok'{} = amqp_channel:call(Ch, #'exchange.declare'{exchange = XName}),
 
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
@@ -900,11 +900,11 @@ link_target_quorum_queue_deleted(Config) ->
 link_target_queue_deleted(QType, Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
     ok = rabbit_ct_client_helpers:close_channel(Ch),
 
     OpnConf = connection_config(Config),
@@ -963,7 +963,7 @@ target_queues_deleted_accepted(Config) ->
     QNames = [Q1, Q2, Q3],
     Ch = rabbit_ct_client_helpers:open_channel(Config),
     [begin
-         #'queue.declare_ok'{} =  amqp_channel:call(Ch, #'queue.declare'{queue = QName}),
+         #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName}),
          #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{queue = QName,
                                                                   exchange = <<"amq.fanout">>})
      end || QName <- QNames],
@@ -1098,11 +1098,11 @@ sync_get_unsettled(QType, Config) ->
     SenderSettleMode = unsettled,
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
 
     %% Attach 1 sender and 1 receiver to the queue.
     OpnConf = connection_config(Config),
@@ -1202,11 +1202,11 @@ sync_get_unsettled_2(QType, Config) ->
     SenderSettleMode = unsettled,
     QName = atom_to_binary(?FUNCTION_NAME),
     Ch = rabbit_ct_client_helpers:open_channel(Config),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
 
     %% Attach a sender and a receiver to the queue.
     OpnConf = connection_config(Config),
@@ -1443,11 +1443,11 @@ stop_stream(Config) ->
 stop(QType, Config) ->
     Ch = rabbit_ct_client_helpers:open_channel(Config),
     QName = atom_to_binary(?FUNCTION_NAME),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
     %% Attach 1 sender and 1 receiver to the queue.
     OpnConf0 = connection_config(Config),
     NumSent = 300,
@@ -1839,11 +1839,11 @@ async_notify_unsettled_stream(Config) ->
 async_notify(SenderSettleMode, QType, Config) ->
     Ch = rabbit_ct_client_helpers:open_channel(Config, 1),
     QName = atom_to_binary(?FUNCTION_NAME),
-    #'queue.declare_ok'{} =  amqp_channel:call(
-                               Ch, #'queue.declare'{
-                                      queue = QName,
-                                      durable = true,
-                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, QType}]}),
 
     %% Attach 1 sender and 1 receiver to the queue.
     OpnConf = connection_config(Config),

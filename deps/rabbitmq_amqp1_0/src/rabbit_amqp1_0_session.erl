@@ -617,7 +617,11 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                                    protocol_error(
                                      ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
                                      "Consuming from ~s failed: ~tp",
-                                     [rabbit_misc:rs(QName), Reason])
+                                     [rabbit_misc:rs(QName), Reason]);
+                               {protocol_error, _Type, Reason, Args} ->
+                                   protocol_error(
+                                     ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
+                                     Reason, Args)
                            end
                    end) of
                 {ok, Reply, State} ->

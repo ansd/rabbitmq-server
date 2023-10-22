@@ -188,7 +188,8 @@
 -callback consume(amqqueue:amqqueue(),
                   consume_spec(),
                   queue_state()) ->
-    {ok, queue_state(), actions()} | {error, term()} |
+    {ok, queue_state(), actions()} |
+    {error, term()} |
     {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
 
 -callback cancel(amqqueue:amqqueue(),
@@ -424,7 +425,9 @@ new(Q, State) when ?is_amqqueue(Q) ->
     set_ctx(Q, Ctx, State).
 
 -spec consume(amqqueue:amqqueue(), consume_spec(), state()) ->
-    {ok, state()} | {error, term()}.
+    {ok, state()} |
+    {error, term()} |
+    {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
 consume(Q, Spec, State) ->
     #ctx{state = CtxState0} = Ctx = get_ctx(Q, State),
     Mod = amqqueue:get_type(Q),
