@@ -324,7 +324,7 @@ consume(Q, Spec,
             end;
         {undefined, _} ->
             {protocol_error, precondition_failed,
-             "queue '~ts' does not have a running replica on the local node",
+             "stream ~ts does not have a running replica on the local node",
              [rabbit_misc:rs(amqqueue:get_name(Q))]}
     end.
 

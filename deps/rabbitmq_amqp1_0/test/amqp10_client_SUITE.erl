@@ -564,12 +564,7 @@ roundtrip_queue_with_drain(Config, QueueType, QName)
     flush("pre-receive"),
     % create a receiver link
     TerminusDurability = none,
-    Filter = case QueueType of
-                 <<"stream">> ->
-                     #{<<"rabbitmq:stream-offset-spec">> => <<"first">>};
-                 _ ->
-                     #{}
-             end,
+    Filter = consume_from_first(QueueType),
     Properties = #{},
     {ok, Receiver} = amqp10_client:attach_receiver_link(Session, <<"test-receiver">>,
                                                         Address, unsettled,
@@ -1845,31 +1840,38 @@ async_notify(SenderSettleMode, QType, Config) ->
                                      durable = true,
                                      arguments = [{<<"x-queue-type">>, longstr, QType}]}),
 
-    %% Attach 1 sender and 1 receiver to the queue.
     OpnConf = connection_config(Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
     {ok, Session} = amqp10_client:begin_session_sync(Connection),
+
+    %% Send 30 messages to the queue.
     Address = <<"/amq/queue/", QName/binary>>,
     {ok, Sender} = amqp10_client:attach_sender_link(
                      Session, <<"test-sender">>, Address),
     ok = wait_for_credit(Sender),
+    NumMsgs = 30,
+    [begin
+         Bin = integer_to_binary(N),
+         ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, false))
+     end || N <- lists:seq(1, NumMsgs)],
+    %% Wait for last message to be confirmed.
+    ok = wait_for_settlement(integer_to_binary(NumMsgs)),
+    ok = amqp10_client:detach_link(Sender),
+    receive {amqp10_event, {link, Sender, {detached, normal}}} -> ok
+    after 5000 -> ct:fail("missing detached")
+    end,
+
+    Filter = consume_from_first(QType),
     {ok, Receiver} = amqp10_client:attach_receiver_link(
-                       Session, <<"test-receiver">>, Address, SenderSettleMode),
+                       Session, <<"test-receiver">>, Address,
+                       SenderSettleMode, configuration, Filter),
     receive {amqp10_event, {link, Receiver, attached}} -> ok
     after 5000 -> ct:fail("missing attached")
     end,
-    flush(receiver_attached),
 
     %% Initially, grant 10 credits to the sending queue.
     %% Whenever credits drops below 5, renew back to 10.
     ok = amqp10_client:flow_link_credit(Receiver, 10, 5),
-
-    %% Let's send 30 messages to the queue.
-    NumMsgs = 30,
-    [begin
-         Bin = integer_to_binary(N),
-         ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, true))
-     end || N <- lists:seq(1, NumMsgs)],
 
     %% We should receive all messages.
     Msgs = receive_messages(Receiver, NumMsgs),
@@ -2059,3 +2061,8 @@ serial_number_increment(S) ->
         16#ffffffff + 1 -> 0;
         S1 -> S1
     end.
+
+consume_from_first(<<"stream">>) ->
+    #{<<"rabbitmq:stream-offset-spec">> => <<"first">>};
+consume_from_first(_) ->
+    #{}.
