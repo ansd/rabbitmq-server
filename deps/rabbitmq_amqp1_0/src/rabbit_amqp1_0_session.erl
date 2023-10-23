@@ -1341,10 +1341,8 @@ incoming_link_transfer(
             % Opts1 = maps_put_truthy(flow, Flow, Opts),
             Qs0 = rabbit_amqqueue:lookup_many(RoutedQNames),
             Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
-            %% TODO convert message container to AMQP 0.9.1 message if feature flag message_containers
-            %% is disabled, see rabbit_mqtt_processor:compat/2:
-            %% https://github.com/rabbitmq/rabbitmq-server/blob/49b357ebd89f8f250afb292d9aeadf0357657c4a/deps/rabbitmq_mqtt/src/rabbit_mqtt_processor.erl#L2564-L2576
-            case rabbit_queue_type:deliver(Qs, Mc, Opts, QStates0) of
+            Msg = compat(Mc, XName),
+            case rabbit_queue_type:deliver(Qs, Msg, Opts, QStates0) of
                 {ok, QStates, Actions} ->
                     % rabbit_global_counters:messages_routed(ProtoVer, length(Qs)),
                     %% Confirms must be registered before processing actions
@@ -1790,6 +1788,20 @@ check_internal_exchange(#exchange{internal = true,
                    [rabbit_misc:rs(XName)]);
 check_internal_exchange(_) ->
     ok.
+
+-spec compat(mc:state(), rabbit_types:exchange_name()) ->
+    mc:state().
+compat(McAmqp, XName) ->
+    case rabbit_feature_flags:is_enabled(message_containers) of
+        true ->
+            McAmqp;
+        false = FFState ->
+            [RoutingKey] = mc:get_annotation(routing_keys, McAmqp),
+            McAmqpl = mc:convert(mc_amqpl, McAmqp),
+            Content = mc:protocol_state(McAmqpl),
+            {ok, BasicMsg} = mc_amqpl:message(XName, RoutingKey, Content, #{}, FFState),
+            BasicMsg
+    end.
 
 check_write_permitted(Resource, User) ->
     check_resource_access(Resource, User, write).
