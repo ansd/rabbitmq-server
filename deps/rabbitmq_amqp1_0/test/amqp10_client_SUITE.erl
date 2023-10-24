@@ -102,7 +102,7 @@ groups() ->
 %% -------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    application:ensure_all_started(amqp10_client),
+    {ok, _} = application:ensure_all_started(amqp10_client),
     rabbit_ct_helpers:log_environment(),
     Config.
 

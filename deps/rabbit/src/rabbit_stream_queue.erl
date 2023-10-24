@@ -77,9 +77,11 @@
                  start_offset = 0 :: non_neg_integer(),
                  listening_offset = 0 :: non_neg_integer(),
                  log :: undefined | osiris_log:state(),
-                 %% These messages were already read ahead from the Osiris log.
-                 %% They are buffered until the consumer has more credits to consume them.
-                 read_ahead_msgs = [] :: [rabbit_amqqueue:qmsg()],
+                 chunk_iterator :: undefined | osiris_log:chunk_iterator(),
+                 %% These messages were already read ahead from the Osiris log,
+                 %% were part of an uncompressed sub batch, and are buffered in
+                 %% reversed order until the consumer has more credits to consume them.
+                 buffer_msgs_rev = [] :: [rabbit_amqqueue:qmsg()],
                  reader_options :: map()}).
 
 -record(stream_client, {stream_id :: string(),
@@ -541,6 +543,10 @@ stream_message(Msg, _FilteringSupported = true) ->
     end;
 stream_message(Msg, _FilteringSupported = false) ->
     msg_to_iodata(Msg).
+
+msg_to_iodata(Msg0) ->
+    Sections = mc:protocol_state(mc:convert(mc_amqp, Msg0)),
+    mc_amqp:serialize(Sections).
 
 -spec dequeue(_, _, _, _, client()) -> no_return().
 dequeue(_, _, _, _, #stream_client{name = Name}) ->
@@ -1081,100 +1087,151 @@ recover(Q) ->
 maybe_send_reply(_ChPid, undefined) -> ok;
 maybe_send_reply(ChPid, Msg) -> ok = rabbit_channel:send_command(ChPid, Msg).
 
-stream_entries(QName, Name, LocalPid, Str) ->
-    stream_entries(QName, Name, LocalPid, Str, []).
-
+stream_entries(QName, Name, LocalPid,
+               #stream{chunk_iterator = undefined,
+                       credit = Credit} = Str0) ->
+    case Credit > 0 of
+        true ->
+            case chunk_iterator(Str0, LocalPid) of
+                {ok, Str} ->
+                    stream_entries(QName, Name, LocalPid, Str);
+                {end_of_stream, Str} ->
+                    {Str, []}
+            end;
+        false ->
+            {Str0, []}
+    end;
 stream_entries(QName, Name, LocalPid,
                #stream{credit = Credit,
-                       read_ahead_msgs = Buf0} = Str0, MsgIn)
+                       buffer_msgs_rev = Buf0} = Str0)
   when Credit > 0 andalso Buf0 =/= [] ->
     BufLen = length(Buf0),
     case Credit =< BufLen of
         true ->
-            %% We can serve all entries from the buffer.
-            {BufMsgs, Buf} = lists:split(Credit, Buf0),
-            Str = Str0#stream{credit = 0,
-                              read_ahead_msgs = Buf},
-            {Str, MsgIn ++ BufMsgs};
+            %% Entire credit worth of messages can be served from the buffer.
+            {Buf, BufMsgsRev} = lists:split(BufLen - Credit, Buf0),
+            {Str0#stream{credit = 0,
+                         buffer_msgs_rev = Buf},
+             lists:reverse(BufMsgsRev)};
         false ->
-            %% We can serve some entries from the buffer.
             Str = Str0#stream{credit = Credit - BufLen,
-                              read_ahead_msgs = []},
-            stream_entries(QName, Name, LocalPid, Str, MsgIn ++ Buf0)
+                              buffer_msgs_rev = []},
+            stream_entries(QName, Name, LocalPid, Str, Buf0)
     end;
+stream_entries(QName, Name, LocalPid, Str) ->
+    stream_entries(QName, Name, LocalPid, Str, []).
+
+stream_entries(_, _, _, #stream{credit = Credit} = Str, Acc)
+  when Credit < 1 ->
+    {Str, lists:reverse(Acc)};
 stream_entries(QName, Name, LocalPid,
-               #stream{credit = Credit,
-                       start_offset = StartOffs,
-                       listening_offset = LOffs,
-                       log = Seg0} = Str0, MsgIn)
-  when Credit > 0 ->
-    case osiris_log:read_chunk_parsed(Seg0) of
-        {end_of_stream, Seg} ->
-            NextOffset = osiris_log:next_offset(Seg),
-            case NextOffset > LOffs of
-                true ->
-                    osiris:register_offset_listener(LocalPid, NextOffset),
-                    {Str0#stream{log = Seg,
-                                 listening_offset = NextOffset}, MsgIn};
-                false ->
-                    {Str0#stream{log = Seg}, MsgIn}
+               #stream{chunk_iterator = Iter0,
+                       credit = Credit,
+                       start_offset = StartOffset} = Str0, Acc0) ->
+    case osiris_log:iterator_next(Iter0) of
+        end_of_chunk ->
+            case chunk_iterator(Str0, LocalPid) of
+                {ok, Str} ->
+                    stream_entries(QName, Name, LocalPid, Str, Acc0);
+                {end_of_stream, Str} ->
+                    {Str, lists:reverse(Acc0)}
             end;
-        {error, Err} ->
-            rabbit_log:debug("stream client: error reading chunk ~w", [Err]),
-            exit(Err);
-        {Records, Seg} ->
-            Msgs0 = [begin
-                         Msg0 = binary_to_msg(QName, B),
-                         Msg = mc:set_annotation(<<"x-stream-offset">>, O, Msg0),
-                         {Name, LocalPid, O, false, Msg}
-                     end || {O, B} <- Records,
-                            O >= StartOffs],
-
-            NumMsgs = length(Msgs0),
-            {Str, Msgs} = case Credit >= NumMsgs of
-                              true ->
-                                  {Str0#stream{credit = Credit - NumMsgs,
-                                               log = Seg}, Msgs0};
-                              false ->
-                                  %% Consumer doesn't have sufficient credit.
-                                  %% Buffer the remaining messages.
-                                  [] = Str0#stream.read_ahead_msgs, % assertion
-                                  {Msgs1, Buf} = lists:split(Credit, Msgs0),
-                                  {Str0#stream{credit = 0,
-                                               read_ahead_msgs = Buf,
-                                               log = Seg}, Msgs1}
-                          end,
-            case Str#stream.credit < 1 of
-                true ->
-                    %% we are done here
-                    {Str, MsgIn ++ Msgs};
-                false ->
-                    %% if there are fewer Msgs than Entries0 it means there were non-events
-                    %% in the log and we should recurse and try again
-                    stream_entries(QName, Name, LocalPid, Str, MsgIn ++ Msgs)
-            end
-    end;
-stream_entries(_QName, _Name, _LocalPid, Str, Msgs) ->
-    {Str, Msgs}.
-
-binary_to_msg(#resource{kind = queue,
-                        name = QName}, Data) ->
-    Mc0 = mc:init(mc_amqp, amqp10_framing:decode_bin(Data), #{}),
-    %% If exchange or routing_keys annotation isn't present the data most likely came
-    %% from the rabbitmq-stream plugin so we'll choose defaults that simulate use
-    %% of the direct exchange.
-    Mc = case mc:get_annotation(exchange, Mc0) of
-             undefined -> mc:set_annotation(exchange, <<>>, Mc0);
-             _ -> Mc0
-         end,
-    case mc:get_annotation(routing_keys, Mc) of
-        undefined -> mc:set_annotation(routing_keys, [QName], Mc);
-        _ -> Mc
+        {{Offset, Entry}, Iter} ->
+            {Str, Acc} = case Entry of
+                             {batch, _NumRecords, 0, _Len, BatchedEntries} ->
+                                 {MsgsRev, NumMsgs} = parse_uncompressed_subbatch(
+                                                        BatchedEntries, Offset, StartOffset,
+                                                        QName, Name, LocalPid, {[], 0}),
+                                 case Credit >= NumMsgs of
+                                     true ->
+                                         {Str0#stream{chunk_iterator = Iter,
+                                                      credit = Credit - NumMsgs},
+                                          MsgsRev ++ Acc0};
+                                     false ->
+                                         %% Consumer doesn't have sufficient credit.
+                                         %% Buffer the remaining messages.
+                                         [] = Str0#stream.buffer_msgs_rev, % assertion
+                                         {Buf, MsgsRev1} = lists:split(NumMsgs - Credit, MsgsRev),
+                                         {Str0#stream{chunk_iterator = Iter,
+                                                      credit = 0,
+                                                      buffer_msgs_rev = Buf},
+                                          MsgsRev1 ++ Acc0}
+                                 end;
+                             {batch, _, _CompressionType, _, _} ->
+                                 %% Skip compressed sub batch.
+                                 %% It can only be consumed by Stream protocol clients.
+                                 {Str0#stream{chunk_iterator = Iter}, Acc0};
+                             _SimpleEntry ->
+                                 case Offset >= StartOffset of
+                                     true ->
+                                         Msg = entry_to_msg(Entry, Offset, QName, Name, LocalPid),
+                                         {Str0#stream{chunk_iterator = Iter,
+                                                      credit = Credit - 1},
+                                          [Msg | Acc0]};
+                                     false ->
+                                         {Str0#stream{chunk_iterator = Iter}, Acc0}
+                                 end
+                         end,
+            stream_entries(QName, Name, LocalPid, Str, Acc)
     end.
 
-msg_to_iodata(Msg0) ->
-    Sections = mc:protocol_state(mc:convert(mc_amqp, Msg0)),
-    mc_amqp:serialize(Sections).
+chunk_iterator(#stream{credit = Credit,
+                       listening_offset = LOffs,
+                       log = Log0} = Str0, LocalPid) ->
+    case osiris_log:chunk_iterator(Log0, Credit) of
+        {ok, _ChunkHeader, Iter, Log} ->
+            {ok, Str0#stream{chunk_iterator = Iter,
+                             log = Log}};
+        {end_of_stream, Log} ->
+            NextOffset = osiris_log:next_offset(Log),
+            Str = case NextOffset > LOffs of
+                      true ->
+                          osiris:register_offset_listener(LocalPid, NextOffset),
+                          Str0#stream{log = Log,
+                                      listening_offset = NextOffset};
+                      false ->
+                          Str0#stream{log = Log}
+                  end,
+            {end_of_stream, Str};
+        {error, Err} ->
+            rabbit_log:info("stream client: failed to create chunk iterator ~p", [Err]),
+            exit(Err)
+    end.
+
+%% Deliver each record of an uncompressed sub batch individually.
+parse_uncompressed_subbatch(<<>>, _Offset, _StartOffset, _QName, _Name, _LocalPid, Acc) ->
+    Acc;
+parse_uncompressed_subbatch(
+  <<0:1, %% simple entry
+    Len:31/unsigned,
+    Entry:Len/binary,
+    Rem/binary>>,
+  Offset, StartOffset, QName, Name, LocalPid, Acc0 = {AccList, AccCount}) ->
+    Acc = case Offset >= StartOffset of
+              true ->
+                  Msg = entry_to_msg(Entry, Offset, QName, Name, LocalPid),
+                  {[Msg | AccList], AccCount + 1};
+              false ->
+                  Acc0
+          end,
+    parse_uncompressed_subbatch(Rem, Offset + 1, StartOffset, QName, Name, LocalPid, Acc).
+
+entry_to_msg(Entry, Offset, #resource{kind = queue,
+                                      name = QName}, Name, LocalPid) ->
+    Mc0 = mc:init(mc_amqp, amqp10_framing:decode_bin(Entry), #{}),
+    %% If exchange or routing_keys annotation isn't present the entry most likely came
+    %% from the rabbitmq-stream plugin so we'll choose defaults that simulate use
+    %% of the direct exchange.
+    Mc1 = case mc:get_annotation(exchange, Mc0) of
+              undefined -> mc:set_annotation(exchange, <<>>, Mc0);
+              _ -> Mc0
+          end,
+    Mc2 = case mc:get_annotation(routing_keys, Mc1) of
+              undefined -> mc:set_annotation(routing_keys, [QName], Mc1);
+              _ -> Mc1
+          end,
+    Mc = mc:set_annotation(<<"x-stream-offset">>, Offset, Mc2),
+    {Name, LocalPid, Offset, false, Mc}.
 
 capabilities() ->
     #{unsupported_policies => [%% Classic policies
