@@ -1813,7 +1813,11 @@ credit_reply_quorum_queue(Config) ->
     ok = amqp10_client:close_connection(Connection).
 
 async_notify_settled_classic_queue(Config) ->
-    async_notify(settled, <<"classic">>, Config).
+    %% TODO require ff message_containers
+    case rabbit_ct_broker_helpers:enable_feature_flag(Config, message_containers) of
+        ok -> async_notify(settled, <<"classic">>, Config);
+        {skip, _} = Skip -> Skip
+    end.
 
 async_notify_settled_quorum_queue(Config) ->
     async_notify(settled, <<"quorum">>, Config).
@@ -1822,7 +1826,11 @@ async_notify_settled_stream(Config) ->
     async_notify(settled, <<"stream">>, Config).
 
 async_notify_unsettled_classic_queue(Config) ->
-    async_notify(unsettled, <<"classic">>, Config).
+    %% TODO require ff message_containers
+    case rabbit_ct_broker_helpers:enable_feature_flag(Config, message_containers) of
+        ok -> async_notify(unsettled, <<"classic">>, Config);
+        {skip, _} = Skip -> Skip
+    end.
 
 async_notify_unsettled_quorum_queue(Config) ->
     async_notify(unsettled, <<"quorum">>, Config).
