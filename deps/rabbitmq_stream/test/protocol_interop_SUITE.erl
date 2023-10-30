@@ -317,7 +317,7 @@ publish_via_stream_protocol(Stream, Config) ->
     M2 = simple_entry(2, <<"m2">>),
     M3 = simple_entry(3, <<"m3">>),
     Messages1 = [M1, M2, M3],
-    PublishFrame1 = rabbit_stream_core:frame({publish_v2, PublisherId, length(Messages1), Messages1}),
+    PublishFrame1 = rabbit_stream_core:frame({publish, PublisherId, length(Messages1), Messages1}),
     ok = gen_tcp:send(S, PublishFrame1),
     {{publish_confirm, PublisherId, _}, C8} = receive_stream_commands(S, C7),
 
@@ -334,7 +334,7 @@ publish_via_stream_protocol(Stream, Config) ->
     M10 = simple_entry(6, <<"m10">>),
     M11 = simple_entry(7, <<"m11">>),
     Messages2 = [M10, M11],
-    PublishFrame4 = rabbit_stream_core:frame({publish_v2, PublisherId, length(Messages2), Messages2}),
+    PublishFrame4 = rabbit_stream_core:frame({publish, PublisherId, length(Messages2), Messages2}),
     ok = gen_tcp:send(S, PublishFrame4),
     {{publish_confirm, PublisherId, _}, _C11} = receive_stream_commands(S, C10).
 
@@ -344,10 +344,7 @@ simple_entry(Sequence, Body)
   when is_binary(Body) ->
     DataSect = iolist_to_binary(amqp10_framing:encode_bin(#'v1_0.data'{content = Body})),
     DataSectSize = byte_size(DataSect),
-    FilterValue = <<>>,
-    FilterValueSize = byte_size(FilterValue),
-    <<Sequence:64, FilterValueSize:16, FilterValue:FilterValueSize/binary,
-      0:1, DataSectSize:31, DataSect:DataSectSize/binary>>.
+    <<Sequence:64, 0:1, DataSectSize:31, DataSect:DataSectSize/binary>>.
 
 %% Here, each AMQP 1.0 encoded message contains a single data section.
 %% All data sections are delivered uncompressed in 1 batch.
