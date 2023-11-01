@@ -63,7 +63,8 @@
 
 -type queue_name() :: rabbit_amqqueue:name().
 -type queue_state() :: term().
--type msg_tag() :: term().
+%% sequence number typically
+-type correlation() :: term().
 -type arguments() :: queue_arguments | consumer_arguments.
 -type queue_type() :: rabbit_classic_queue | rabbit_quorum_queue | rabbit_stream_queue.
 %% Link credit can be negative, see AMQP 1.0 [2.6.7].
@@ -85,7 +86,7 @@
 -type action() ::
     %% indicate to the queue type module that a message has been delivered
     %% fully to the queue
-    {settled, Success :: boolean(), [msg_tag()]} |
+    {settled, queue_name(), [correlation()]} |
     {deliver, rabbit_types:ctag(), boolean(), [rabbit_amqqueue:qmsg()]} |
     {block | unblock, QueueName :: term()} |
     {credit_reply, rabbit_types:ctag(), credit(), Available :: non_neg_integer(),
@@ -98,16 +99,7 @@
     term().
 
 -record(ctx, {module :: module(),
-              %% "publisher confirm queue accounting"
-              %% queue type implementation should emit a:
-              %% {settle, Success :: boolean(), msg_tag()}
-              %% to either settle or reject the delivery of a
-              %% message to the queue instance
-              %% The queue type module will then emit a {confirm | reject, [msg_tag()}
-              %% action to the channel or channel like process when a msg_tag
-              %% has reached its conclusion
               state :: queue_state()}).
-
 
 -record(?STATE, {ctxs = #{} :: #{queue_name() => #ctx{}}
                 }).
@@ -126,7 +118,7 @@
                           ok_msg := term(),
                           acting_user :=  rabbit_types:username()}.
 
--type delivery_options() :: #{correlation => term(), %% sequence no typically
+-type delivery_options() :: #{correlation => correlation(),
                               atom() => term()}.
 
 -type settle_op() :: 'complete' | 'requeue' | 'discard'.
@@ -140,6 +132,7 @@
               settle_op/0,
               queue_type/0,
               credit/0,
+              correlation/0,
               link_state_properties/0]).
 
 -callback is_enabled() -> boolean().

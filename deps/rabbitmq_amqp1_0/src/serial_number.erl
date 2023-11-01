@@ -10,9 +10,12 @@
 
 -export([add/2,
          compare/2,
-         usort/1,
          ranges/1,
          diff/2]).
+
+-ifdef(TEST).
+-export([usort/1]).
+-endif.
 
 -type serial_number() :: sequence_no().
 -export_type([serial_number/0]).

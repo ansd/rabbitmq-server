@@ -411,9 +411,9 @@ mapped({call, From},
               unsettled = Unsettled} = State) ->
     case Links of
         #{OutHandle := #link{input_handle = undefined}} ->
-            {keep_state, State, [{reply, From, {error, half_attached}}]};
+            {keep_state_and_data, [{reply, From, {error, half_attached}}]};
         #{OutHandle := #link{link_credit = LC}} when LC =< 0 ->
-            {keep_state, State, [{reply, From, {error, insufficient_credit}}]};
+            {keep_state_and_data, [{reply, From, {error, insufficient_credit}}]};
         #{OutHandle := Link} ->
             Transfer = Transfer0#'v1_0.transfer'{delivery_id = uint(NOI),
                                                  resume = false},
@@ -422,7 +422,7 @@ mapped({call, From},
             {keep_state, book_transfer_send(NumFrames, Link, State1),
              [{reply, From, ok}]};
         _ ->
-            {keep_state, State, [{reply, From, {error, link_not_found}}]}
+            {keep_state_and_data, [{reply, From, {error, link_not_found}}]}
 
     end;
 mapped({call, From},
@@ -442,7 +442,7 @@ mapped({call, From},
             {keep_state, book_transfer_send(NumFrames, Link, State),
              [{reply, From, ok}]};
         _ ->
-            {keep_state, [{reply, From, {error, link_not_found}}]}
+            {keep_state_and_data, [{reply, From, {error, link_not_found}}]}
     end;
 
 mapped({call, From},
@@ -845,10 +845,12 @@ translate_delivery_state(received) -> #'v1_0.received'{}.
 translate_role(sender) -> false;
 translate_role(receiver) -> true.
 
-maybe_notify_link_credit(#link{link_credit = 0, role = sender},
-                         #link{link_credit = Credit} = Link)
-  when Credit > 0 ->
-    notify_link(Link, credited);
+maybe_notify_link_credit(#link{role = sender,
+                               link_credit = 0},
+                         #link{role = sender,
+                               link_credit = NewCredit} = NewLink)
+  when NewCredit > 0 ->
+    notify_link(NewLink, credited);
 maybe_notify_link_credit(_Old, _New) ->
     ok.
 
@@ -925,7 +927,8 @@ update_link(Link = #link{output_handle = OutHandle},
             State#state{links = Links#{OutHandle => Link}}.
 
 incr_link_counters(#link{link_credit = LC, delivery_count = DC} = Link) ->
-    Link#link{delivery_count = DC+1, link_credit = LC-1}.
+    Link#link{delivery_count = DC+1,
+              link_credit = LC-1}.
 
 append_partial_transfer(Transfer, Payload,
                         #link{partial_transfers = undefined} = Link) ->

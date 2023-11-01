@@ -68,7 +68,6 @@
 
 -type appender_seq() :: non_neg_integer().
 
--type msg_id() :: non_neg_integer().
 -type msg() :: term(). %% TODO: refine
 
 -record(stream, {mode :: rabbit_queue_type:consume_mode(),
@@ -89,7 +88,7 @@
                         leader :: pid(),
                         local_pid :: undefined | pid(),
                         next_seq = 1 :: non_neg_integer(),
-                        correlation = #{} :: #{appender_seq() => {msg_id(), msg()}},
+                        correlation = #{} :: #{appender_seq() => {rabbit_queue_type:correlation(), msg()}},
                         soft_limit :: non_neg_integer(),
                         slow = false :: boolean(),
                         readers = #{} :: #{rabbit_types:ctag() => #stream{}},
@@ -520,7 +519,7 @@ deliver0(MsgId, Msg,
     Correlation = case MsgId of
                       undefined ->
                           Correlation0;
-                      _ when is_number(MsgId) ->
+                      _ ->
                           Correlation0#{Seq => {MsgId, Msg}}
                   end,
     {Slow, Actions} = case maps:size(Correlation) >= SftLmt of

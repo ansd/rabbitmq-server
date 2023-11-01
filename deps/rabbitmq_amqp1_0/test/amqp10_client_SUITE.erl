@@ -88,7 +88,8 @@ groups() ->
        async_notify_settled_stream,
        async_notify_unsettled_classic_queue,
        async_notify_unsettled_quorum_queue,
-       async_notify_unsettled_stream
+       async_notify_unsettled_stream,
+       link_flow_control
       ]},
 
      {metrics, [shuffle],
@@ -765,8 +766,8 @@ multiple_sessions(Config) ->
     %% Send concurrently.
     Group1 = <<"group 1">>,
     Group2 = <<"group 2">>,
-    spawn_link(?MODULE, send_messages, [Sender1, NMsgsPerSender, Group1]),
-    spawn_link(?MODULE, send_messages, [Sender2, NMsgsPerSender, Group2]),
+    spawn_link(?MODULE, send_messages_with_group_id, [Sender1, NMsgsPerSender, Group1]),
+    spawn_link(?MODULE, send_messages_with_group_id, [Sender2, NMsgsPerSender, Group2]),
 
     Q1Msgs = receive_messages(Receiver1, NMsgsPerReceiver),
     Q2Msgs = receive_messages(Receiver2, NMsgsPerReceiver),
@@ -1462,12 +1463,7 @@ stop(QType, Config) ->
     flush(receiver_attached),
 
     ok = amqp10_client:flow_link_credit(Receiver, 10, 5),
-
-    %% Send 300 messages.
-    [begin
-         Bin = integer_to_binary(N),
-         ok = amqp10_client:send_msg(Sender, amqp10_msg:new(Bin, Bin, true))
-     end || N <- lists:seq(1, NumSent)],
+    ok = send_messages(Sender, NumSent),
 
     %% Let's await the first 20 messages.
     NumReceived = 20,
@@ -1491,8 +1487,8 @@ stop(QType, Config) ->
     %% Check that contents of the first 20 messages are correct.
     FirstMsg = hd(Msgs),
     LastMsg = lists:last(Msgs),
-    ?assertEqual([<<"1">>], amqp10_msg:body(FirstMsg)),
-    ?assertEqual([integer_to_binary(NumReceived)], amqp10_msg:body(LastMsg)),
+    ?assertEqual([integer_to_binary(NumSent)], amqp10_msg:body(FirstMsg)),
+    ?assertEqual([integer_to_binary(NumSent - NumReceived + 1)], amqp10_msg:body(LastMsg)),
 
     %% Let's resume the link.
     ok = amqp10_client:flow_link_credit(Receiver, 50, 40),
@@ -1501,7 +1497,7 @@ stop(QType, Config) ->
     NumRemaining = NumSent - NumReceived - NumInFlight,
     ct:pal("Waiting for the remaining ~b messages", [NumRemaining]),
     Msgs1 = receive_messages(Receiver, NumRemaining),
-    ?assertEqual([integer_to_binary(NumSent)], amqp10_msg:body(lists:last(Msgs1))),
+    ?assertEqual([<<"1">>], amqp10_msg:body(lists:last(Msgs1))),
 
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_channel(Ch),
@@ -1532,6 +1528,7 @@ single_active_consumer(QType, Config) ->
     {ok, Sender} = amqp10_client:attach_sender_link(
                      Session, <<"test-sender">>, Address),
     ok = wait_for_credit(Sender),
+    flush(sender_attached),
 
     %% The 1st consumer will become active.
     {ok, Receiver1} = amqp10_client:attach_receiver_link(
@@ -1910,6 +1907,88 @@ async_notify(SenderSettleMode, QType, Config) ->
     ok = rabbit_ct_client_helpers:close_channel(Ch),
     ok = amqp10_client:close_connection(Connection).
 
+%% For TRANSFERS from AMQP client to RabbitMQ, this test asserts that a single slow link receiver
+%% (slow queue) does not impact other link receivers (fast queues) on the **same** session.
+%% (This is unlike AMQP legacy where a single slow queue will block the entire connection.)
+link_flow_control(Config) ->
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    CQ = <<"cq">>,
+    QQ = <<"qq">>,
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = CQ,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"classic">>}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QQ,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+
+    AddressCQ = <<"/amq/queue/", CQ/binary>>,
+    AddressQQ = <<"/amq/queue/", QQ/binary>>,
+    {ok, ReceiverCQ} = amqp10_client:attach_receiver_link(Session, <<"cq-receiver">>, AddressCQ, settled),
+    {ok, ReceiverQQ} = amqp10_client:attach_receiver_link(Session, <<"qq-receiver">>, AddressQQ, settled),
+    {ok, SenderCQ} = amqp10_client:attach_sender_link(Session, <<"cq-sender">>, AddressCQ, settled),
+    {ok, SenderQQ} = amqp10_client:attach_sender_link(Session, <<"qq-sender">>, AddressQQ, settled),
+    ok = wait_for_credit(SenderCQ),
+    ok = wait_for_credit(SenderQQ),
+    flush(attached),
+
+    %% Send and receive a single message on both queues.
+    ok = amqp10_client:send_msg(SenderCQ, amqp10_msg:new(<<0>>, <<0>>, true)),
+    ok = amqp10_client:send_msg(SenderQQ, amqp10_msg:new(<<1>>, <<1>>, true)),
+    {ok, Msg0} = amqp10_client:get_msg(ReceiverCQ),
+    ?assertEqual([<<0>>], amqp10_msg:body(Msg0)),
+    {ok, Msg1} = amqp10_client:get_msg(ReceiverQQ),
+    ?assertEqual([<<1>>], amqp10_msg:body(Msg1)),
+
+    %% Make quorum queue unavailable.
+    ok = rabbit_ct_broker_helpers:stop_node(Config, 2),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, 1),
+
+    NumMsgs = 1000,
+    %% Since the quorum queue is unavailable, we expect our quorum queue sender to run
+    %% out of credits and RabbitMQ should not grant our quorum queue sender any new credits.
+    ok = assert_link_credit_runs_out(SenderQQ, NumMsgs),
+    %% Despite the quorum queue being unavailable, the classic queue can perfectly receive messages.
+    %% So, we expect that on the same AMQP session, link credit will be renewed for our classic queue sender.
+    ok = send_messages(SenderCQ, NumMsgs),
+
+    %% Check that all 1k messages can be received from the classic queue.
+    ok = amqp10_client:flow_link_credit(ReceiverCQ, NumMsgs, never),
+    ReceivedCQ = receive_messages(ReceiverCQ, NumMsgs),
+    FirstMsg = hd(ReceivedCQ),
+    LastMsg = lists:last(ReceivedCQ),
+    ?assertEqual([integer_to_binary(NumMsgs)], amqp10_msg:body(FirstMsg)),
+    ?assertEqual([<<"1">>], amqp10_msg:body(LastMsg)),
+
+    %% We expect still that RabbitMQ won't grant our quorum queue sender any new credits.
+    receive {amqp10_event, {link, SenderQQ, credited}} ->
+                ct:fail(unexpected_credited)
+    after 5 -> ok
+    end,
+
+    %% Make quorum queue available again.
+    ok = rabbit_ct_broker_helpers:start_node(Config, 1),
+    ok = rabbit_ct_broker_helpers:start_node(Config, 2),
+
+    %% Now, we exepct that the messages sent earlier make it actually into the quorum queue.
+    %% Therefore, RabbitMQ should grant our quorum queue sender more credits.
+    receive {amqp10_event, {link, SenderQQ, credited}} ->
+                ct:pal("quorum queue sender got credited")
+    after 30_000 -> ct:fail({credited_timeout, ?LINE})
+    end,
+
+    [ok = amqp10_client:detach_link(Link) || Link <- [ReceiverCQ, ReceiverQQ, SenderCQ, SenderQQ]],
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
+    delete_queue(Config, QQ),
+    delete_queue(Config, CQ).
+
 %% internal
 %%
 
@@ -1946,7 +2025,6 @@ open_and_close_connection(Config) ->
 wait_for_credit(Sender) ->
     receive
         {amqp10_event, {link, Sender, credited}} ->
-            flush(?FUNCTION_NAME),
             ok
     after 5000 ->
               flush("wait_for_credit timed out"),
@@ -2043,7 +2121,38 @@ count_received_messages0(Receiver, Count) ->
               Count
     end.
 
-send_messages(Sender, N, GroupId) ->
+send_messages(_Sender, 0) ->
+    ok;
+send_messages(Sender, Left) ->
+    Bin = integer_to_binary(Left),
+    Msg = amqp10_msg:new(Bin, Bin, true),
+    case amqp10_client:send_msg(Sender, Msg) of
+        ok ->
+            send_messages(Sender, Left - 1);
+        {error, insufficient_credit} ->
+            ok = wait_for_credit(Sender),
+            ok = amqp10_client:send_msg(Sender, Msg),
+            send_messages(Sender, Left - 1)
+    end.
+
+assert_link_credit_runs_out(_Sender, 0) ->
+    ct:fail(sufficient_link_credit);
+assert_link_credit_runs_out(Sender, Left) ->
+    Bin = integer_to_binary(Left),
+    Msg = amqp10_msg:new(Bin, Bin, true),
+    case amqp10_client:send_msg(Sender, Msg) of
+        ok ->
+            assert_link_credit_runs_out(Sender, Left - 1);
+        {error, insufficient_credit} ->
+            ct:pal("insufficient link credit with ~b messages left", [Left]),
+            receive {amqp10_event, {link, Sender, credited}} ->
+                        ct:fail(unexpected_credited)
+            after 100 ->
+                      ok
+            end
+    end.
+
+send_messages_with_group_id(Sender, N, GroupId) ->
     [begin
          Bin = integer_to_binary(I),
          Msg0 = amqp10_msg:new(Bin, Bin, true),
