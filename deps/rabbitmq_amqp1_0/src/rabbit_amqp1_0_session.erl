@@ -24,6 +24,7 @@
                    ?V_1_0_SYMBOL_MODIFIED]).
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
 -define(TOPIC_PERMISSION_CACHE, topic_permission_cache).
+-define(PROCESS_GROUP_NAME, amqp_sessions).
 -define(UINT(N), {uint, N}).
 %% This is the link credit that we grant to sending clients.
 %% We are free to choose whatever we want, sending clients must obey.
@@ -45,7 +46,8 @@
 -type transfer_number() :: sequence_no().
 
 -export([start_link/6,
-         process_frame/2]).
+         process_frame/2,
+         list_local/0]).
 
 -export([init/1,
          terminate/2,
@@ -156,6 +158,7 @@ process_frame(Pid, Frame) ->
 init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost}) ->
     %%TODO do we neeed to trap_exit?
     process_flag(trap_exit, true),
+    ok = pg:join(node(), ?PROCESS_GROUP_NAME, self()),
     %% TODO tick_timer with consumer_timeout and permission expiry as done in channel?
     % put(permission_cache_can_expire, rabbit_access_control:permission_cache_can_expire(User)),
     {ok, #state{cfg = #cfg{reader_pid = ReaderPid,
@@ -167,6 +170,10 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost}) ->
 
 terminate(_Reason, #state{queue_states = QStates}) ->
     ok = rabbit_queue_type:close(QStates).
+
+-spec list_local() -> [pid()].
+list_local() ->
+    pg:get_local_members(node(), ?PROCESS_GROUP_NAME).
 
 handle_call(Msg, _From, State) ->
     Reply = {error, {not_understood, Msg}},

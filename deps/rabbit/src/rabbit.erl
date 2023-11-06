@@ -36,7 +36,7 @@
 
 %%---------------------------------------------------------------------------
 %% Boot steps.
--export([maybe_insert_default_data/0, boot_delegate/0, recover/0]).
+-export([maybe_insert_default_data/0, boot_delegate/0, recover/0, pg_local/0]).
 
 %% for tests
 -export([validate_msg_store_io_batch_size_and_credit_disc_bound/2]).
@@ -266,6 +266,12 @@
                    [{description, "TCP and TLS listeners (backwards compatibility)"},
                     {mfa,         {logger, debug, ["'networking' boot step skipped and moved to end of startup", [], #{domain => ?RMQLOG_DOMAIN_GLOBAL}]}},
                     {requires,    notify_cluster}]}).
+
+-rabbit_boot_step({pg_local,
+                   [{description, "local-only pg scope"},
+                    {mfa,         {rabbit, pg_local, []}},
+                    {requires,    kernel_ready},
+                    {enables,     core_initialized}]}).
 
 %%---------------------------------------------------------------------------
 
@@ -1096,6 +1102,9 @@ boot_delegate() ->
 recover() ->
     ok = rabbit_vhost:recover(),
     ok.
+
+pg_local() ->
+    rabbit_sup:start_child(pg, [node()]).
 
 -spec maybe_insert_default_data() -> 'ok'.
 

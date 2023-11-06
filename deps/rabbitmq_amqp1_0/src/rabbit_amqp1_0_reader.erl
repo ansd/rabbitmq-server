@@ -265,7 +265,6 @@ update_last_blocked_by(Throttle) ->
 close(Error, State = #v1{sock = Sock,
                          connection = #v1_connection{timeout_sec = TimeoutSec}}) ->
     Self = self(),
-    ok = rabbit_amqp1_0:unregister_connection(Self),
 
     %% Client properties will be emitted in the connection_closed event by rabbit_reader.
     ClientProperties = i(client_properties, State),
