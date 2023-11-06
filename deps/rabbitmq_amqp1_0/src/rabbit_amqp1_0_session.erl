@@ -51,7 +51,8 @@
          terminate/2,
          handle_call/3,
          handle_cast/2, 
-         handle_info/2]).
+         handle_info/2,
+         format_status/1]).
 
 -import(rabbit_amqp1_0_util,
         [protocol_error/3]).
@@ -87,6 +88,7 @@
          }).
 
 -record(outgoing_unsettled, {
+          link_handle :: link_handle(),
           %% The queue sent us this consumer scoped sequence number.
           msg_id :: rabbit_amqqueue:msg_id(),
           consumer_tag :: rabbit_types:ctag(),
@@ -95,7 +97,6 @@
          }).
 
 -record(pending_transfer, {
-          link_handle :: ?UINT(non_neg_integer()),
           frames :: iolist(),
           queue_ack_required :: boolean(),
           %% queue that sent us this message
@@ -104,28 +105,29 @@
           outgoing_unsettled :: #outgoing_unsettled{}
          }).
 
-%%TODO put rarely used fields into separate #cfg{}
--record(state, {
+-record(cfg, {
           frame_max,
           reader_pid :: pid(),
           writer_pid :: pid(),
+          user :: rabbit_types:user(),
+          vhost :: rabbit_types:vhost(),
+          channel_num %% we just use the incoming (AMQP 1.0) channel number
+         }).
+
+-record(state, {
+          cfg = #cfg{},
           %% These messages were received from queues thanks to sufficient link credit.
           %% However, they are buffered here due to session flow control before being sent to the client.
           pending_transfers = queue:new() :: queue:queue(#pending_transfer{}),
-          user :: rabbit_types:user(),
-          vhost :: rabbit_types:vhost(),
-          channel_num, %% we just use the incoming (AMQP 1.0) channel number
           remote_incoming_window, % keep track of the window until we're told
           remote_outgoing_window,
           next_incoming_id, % just to keep a check
-          incoming_window_max, % )
           incoming_window,     % ) so we know when to open the session window
           %% "The next-outgoing-id MAY be initialized to an arbitrary value and is incremented after each
           %% successive transfer according to RFC-1982 [RFC1982] serial number arithmetic." [2.5.6]
           next_outgoing_id = 0 :: transfer_number(),
           next_delivery_id = 0 :: delivery_number(),
           outgoing_window,
-          outgoing_window_max,
           %% Links are unidirectional.
           %% We receive messages from clients on incoming links.
           incoming_links = #{} :: #{link_handle() => #incoming_link{}},
@@ -156,12 +158,12 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost}) ->
     process_flag(trap_exit, true),
     %% TODO tick_timer with consumer_timeout and permission expiry as done in channel?
     % put(permission_cache_can_expire, rabbit_access_control:permission_cache_can_expire(User)),
-    {ok, #state{reader_pid = ReaderPid,
-                writer_pid = WriterPid,
-                frame_max = FrameMax,
-                user = User,
-                vhost = Vhost,
-                channel_num = ChannelNum}}.
+    {ok, #state{cfg = #cfg{reader_pid = ReaderPid,
+                           writer_pid = WriterPid,
+                           frame_max = FrameMax,
+                           user = User,
+                           vhost = Vhost,
+                           channel_num = ChannelNum}}}.
 
 terminate(_Reason, #state{queue_states = QStates}) ->
     ok = rabbit_queue_type:close(QStates).
@@ -191,9 +193,9 @@ handle_info({{'DOWN', QName}, _MRef, process, QPid, Reason},
             noreply(State)
     end;
 handle_info({'EXIT', WriterPid, Reason = {writer, send_failed, _Error}},
-            State = #state{writer_pid = WriterPid,
-                           reader_pid = ReaderPid,
-                           channel_num = ChannelNum}) ->
+            State = #state{cfg = #cfg{writer_pid = WriterPid,
+                                      reader_pid = ReaderPid,
+                                      channel_num = ChannelNum}}) ->
     %%TODO this branch seems not needed?
     ReaderPid ! {channel_exit, ChannelNum, Reason},
     {stop, normal, State};
@@ -201,9 +203,9 @@ handle_info({'EXIT', _Pid, Reason}, State) ->
     {stop, Reason, State}.
 
 handle_cast({frame, Frame, FlowPid},
-            #state{reader_pid = ReaderPid,
-                   writer_pid = WriterPid,
-                   channel_num = Ch} = State0) ->
+            #state{cfg = #cfg{reader_pid = ReaderPid,
+                              writer_pid = WriterPid,
+                              channel_num = Ch}} = State0) ->
     %%TODO not needed since session flow control protects the session process
     credit_flow:ack(FlowPid),
     try handle_control(Frame, State0) of
@@ -232,8 +234,8 @@ handle_cast({frame, Frame, FlowPid},
               {stop, {Reason, Stacktrace}, State0}
     end;
 handle_cast({queue_event, _, _} = QEvent,
-            #state{writer_pid = WriterPid,
-                   channel_num = Ch} = State0) ->
+            #state{cfg = #cfg{writer_pid = WriterPid,
+                              channel_num = Ch}} = State0) ->
     {Reply, State} = handle_queue_event(QEvent, State0),
     [rabbit_amqp1_0_writer:send_command(WriterPid, Ch, F) ||
      F <- flow_fields(Reply, State)],
@@ -261,8 +263,8 @@ send_delivery_state_changes(#state{stashed_rejected = [],
                                    stashed_settled = [],
                                    stashed_eol = []} = State) ->
     State;
-send_delivery_state_changes(#state{writer_pid = Writer,
-                                   channel_num = ChannelNum} = State0) ->
+send_delivery_state_changes(State0 = #state{cfg = #cfg{writer_pid = Writer,
+                                                       channel_num = ChannelNum}}) ->
     %% 1. Process queue rejections.
     {RejectedIds, GrantCredits0, State1} = handle_stashed_rejected(State0),
     send_dispositions(RejectedIds, #'v1_0.rejected'{}, Writer, ChannelNum),
@@ -527,10 +529,8 @@ handle_control(#'v1_0.begin'{next_outgoing_id = ?UINT(RemoteNextOut),
                              incoming_window = ?UINT(RemoteInWindow),
                              outgoing_window = ?UINT(RemoteOutWindow),
                              handle_max = HandleMax0},
-               #state{next_outgoing_id = LocalNextOut,
-                      channel_num = Channel} = State0) ->
-    InWindow = ?MAX_SESSION_WINDOW_SIZE,
-    OutWindow = ?MAX_SESSION_WINDOW_SIZE,
+               State0 = #state{next_outgoing_id = LocalNextOut,
+                               cfg = #cfg{channel_num = Channel}}) ->
     HandleMax = case HandleMax0 of
                     ?UINT(Max) -> Max;
                     _ -> ?DEFAULT_MAX_HANDLE
@@ -538,15 +538,13 @@ handle_control(#'v1_0.begin'{next_outgoing_id = ?UINT(RemoteNextOut),
     Reply = #'v1_0.begin'{remote_channel = {ushort, Channel},
                           handle_max = ?UINT(HandleMax),
                           next_outgoing_id = ?UINT(LocalNextOut),
-                          incoming_window = ?UINT(InWindow),
-                          outgoing_window = ?UINT(OutWindow)},
-    State = State0#state{outgoing_window = OutWindow,
-                         outgoing_window_max = OutWindow,
+                          incoming_window = ?UINT(?MAX_SESSION_WINDOW_SIZE),
+                          outgoing_window = ?UINT(?MAX_SESSION_WINDOW_SIZE)},
+    State = State0#state{outgoing_window = ?MAX_SESSION_WINDOW_SIZE,
+                         incoming_window = ?MAX_SESSION_WINDOW_SIZE,
                          next_incoming_id = RemoteNextOut,
                          remote_incoming_window = RemoteInWindow,
-                         remote_outgoing_window = RemoteOutWindow,
-                         incoming_window  = InWindow,
-                         incoming_window_max = InWindow},
+                         remote_outgoing_window = RemoteOutWindow},
     reply0(Reply, State);
 
 handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
@@ -557,9 +555,9 @@ handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
                               rcv_settle_mode = RcvSettleMode,
                               target = Target,
                               initial_delivery_count = ?UINT(InitTransfer)} = Attach,
-               #state{vhost = Vhost,
-                      user = User,
-                      incoming_links = IncomingLinks0} = State0) ->
+               State0 = #state{incoming_links = IncomingLinks0,
+                               cfg = #cfg{vhost = Vhost,
+                                          user = User}}) ->
     ok = validate_attach(Attach),
     case ensure_target(Target, Vhost, User) of
         {ok, XName, RoutingKey, QNameBin} ->
@@ -610,10 +608,10 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                               source = Source,
                               snd_settle_mode = SndSettleMode,
                               rcv_settle_mode = RcvSettleMode} = Attach,
-               #state{vhost = Vhost,
-                      user = User = #user{username = Username},
-                      queue_states = QStates0,
-                      outgoing_links = OutgoingLinks0} = State0) ->
+               State0 = #state{queue_states = QStates0,
+                               outgoing_links = OutgoingLinks0,
+                               cfg = #cfg{vhost = Vhost,
+                                          user = User = #user{username = Username}}}) ->
 
     ok = validate_attach(Attach),
     {SndSettled, EffectiveSndSettleMode}
@@ -721,9 +719,6 @@ handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle)}, MsgPart},
                            "Unknown link handle: ~p", [Handle])
     end;
 
-handle_control(#'v1_0.disposition'{role = ?RECV_ROLE} = Disp, State) ->
-    settle(Disp, State);
-
 %% Flow control. These frames come with two pieces of information:
 %% the session window, and optionally, credit for a particular link.
 %% We'll deal with each of them separately.
@@ -766,13 +761,14 @@ handle_control(#'v1_0.flow'{handle = Handle} = Flow,
 
 handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
                               closed = Closed},
-               #state{writer_pid = WriterPid,
-                      channel_num = Ch,
-                      queue_states = QStates0,
-                      vhost = Vhost,
-                      user = #user{username = Username},
-                      incoming_links = IncomingLinks,
-                      outgoing_links = OutgoingLinks0} = State0) ->
+               State0 = #state{queue_states = QStates0,
+                               incoming_links = IncomingLinks,
+                               outgoing_links = OutgoingLinks0,
+                               cfg = #cfg{
+                                        writer_pid = WriterPid,
+                                        vhost = Vhost,
+                                        user = #user{username = Username},
+                                        channel_num = Ch}}) ->
     %% TODO delete queue if closed flag is set to true? see 2.6.6
     %% TODO keep the state around depending on the lifetime
     {QStates, OutgoingLinks} =
@@ -805,8 +801,9 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
                                          closed = Closed}),
     {noreply, State};
 
-handle_control(#'v1_0.end'{}, #state{writer_pid = WriterPid,
-                                     channel_num = Ch} = State0) ->
+handle_control(#'v1_0.end'{},
+               State0 = #state{cfg = #cfg{writer_pid = WriterPid,
+                                          channel_num = Ch}}) ->
     State = send_delivery_state_changes(State0),
     ok = try rabbit_amqp1_0_writer:send_command_sync(WriterPid, Ch, #'v1_0.end'{})
          catch exit:{Reason, {gen_server, call, _ArgList}}
@@ -818,137 +815,13 @@ handle_control(#'v1_0.end'{}, #state{writer_pid = WriterPid,
          end,
     {stop, normal, State};
 
-handle_control(Frame, _State) ->
-    protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                   "Unexpected frame ~tp",
-                   [amqp10_framing:pprint(Frame)]).
-
-send_pending_transfers(#state{outgoing_window = LocalSpace,
-                              remote_incoming_window = RemoteSpace,
-                              writer_pid = WriterPid,
-                              channel_num = Ch,
-                              pending_transfers = Buf0,
-                              queue_states = QStates} = State0)
-  when RemoteSpace > 0 andalso LocalSpace > 0 ->
-    Space = erlang:min(LocalSpace, RemoteSpace),
-    case queue:out(Buf0) of
-        {empty, Buf} ->
-            State0#state{pending_transfers = Buf};
-        {{value, #pending_transfer{
-                    frames = Frames,
-                    link_handle = ?UINT(Handle),
-                    queue_pid = QPid,
-                    outgoing_unsettled = #outgoing_unsettled{
-                                            queue_name = QName
-                                           }} = Pending}, Buf1} ->
-            SendFun = case rabbit_queue_type:module(QName, QStates) of
-                          {ok, rabbit_classic_queue} ->
-                              fun(T, C) ->
-                                      rabbit_amqp1_0_writer:send_command_and_notify(
-                                        WriterPid, Ch, QPid, self(), T, C)
-                              end;
-                          {ok, _QType} ->
-                              fun(T, C) ->
-                                      rabbit_amqp1_0_writer:send_command(
-                                        WriterPid, Ch, T, C)
-                              end
-                      end,
-            %% rabbit_basic:maybe_gc_large_msg(Content, GCThreshold)
-            case send_frames(SendFun, Frames, Space) of
-                {all, SpaceLeft} ->
-                    State1 = #state{outgoing_links = OutgoingLinks0} = record_transfers(
-                                                                         Space - SpaceLeft, State0),
-                    OutgoingLinks = maps:update_with(
-                                      Handle,
-                                      fun(Link = #outgoing_link{delivery_count = C}) ->
-                                              Link#outgoing_link{delivery_count = add(C, 1)}
-                                      end,
-                                      OutgoingLinks0),
-                    State2 = State1#state{outgoing_links = OutgoingLinks},
-                    State = record_outgoing_unsettled(Pending, State2),
-                    send_pending_transfers(State#state{pending_transfers = Buf1});
-                {some, Rest} ->
-                    State = record_transfers(Space, State0),
-                    Buf = queue:in_r(Pending#pending_transfer{frames = Rest}, Buf1),
-                    send_pending_transfers(State#state{pending_transfers = Buf})
-            end
-    end;
-send_pending_transfers(#state{remote_incoming_window = RemoteSpace,
-                              writer_pid = WriterPid,
-                              channel_num = Ch} = State0)
-  when RemoteSpace > 0 ->
-    {Flow = #'v1_0.flow'{}, State} = bump_outgoing_window(State0),
-    rabbit_amqp1_0_writer:send_command(WriterPid, Ch, flow_fields(Flow, State)),
-    send_pending_transfers(State);
-send_pending_transfers(State) ->
-    State.
-
-send_frames(_, [], Left) ->
-    {all, Left};
-send_frames(_, Rest, 0) ->
-    {some, Rest};
-send_frames(SendFun, [[T, C] | Rest], Left) ->
-    ok = SendFun(T, C),
-    send_frames(SendFun, Rest, Left - 1).
-
-record_outgoing_unsettled(#pending_transfer{queue_ack_required = true,
-                                            delivery_id = DeliveryId,
-                                            outgoing_unsettled = Unsettled},
-                          #state{outgoing_unsettled_map = Map0} = State) ->
-    %% Record by DeliveryId such that we will ack this message to the queue
-    %% once we receive the DISPOSITION from the AMQP client.
-    Map = Map0#{DeliveryId => Unsettled},
-    State#state{outgoing_unsettled_map = Map};
-record_outgoing_unsettled(#pending_transfer{queue_ack_required = false}, State) ->
-    %% => 'snd-settle-mode' at attachment must have been 'settled'.
-    %% => 'settled' field in TRANSFER must have been 'true'.
-    %% => AMQP client won't ack this message.
-    %% Also, queue client already acked to queue on behalf of us.
-    State.
-
-reply0([], State) ->
-    {noreply, State};
-reply0(Reply, State) ->
-    {reply, flow_fields(Reply, State), State}.
-
-incr_incoming_id(#state{next_incoming_id = NextIn,
-                        incoming_window = InWindow,
-                        incoming_window_max = InWindowMax,
-                        remote_outgoing_window = RemoteOut} = State) ->
-    NewOutWindow = RemoteOut - 1,
-    InWindow1 = InWindow - 1,
-    NewNextIn = add(NextIn, 1),
-    %% If we've reached halfway, open the window
-    {Flows, NewInWindow} =
-    if InWindow1 =< (InWindowMax div 2) ->
-           {[#'v1_0.flow'{}], InWindowMax};
-       true ->
-           {[], InWindow1}
-    end,
-    {Flows, State#state{next_incoming_id = NewNextIn,
-                        incoming_window = NewInWindow,
-                        remote_outgoing_window = NewOutWindow}}.
-
-record_transfers(NumTransfers,
-                 #state{remote_incoming_window = RemoteInWindow,
-                        outgoing_window = OutWindow,
-                        next_outgoing_id = NextOutId} = State) ->
-    State#state{remote_incoming_window = RemoteInWindow - NumTransfers,
-                outgoing_window = OutWindow - NumTransfers,
-                next_outgoing_id = add(NextOutId, NumTransfers)}.
-
-%% Make sure we have "room" in our outgoing window by bumping the
-%% window if necessary. TODO this *could* be based on how much
-%% notional "room" there is in outgoing_unsettled.
-bump_outgoing_window(State = #state{outgoing_window_max = OutMax}) ->
-    {#'v1_0.flow'{}, State#state{outgoing_window = OutMax}}.
-
-settle(#'v1_0.disposition'{first = ?UINT(First),
-                           last = Last0,
-                           state = Outcome,
-                           settled = DispositionSettled} = Disposition,
-       #state{outgoing_unsettled_map = UnsettledMap,
-              queue_states = QStates0} = State0) ->
+handle_control(#'v1_0.disposition'{role = ?RECV_ROLE,
+                                   first = ?UINT(First),
+                                   last = Last0,
+                                   state = Outcome,
+                                   settled = DispositionSettled} = Disposition,
+               #state{outgoing_unsettled_map = UnsettledMap,
+                      queue_states = QStates0} = State0) ->
     Last = case Last0 of
                ?UINT(L) ->
                    L;
@@ -966,7 +839,7 @@ settle(#'v1_0.disposition'{first = ?UINT(First),
             case DispositionRangeSize =< UnsettledMapSize of
                 true ->
                     %% It is cheaper to iterate over the range of settled delivery IDs.
-                    maybe_settle(First, Last, #{}, UnsettledMap);
+                    settle_delivery_ids(First, Last, #{}, UnsettledMap);
                 false ->
                     %% It is cheaper to iterate over the outgoing unsettled map.
                     maps:fold(
@@ -1018,19 +891,145 @@ settle(#'v1_0.disposition'{first = ?UINT(First),
                      end,
             {Reply, State} = handle_queue_actions(Actions, State1),
             reply0(Reply0 ++ Reply, State)
-    end.
+    end;
 
-maybe_settle(Current, Last, Settled, Unsettled) ->
+handle_control(Frame, _State) ->
+    protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
+                   "Unexpected frame ~tp",
+                   [amqp10_framing:pprint(Frame)]).
+
+send_pending_transfers(
+  State0 = #state{outgoing_window = LocalSpace,
+                  remote_incoming_window = RemoteSpace,
+                  pending_transfers = Buf0,
+                  queue_states = QStates,
+                  cfg = #cfg{writer_pid = WriterPid,
+                             channel_num = Ch}})
+  when RemoteSpace > 0 andalso LocalSpace > 0 ->
+    Space = erlang:min(LocalSpace, RemoteSpace),
+    case queue:out(Buf0) of
+        {empty, Buf} ->
+            State0#state{pending_transfers = Buf};
+        {{value, #pending_transfer{
+                    frames = Frames,
+                    queue_pid = QPid,
+                    outgoing_unsettled = #outgoing_unsettled{
+                                            link_handle = HandleInt,
+                                            queue_name = QName
+                                           }} = Pending}, Buf1} ->
+            SendFun = case rabbit_queue_type:module(QName, QStates) of
+                          {ok, rabbit_classic_queue} ->
+                              fun(T, C) ->
+                                      rabbit_amqp1_0_writer:send_command_and_notify(
+                                        WriterPid, Ch, QPid, self(), T, C)
+                              end;
+                          {ok, _QType} ->
+                              fun(T, C) ->
+                                      rabbit_amqp1_0_writer:send_command(
+                                        WriterPid, Ch, T, C)
+                              end
+                      end,
+            %% rabbit_basic:maybe_gc_large_msg(Content, GCThreshold)
+            case send_frames(SendFun, Frames, Space) of
+                {all, SpaceLeft} ->
+                    State1 = #state{outgoing_links = OutgoingLinks0} = record_transfers(
+                                                                         Space - SpaceLeft, State0),
+                    OutgoingLinks = maps:update_with(
+                                      HandleInt,
+                                      fun(Link = #outgoing_link{delivery_count = C}) ->
+                                              Link#outgoing_link{delivery_count = add(C, 1)}
+                                      end,
+                                      OutgoingLinks0),
+                    State2 = State1#state{outgoing_links = OutgoingLinks},
+                    State = record_outgoing_unsettled(Pending, State2),
+                    send_pending_transfers(State#state{pending_transfers = Buf1});
+                {some, Rest} ->
+                    State = record_transfers(Space, State0),
+                    Buf = queue:in_r(Pending#pending_transfer{frames = Rest}, Buf1),
+                    send_pending_transfers(State#state{pending_transfers = Buf})
+            end
+    end;
+send_pending_transfers(
+  State0 = #state{remote_incoming_window = RemoteSpace,
+                  cfg = #cfg{writer_pid = WriterPid,
+                             channel_num = Ch}})
+  when RemoteSpace > 0 ->
+    {Flow = #'v1_0.flow'{}, State} = bump_outgoing_window(State0),
+    rabbit_amqp1_0_writer:send_command(WriterPid, Ch, flow_fields(Flow, State)),
+    send_pending_transfers(State);
+send_pending_transfers(State) ->
+    State.
+
+send_frames(_, [], Left) ->
+    {all, Left};
+send_frames(_, Rest, 0) ->
+    {some, Rest};
+send_frames(SendFun, [[T, C] | Rest], Left) ->
+    ok = SendFun(T, C),
+    send_frames(SendFun, Rest, Left - 1).
+
+record_outgoing_unsettled(#pending_transfer{queue_ack_required = true,
+                                            delivery_id = DeliveryId,
+                                            outgoing_unsettled = Unsettled},
+                          #state{outgoing_unsettled_map = Map0} = State) ->
+    %% Record by DeliveryId such that we will ack this message to the queue
+    %% once we receive the DISPOSITION from the AMQP client.
+    Map = Map0#{DeliveryId => Unsettled},
+    State#state{outgoing_unsettled_map = Map};
+record_outgoing_unsettled(#pending_transfer{queue_ack_required = false}, State) ->
+    %% => 'snd-settle-mode' at attachment must have been 'settled'.
+    %% => 'settled' field in TRANSFER must have been 'true'.
+    %% => AMQP client won't ack this message.
+    %% Also, queue client already acked to queue on behalf of us.
+    State.
+
+reply0([], State) ->
+    {noreply, State};
+reply0(Reply, State) ->
+    {reply, flow_fields(Reply, State), State}.
+
+incr_incoming_id(#state{next_incoming_id = NextIn,
+                        incoming_window = InWindow,
+                        remote_outgoing_window = RemoteOut} = State) ->
+    NewOutWindow = RemoteOut - 1,
+    InWindow1 = InWindow - 1,
+    NewNextIn = add(NextIn, 1),
+    %% If we've reached halfway, open the window
+    {Flows, NewInWindow} =
+    if InWindow1 =< (?MAX_SESSION_WINDOW_SIZE div 2) ->
+           {[#'v1_0.flow'{}], ?MAX_SESSION_WINDOW_SIZE};
+       true ->
+           {[], InWindow1}
+    end,
+    {Flows, State#state{next_incoming_id = NewNextIn,
+                        incoming_window = NewInWindow,
+                        remote_outgoing_window = NewOutWindow}}.
+
+record_transfers(NumTransfers,
+                 #state{remote_incoming_window = RemoteInWindow,
+                        outgoing_window = OutWindow,
+                        next_outgoing_id = NextOutId} = State) ->
+    State#state{remote_incoming_window = RemoteInWindow - NumTransfers,
+                outgoing_window = OutWindow - NumTransfers,
+                next_outgoing_id = add(NextOutId, NumTransfers)}.
+
+%% Make sure we have "room" in our outgoing window by bumping the
+%% window if necessary. TODO this *could* be based on how much
+%% notional "room" there is in outgoing_unsettled.
+bump_outgoing_window(State) ->
+    {#'v1_0.flow'{}, State#state{outgoing_window = ?MAX_SESSION_WINDOW_SIZE}}.
+
+settle_delivery_ids(Current, Last, Settled, Unsettled) ->
     case compare(Current, Last) of
         less ->
-            {Settled1, Unsettled1} = maybe_settle0(Current, Settled, Unsettled),
+            {Settled1, Unsettled1} = settle_delivery_id(Current, Settled, Unsettled),
             Next = add(Current, 1),
-            maybe_settle(Next, Last, Settled1, Unsettled1);
+            settle_delivery_ids(Next, Last, Settled1, Unsettled1);
         equal ->
-            maybe_settle0(Current, Settled, Unsettled)
+            settle_delivery_id(Current, Settled, Unsettled)
     end.
 
-maybe_settle0(Current, Settled, Unsettled) ->
+settle_delivery_id(Current, Settled, Unsettled) ->
     case maps:take(Current, Unsettled) of
         {#outgoing_unsettled{queue_name = QName,
                              consumer_tag = Ctag,
@@ -1260,10 +1259,10 @@ handle_queue_actions(Actions, State0) ->
 
 handle_deliver(ConsumerTag, AckRequired,
                {QName, QPid, MsgId, Redelivered, Mc0},
-               #state{pending_transfers = Pendings,
-                      next_delivery_id = DeliveryId,
-                      outgoing_links = OutgoingLinks,
-                      frame_max = FrameMax} = State0) ->
+               State0 = #state{pending_transfers = Pendings,
+                               next_delivery_id = DeliveryId,
+                               outgoing_links = OutgoingLinks,
+                               cfg = #cfg{frame_max = FrameMax}}) ->
     Handle = ctag_to_handle(ConsumerTag),
     case OutgoingLinks of
         #{Handle := #outgoing_link{send_settled = SendSettled}} ->
@@ -1310,6 +1309,7 @@ handle_deliver(ConsumerTag, AckRequired,
                          _ -> encode_frames(Transfer, Sections, FrameMax - TLen, [])
                      end,
             Del = #outgoing_unsettled{
+                     link_handle = Handle,
                      msg_id = MsgId,
                      consumer_tag = ConsumerTag,
                      queue_name = QName,
@@ -1318,7 +1318,6 @@ handle_deliver(ConsumerTag, AckRequired,
                      %% the message is sitting here for a long time.
                      delivered_at = os:system_time(millisecond)},
             Pending = #pending_transfer{
-                         link_handle = ?UINT(Handle),
                          frames = Frames,
                          queue_ack_required = AckRequired,
                          queue_pid = QPid,
@@ -1374,9 +1373,8 @@ incoming_link_transfer(
                  msg_acc = MsgAcc,
                  send_settle_mode = SSM,
                  recv_settle_mode = RSM} = Link0,
-  #state{queue_states = QStates0,
-         user = User
-        } = State0) ->
+  State0 = #state{queue_states = QStates0,
+                  cfg = #cfg{user = User}}) ->
     #incoming_link{delivery_id = DeliveryId} = set_delivery_id(DeliveryId0, Link0),
     MsgBin = iolist_to_binary(lists:reverse([MsgPart | MsgAcc])),
     Sections = amqp10_framing:decode_bin(MsgBin),
@@ -1527,8 +1525,8 @@ handle_outgoing_link_flow_control(
                drain = Drain0,
                echo = Echo0,
                properties = Properties0},
-  #state{vhost = Vhost,
-         queue_states = QStates0} = State0) ->
+  State0 = #state{queue_states = QStates0,
+                  cfg = #cfg{vhost = Vhost}}) ->
     ?UINT(DeliveryCountRcv) = default(DeliveryCountRcv0, ?UINT(DeliveryCountSnd)),
     %% See section 2.6.7
     %%TODO use serial number arithmetic since delivery-count is a sequence number
@@ -1930,3 +1928,40 @@ check_topic_authorisation(_, _, _, _) ->
 % clear_permission_cache() ->
 %     erase(?TOPIC_PERMISSION_CACHE),
 %     ok.
+
+format_status(
+  #{state := #state{cfg = Cfg,
+                    pending_transfers = PendingTransfers,
+                    remote_incoming_window = RemoteIncomingWindow,
+                    remote_outgoing_window = RemoteOutgoingWindow,
+                    next_incoming_id = NextIncomingId,
+                    incoming_window = IncomingWindow,
+                    next_outgoing_id = NextOutgoingId,
+                    next_delivery_id = NextDeliveryId,
+                    outgoing_window = OutgoingWindow,
+                    incoming_links = IncomingLinks,
+                    outgoing_links = OutgoingLinks,
+                    outgoing_unsettled_map = OutgoingUnsettledMap,
+                    stashed_rejected = StashedRejected,
+                    stashed_settled = StashedSettled,
+                    stashed_eol = StashedEol,
+                    queue_states = QueueStates}} = Status) ->
+
+    State = #{cfg => Cfg,
+              pending_transfers => queue:len(PendingTransfers),
+              remote_incoming_window => RemoteIncomingWindow,
+              remote_outgoing_window => RemoteOutgoingWindow,
+              next_incoming_id => NextIncomingId,
+              incoming_window => IncomingWindow,
+              next_outgoing_id => NextOutgoingId,
+              next_delivery_id => NextDeliveryId,
+              outgoing_window => OutgoingWindow,
+              incoming_links => IncomingLinks,
+              outgoing_links => OutgoingLinks,
+              outgoing_unsettled_map => OutgoingUnsettledMap,
+              stashed_rejected => StashedRejected,
+              stashed_settled => StashedSettled,
+              stashed_eol => StashedEol,
+              queue_states => rabbit_queue_type:format_status(QueueStates)},
+
+    maps:update(state, State, Status).
