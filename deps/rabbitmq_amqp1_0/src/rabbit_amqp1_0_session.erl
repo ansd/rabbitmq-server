@@ -90,7 +90,6 @@
          }).
 
 -record(outgoing_unsettled, {
-          link_handle :: link_handle(),
           %% The queue sent us this consumer scoped sequence number.
           msg_id :: rabbit_amqqueue:msg_id(),
           consumer_tag :: rabbit_types:ctag(),
@@ -468,7 +467,7 @@ destroy_link(Handle, Link, QNameBin, QPos, Acc = {Frames, GrantCreds, Links}) ->
              [detach(Handle, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
              %% Don't grant credits for a link that we destroy.
              maps:remove(Handle, GrantCreds),
-             %%TODO release delivery IDs first?
+             %%TODO release delivery IDs first via remove_link_from_outgoing_unsettled_map if it's an outgoing link
              maps:remove(Handle, Links)
             };
         _ ->
@@ -634,7 +633,6 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
         {ok, QNameBin} ->
             Spec = #{no_ack => SndSettled,
                      channel_pid => self(),
-                     %%TODO check if limiter required for consumer credit
                      limiter_pid => none,
                      limiter_active => false,
                      mode => credited,
@@ -771,6 +769,7 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
                State0 = #state{queue_states = QStates0,
                                incoming_links = IncomingLinks,
                                outgoing_links = OutgoingLinks0,
+                               outgoing_unsettled_map = Unsettled0,
                                cfg = #cfg{
                                         writer_pid = WriterPid,
                                         vhost = Vhost,
@@ -778,31 +777,46 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
                                         channel_num = Ch}}) ->
     %% TODO delete queue if closed flag is set to true? see 2.6.6
     %% TODO keep the state around depending on the lifetime
-    {QStates, OutgoingLinks} =
-    case maps:take(HandleInt, OutgoingLinks0) of
-        {#outgoing_link{queue = QNameBin}, OutgoingLinks1} ->
-            case rabbit_amqqueue:lookup(QNameBin, Vhost) of
-                {ok, Q} ->
-                    Ctag = handle_to_ctag(HandleInt),
-                    case rabbit_queue_type:cancel(Q, Ctag, undefined, Username, QStates0) of
-                        {ok, QStates1} ->
-                            {QStates1, OutgoingLinks1};
-                        {error, Reason} ->
-                            protocol_error(
-                              ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                              "Failed to cancel consuming from ~s: ~tp",
-                              [rabbit_misc:rs(amqqueue:get_name(Q)), Reason])
-                    end;
-                {error, not_found} ->
-                    {QStates0, OutgoingLinks1}
-            end;
-        error ->
-            {QStates0, OutgoingLinks0}
-    end,
+    {QStates, Unsettled, OutgoingLinks}
+    = case maps:take(HandleInt, OutgoingLinks0) of
+          {#outgoing_link{queue = QNameBin}, OutgoingLinks1} ->
+              QName = rabbit_misc:r(Vhost, queue, QNameBin),
+              case rabbit_amqqueue:lookup(QName) of
+                  {ok, Q} ->
+                      Ctag = handle_to_ctag(HandleInt),
+                      case rabbit_queue_type:cancel(Q, Ctag, undefined, Username, QStates0) of
+                          {ok, QStates1} ->
+                              {Unsettled1, MsgIds} = remove_link_from_outgoing_unsettled_map(Ctag, Unsettled0),
+                              case MsgIds of
+                                  [] ->
+                                      {QStates1, Unsettled0, OutgoingLinks1};
+                                  _ ->
+                                      case rabbit_queue_type_settle(QName, requeue, Ctag, MsgIds, QStates1) of
+                                          {ok, QStates2, _Actions = []} ->
+                                              {QStates2, Unsettled1, OutgoingLinks1};
+                                          {protocol_error, _ErrorType, Reason, ReasonArgs} ->
+                                              protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
+                                                             Reason, ReasonArgs)
+                                      end
+                              end;
+                          {error, Reason} ->
+                              protocol_error(
+                                ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
+                                "Failed to cancel consuming from ~s: ~tp",
+                                [rabbit_misc:rs(amqqueue:get_name(Q)), Reason])
+                      end;
+                  {error, not_found} ->
+                      %%TODO still delete delivery IDs from outgoing_unettled_map
+                      {QStates0, Unsettled0, OutgoingLinks1}
+              end;
+          error ->
+              %%TODO still delete delivery IDs from outgoing_unettled_map ?
+              {QStates0, Unsettled0, OutgoingLinks0}
+      end,
     State = State0#state{queue_states = QStates,
+                         incoming_links = maps:remove(HandleInt, IncomingLinks),
                          outgoing_links = OutgoingLinks,
-                         %%TODO release delivery IDs first?
-                         incoming_links = maps:remove(HandleInt, IncomingLinks)},
+                         outgoing_unsettled_map = Unsettled},
     ok = rabbit_amqp1_0_writer:send_command(
            WriterPid, Ch, #'v1_0.detach'{handle = Handle,
                                          closed = Closed}),
@@ -877,10 +891,8 @@ handle_control(#'v1_0.disposition'{role = ?RECV_ROLE,
             SettleOp = settle_op_from_outcome(Outcome),
             {QStates, Actions} =
             maps:fold(
-              fun({QName, Ctag}, MsgIds0, {QS0, ActionsAcc}) ->
-                      %% Classic queues expect message IDs in sorted order.
-                      MsgIds = lists:usort(MsgIds0),
-                      case rabbit_queue_type:settle(QName, SettleOp, Ctag, MsgIds, QS0) of
+              fun({QName, Ctag}, MsgIds, {QS0, ActionsAcc}) ->
+                      case rabbit_queue_type_settle(QName, SettleOp, Ctag, MsgIds, QS0) of
                           {ok, QS, Actions0} ->
                               {QS, ActionsAcc ++ Actions0};
                           {protocol_error, _ErrorType, Reason, ReasonArgs} ->
@@ -905,6 +917,11 @@ handle_control(Frame, _State) ->
                    "Unexpected frame ~tp",
                    [amqp10_framing:pprint(Frame)]).
 
+rabbit_queue_type_settle(QName, SettleOp, Ctag, MsgIds0, QStates) ->
+    %% Classic queues expect message IDs in sorted order.
+    MsgIds = lists:usort(MsgIds0),
+    rabbit_queue_type:settle(QName, SettleOp, Ctag, MsgIds, QStates).
+
 send_pending_transfers(
   State0 = #state{outgoing_window = LocalSpace,
                   remote_incoming_window = RemoteSpace,
@@ -921,7 +938,7 @@ send_pending_transfers(
                     frames = Frames,
                     queue_pid = QPid,
                     outgoing_unsettled = #outgoing_unsettled{
-                                            link_handle = HandleInt,
+                                            consumer_tag = Ctag,
                                             queue_name = QName
                                            }} = Pending}, Buf1} ->
             SendFun = case rabbit_queue_type:module(QName, QStates) of
@@ -941,6 +958,7 @@ send_pending_transfers(
                 {all, SpaceLeft} ->
                     State1 = #state{outgoing_links = OutgoingLinks0} = record_transfers(
                                                                          Space - SpaceLeft, State0),
+                    HandleInt = ctag_to_handle(Ctag),
                     OutgoingLinks = maps:update_with(
                                       HandleInt,
                                       fun(Link = #outgoing_link{delivery_count = C}) ->
@@ -1316,7 +1334,6 @@ handle_deliver(ConsumerTag, AckRequired,
                          _ -> encode_frames(Transfer, Sections, FrameMax - TLen, [])
                      end,
             Del = #outgoing_unsettled{
-                     link_handle = Handle,
                      msg_id = MsgId,
                      consumer_tag = ConsumerTag,
                      queue_name = QName,
@@ -1857,6 +1874,24 @@ queue_is_durable(undefined) ->
 %% For simplicity, we choose to use the same handle.
 output_handle(InputHandle) ->
     _Outputhandle = InputHandle.
+
+-spec remove_link_from_outgoing_unsettled_map(link_handle() | rabbit_types:ctag(), Map) ->
+    {Map, [rabbit_amqqueue:msg_id()]}
+      when Map :: #{delivery_number() => #outgoing_unsettled{}}.
+remove_link_from_outgoing_unsettled_map(Handle, Map)
+  when is_integer(Handle) ->
+    remove_link_from_outgoing_unsettled_map(handle_to_ctag(Handle), Map);
+remove_link_from_outgoing_unsettled_map(Ctag, Map)
+  when is_binary(Ctag) ->
+    maps:fold(fun(DeliveryId,
+                  #outgoing_unsettled{consumer_tag = Tag,
+                                      msg_id = Id},
+                  {M, Ids})
+                    when Tag =:= Ctag ->
+                      {maps:remove(DeliveryId, M), [Id | Ids]};
+                 (_, _, Acc) ->
+                      Acc
+              end, {Map, []}, Map).
 
 routing_key(undefined, XName) ->
     protocol_error(?V_1_0_AMQP_ERROR_INVALID_FIELD,

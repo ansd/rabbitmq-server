@@ -75,7 +75,8 @@ groups() ->
        stop_quorum_queue,
        stop_stream,
        single_active_consumer_classic_queue,
-       single_active_consumer_quorum_queue
+       single_active_consumer_quorum_queue,
+       detach_requeues
       ]},
 
      {cluster_size_3, [shuffle],
@@ -1594,6 +1595,105 @@ single_active_consumer(QType, Config) ->
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection),
     delete_queue(Config, QName).
+
+%% "A session endpoint can choose to unmap its output handle for a link. In this case, the endpoint MUST
+%% send a detach frame to inform the remote peer that the handle is no longer attached to the link endpoint.
+%% If both endpoints do this, the link MAY return to a fully detached state. Note that in this case the
+%% link endpoints MAY still indirectly communicate via the session, as there could still be active deliveries
+%% on the link referenced via delivery-id." [2.6.4]
+%%
+%% "The disposition performative MAY refer to deliveries on links that are no longer attached. As long as
+%% the links have not been closed or detached with an error then the deliveries are still "live" and the
+%% updated state MUST be applied." [2.7.6]
+%%
+%% Although the spec allows to settle delivery IDs on detached links, RabbitMQ does not respect the 'closed'
+%% field of the DETACH frame and therefore handles every DETACH frame as closed. Since the link is closed,
+%% we expect every outstanding delivery to be requeued.
+%%
+%% In addition to consumer cancellation, detaching a link therefore causes in flight deliveries to be requeued.
+%%
+%% Note that this behaviour is different from merely consumer cancellation in AMQP legacy:
+%% "After a consumer is cancelled there will be no future deliveries dispatched to it. Note that there can
+%% still be "in flight" deliveries dispatched previously. Cancelling a consumer will neither discard nor requeue them."
+%% [https://www.rabbitmq.com/consumers.html#unsubscribing]
+detach_requeues(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QName,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
+
+    %% Attach 1 sender and 2 receivers to the queue.
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    Address = <<"/amq/queue/", QName/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address, settled),
+    ok = wait_for_credit(Sender),
+    {ok, Receiver1} = amqp10_client:attach_receiver_link(
+                        Session, <<"recv 1">>, Address, unsettled),
+    receive {amqp10_event, {link, Receiver1, attached}} -> ok
+    after 5000 -> ct:fail("missing attached")
+    end,
+    {ok, Receiver2} = amqp10_client:attach_receiver_link(
+                        Session, <<"recv 2">>, Address, unsettled),
+    receive {amqp10_event, {link, Receiver2, attached}} -> ok
+    after 5000 -> ct:fail("missing attached")
+    end,
+    flush(attached),
+
+    ok = amqp10_client:flow_link_credit(Receiver1, 50, never),
+    ok = amqp10_client:flow_link_credit(Receiver2, 50, never),
+
+    %% Let's send 4 messages to the queue.
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag1">>, <<"m1">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag2">>, <<"m2">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag3">>, <<"m3">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"tag4">>, <<"m4">>, true)),
+    ok = amqp10_client:detach_link(Sender),
+
+    %% The queue should serve round robin.
+    [Msg1, Msg3] = receive_messages(Receiver1, 2),
+    [Msg2, Msg4] = receive_messages(Receiver2, 2),
+    ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1)),
+    ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2)),
+    ?assertEqual([<<"m3">>], amqp10_msg:body(Msg3)),
+    ?assertEqual([<<"m4">>], amqp10_msg:body(Msg4)),
+
+    %% Let's detach the 1st receiver.
+    ok = amqp10_client:detach_link(Receiver1),
+    receive {amqp10_event, {link, Receiver1, {detached, normal}}} -> ok
+    after 5000 -> ct:fail("missing detached")
+    end,
+
+    %% Since Receiver1 hasn't settled its 2 deliveries,
+    %% we expect them to be re-queued and re-delivered to Receiver2.
+    [Msg1b, Msg3b] = receive_messages(Receiver2, 2),
+    ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1b)),
+    ?assertEqual([<<"m3">>], amqp10_msg:body(Msg3b)),
+
+    %% Receiver2 accepts all 4 messages.
+    ok = amqp10_client_session:disposition(
+           Session, receiver,
+           amqp10_msg:delivery_id(Msg2),
+           amqp10_msg:delivery_id(Msg3b),
+           true, accepted),
+
+    %% Check that there are no in flight deliveries in the server session.
+    [SessionPid] = rpc(Config, rabbit_amqp1_0_session, list_local, []),
+    %% Let server process DISPOSITION
+    timer:sleep(5),
+    ct:pal("state of server session proc:~n~p",
+           [sys:get_state(SessionPid)]),
+
+    ok = amqp10_client:detach_link(Receiver2),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch).
 
 auth_attempt_metrics(Config) ->
     open_and_close_connection(Config),
