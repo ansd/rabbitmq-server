@@ -445,34 +445,38 @@ destroy_links(#resource{kind = queue,
               Frames0,
               GrantCredits0,
               #state{incoming_links = IncomingLinks0,
-                     outgoing_links = OutgoingLinks0} = State0) ->
+                     outgoing_links = OutgoingLinks0,
+                     outgoing_unsettled_map = Unsettled0} = State0) ->
     {Frames1,
      GrantCredits,
      IncomingLinks} = maps:fold(fun(Handle, Link, Acc) ->
-                                        destroy_link(Handle, Link, QNameBin, #incoming_link.queue, Acc)
+                                        destroy_incoming_link(Handle, Link, QNameBin, Acc)
                                 end, {Frames0, GrantCredits0, IncomingLinks0}, IncomingLinks0),
     {Frames,
-     _,
+     Unsettled,
      OutgoingLinks} = maps:fold(fun(Handle, Link, Acc) ->
-                                        destroy_link(Handle, Link, QNameBin, #outgoing_link.queue, Acc)
-                                end, {Frames1, #{}, OutgoingLinks0}, OutgoingLinks0),
+                                        destroy_outgoing_link(Handle, Link, QNameBin, Acc)
+                                end, {Frames1, Unsettled0, OutgoingLinks0}, OutgoingLinks0),
     State = State0#state{incoming_links = IncomingLinks,
-                         outgoing_links = OutgoingLinks},
+                         outgoing_links = OutgoingLinks,
+                         outgoing_unsettled_map = Unsettled},
     {Frames, GrantCredits, State}.
 
-destroy_link(Handle, Link, QNameBin, QPos, Acc = {Frames, GrantCreds, Links}) ->
-    case element(QPos, Link) of
-        QNameBin ->
-            {
-             [detach(Handle, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
-             %% Don't grant credits for a link that we destroy.
-             maps:remove(Handle, GrantCreds),
-             %%TODO release delivery IDs first via remove_link_from_outgoing_unsettled_map if it's an outgoing link
-             maps:remove(Handle, Links)
-            };
-        _ ->
-            Acc
-    end.
+destroy_incoming_link(Handle, #incoming_link{queue = QNameBin}, QNameBin, {Frames, GrantCreds, Links}) ->
+    {[detach(Handle, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
+     %% Don't grant credits for a link that we destroy.
+     maps:remove(Handle, GrantCreds),
+     maps:remove(Handle, Links)};
+destroy_incoming_link(_, _, _, Acc) ->
+    Acc.
+
+destroy_outgoing_link(Handle, #outgoing_link{queue = QNameBin}, QNameBin, {Frames, Unsettled0, Links}) ->
+    {Unsettled, _RemovedMsgIds} = remove_link_from_outgoing_unsettled_map(Handle, Unsettled0),
+    {[detach(Handle, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
+     Unsettled,
+     maps:remove(Handle, Links)};
+destroy_outgoing_link(_, _, _, Acc) ->
+    Acc.
 
 detach(Handle, ErrorCondition) ->
     rabbit_log:warning("Detaching link handle ~b due to error condition: ~tp",
@@ -715,7 +719,6 @@ handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle)}, MsgPart},
                     %% with appropriate error information supplied in the error field of the
                     %% detach frame. The link endpoint MUST then be destroyed." [2.6.5]
                     Reply = Reply0 ++ Flows,
-                    %%TODO release delivery IDs first?
                     State = State1#state{incoming_links = maps:remove(Handle, IncomingLinks)},
                     reply0(Reply, State)
             end;
@@ -775,6 +778,7 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
                                         vhost = Vhost,
                                         user = #user{username = Username},
                                         channel_num = Ch}}) ->
+    Ctag = handle_to_ctag(HandleInt),
     %% TODO delete queue if closed flag is set to true? see 2.6.6
     %% TODO keep the state around depending on the lifetime
     {QStates, Unsettled, OutgoingLinks}
@@ -783,7 +787,6 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
               QName = rabbit_misc:r(Vhost, queue, QNameBin),
               case rabbit_amqqueue:lookup(QName) of
                   {ok, Q} ->
-                      Ctag = handle_to_ctag(HandleInt),
                       case rabbit_queue_type:cancel(Q, Ctag, undefined, Username, QStates0) of
                           {ok, QStates1} ->
                               {Unsettled1, MsgIds} = remove_link_from_outgoing_unsettled_map(Ctag, Unsettled0),
@@ -806,12 +809,12 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
                                 [rabbit_misc:rs(amqqueue:get_name(Q)), Reason])
                       end;
                   {error, not_found} ->
-                      %%TODO still delete delivery IDs from outgoing_unettled_map
-                      {QStates0, Unsettled0, OutgoingLinks1}
+                      {Unsettled1, _RemovedMsgIds} = remove_link_from_outgoing_unsettled_map(Ctag, Unsettled0),
+                      {QStates0, Unsettled1, OutgoingLinks1}
               end;
           error ->
-              %%TODO still delete delivery IDs from outgoing_unettled_map ?
-              {QStates0, Unsettled0, OutgoingLinks0}
+              {Unsettled1, _RemovedMsgIds} = remove_link_from_outgoing_unsettled_map(Ctag, Unsettled0),
+              {QStates0, Unsettled1, OutgoingLinks0}
       end,
     State = State0#state{queue_states = QStates,
                          incoming_links = maps:remove(HandleInt, IncomingLinks),

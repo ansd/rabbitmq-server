@@ -192,6 +192,7 @@ reliable_send_receive(QType, Outcome, Config) ->
     {ok, Sender} = amqp10_client:attach_sender_link(
                      Session, <<"test-sender">>, Address),
     ok = wait_for_credit(Sender),
+    flush(credited),
     DTag1 = <<"dtag-1">>,
     %% create an unsettled message,
     %% link will be in "mixed" mode by default
@@ -822,18 +823,35 @@ server_closes_link(QType, Config) ->
     {ok, Session} = amqp10_client:begin_session_sync(Connection),
     Address = <<"/amq/queue/", QName/binary>>,
 
-    {ok, Sender} = amqp10_client:attach_sender_link(
-                     Session, <<"test-sender">>, Address),
-    ok = wait_for_credit(Sender),
-    DTag = <<0>>,
-    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag, <<"body">>, false)),
-    ok = wait_for_settlement(DTag),
-
     {ok, Receiver} = amqp10_client:attach_receiver_link(
                        Session, <<"test-receiver">>, Address, unsettled),
     receive {amqp10_event, {link, Receiver, attached}} -> ok
     after 5000 -> ct:fail("missing ATTACH frame from server")
     end,
+    ok = amqp10_client:flow_link_credit(Receiver, 5, never),
+
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    flush(credited),
+    DTag = <<0>>,
+    Body = <<"body">>,
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag, Body, false)),
+    ok = wait_for_settlement(DTag),
+
+    receive {amqp10_msg, Receiver, Msg} ->
+                ?assertEqual([Body], amqp10_msg:body(Msg))
+    after 5000 -> ct:fail("missing msg")
+    end,
+
+    [SessionPid] = rpc(Config, rabbit_amqp1_0_session, list_local, []),
+    %% Received delivery is unsettled.
+    eventually(?_assertEqual(
+                  1,
+                  begin
+                      #{outgoing_unsettled_map := UnsettledMap} = gen_server_state(SessionPid),
+                      maps:size(UnsettledMap)
+                  end)),
 
     %% Server closes the link endpoint due to some AMQP 1.0 external condition:
     %% In this test, the external condition is that an AMQP 0.9.1 client deletes the queue.
@@ -849,6 +867,16 @@ server_closes_link(QType, Config) ->
     receive {amqp10_event, {link, Receiver, {detached, ExpectedError}}} -> ok
     after 5000 -> ct:fail("server did not close our incoming link")
     end,
+
+    %% Our client has not and will not settle the delivery since the source queue got deleted and
+    %% the link detached with an error condition. Nevertheless the server session should clean up its
+    %% session state by removing the unsettled delivery from its session state.
+    eventually(?_assertEqual(
+                  0,
+                  begin
+                      #{outgoing_unsettled_map := UnsettledMap} = gen_server_state(SessionPid),
+                      maps:size(UnsettledMap)
+                  end)),
 
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection).
@@ -912,6 +940,7 @@ link_target_queue_deleted(QType, Config) ->
     {ok, Sender} = amqp10_client:attach_sender_link(
                      Session, <<"test-sender">>, Address),
     ok = wait_for_credit(Sender),
+    flush(credited),
     DTag1 = <<1>>,
     ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag1, <<"m1">>, false)),
     ok = wait_for_settlement(DTag1),
@@ -972,6 +1001,7 @@ target_queues_deleted_accepted(Config) ->
     {ok, Sender} = amqp10_client:attach_sender_link(
                      Session, <<"test-sender">>, Address, unsettled),
     ok = wait_for_credit(Sender),
+    flush(credited),
 
     DTag1 = <<1>>,
     ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag1, <<"m1">>, false)),
@@ -1682,12 +1712,14 @@ detach_requeues(Config) ->
            amqp10_msg:delivery_id(Msg3b),
            true, accepted),
 
-    %% Check that there are no in flight deliveries in the server session.
+    %% Double check that there are no in flight deliveries in the server session.
     [SessionPid] = rpc(Config, rabbit_amqp1_0_session, list_local, []),
-    %% Let server process DISPOSITION
-    timer:sleep(5),
-    ct:pal("state of server session proc:~n~p",
-           [sys:get_state(SessionPid)]),
+    eventually(?_assertEqual(
+                  0,
+                  begin
+                      #{outgoing_unsettled_map := UnsettledMap} = gen_server_state(SessionPid),
+                      maps:size(UnsettledMap)
+                  end)),
 
     ok = amqp10_client:detach_link(Receiver2),
     ok = end_session_sync(Session),
@@ -1961,6 +1993,7 @@ async_notify(SenderSettleMode, QType, Config) ->
      end || N <- lists:seq(1, NumMsgs)],
     %% Wait for last message to be confirmed.
     ok = wait_for_settlement(integer_to_binary(NumMsgs)),
+    flush(settled),
     ok = amqp10_client:detach_link(Sender),
     receive {amqp10_event, {link, Sender, {detached, normal}}} -> ok
     after 5000 -> ct:fail("missing detached")
@@ -2151,7 +2184,6 @@ wait_for_settlement(Tag) ->
 wait_for_settlement(Tag, State) ->
     receive
         {amqp10_disposition, {State, Tag}} ->
-            flush(?FUNCTION_NAME),
             ok
     after 5000 ->
               flush("wait_for_settlement timed out"),
@@ -2283,3 +2315,11 @@ consume_from_first(<<"stream">>) ->
     #{<<"rabbitmq:stream-offset-spec">> => <<"first">>};
 consume_from_first(_) ->
     #{}.
+
+%% Return the formatted state of a gen_server via sys:get_status/1.
+%% (sys:get_state/1 is unformatted)
+gen_server_state(Pid) ->
+    {status, _, _, L0} = sys:get_status(Pid, 20_000),
+    L1 = lists:last(L0),
+    {data, L2} = lists:last(L1),
+    proplists:get_value("State", L2).
