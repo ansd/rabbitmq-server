@@ -781,12 +781,12 @@ untrack_channel(Channel, State) ->
     end.
 
 send_to_new_1_0_session(
-  ChannelNum, Frame,
+  ChannelNum, BeginFrame,
   #v1{session_sup = SessionSup,
       connection = #v1_connection{frame_max = FrameMax0,
                                   hostname = Hostname,
                                   user = User},
-      writer = WriterPid} = State) ->
+      writer = WriterPid} = State0) ->
     %% Subtract fixed frame header size.
     FrameMax = case FrameMax0 of
                    unlimited -> unlimited;
@@ -796,17 +796,17 @@ send_to_new_1_0_session(
                  ChannelNum,
                  FrameMax,
                  User,
-                 vhost(Hostname)],
+                 vhost(Hostname),
+                 BeginFrame],
     case rabbit_amqp1_0_session_sup:start_session(SessionSup, ChildArgs) of
         {ok, SessionPid} ->
             erlang:monitor(process, SessionPid),
-            ModifiedState = track_channel(ChannelNum, SessionPid, State),
+            State = track_channel(ChannelNum, SessionPid, State0),
             rabbit_log_connection:info(
-                        "AMQP 1.0 connection ~tp: "
-                        "user '~ts' authenticated and granted access to vhost '~ts'",
-                        [self(), User#user.username, vhost(Hostname)]),
-            ok = rabbit_amqp1_0_session:process_frame(SessionPid, Frame),
-            ModifiedState;
+              "AMQP 1.0 connection ~tp: "
+              "user '~ts' authenticated and granted access to vhost '~ts'",
+              [self(), User#user.username, vhost(Hostname)]),
+            State;
         {error, {not_allowed, _}} ->
             rabbit_log:error("AMQP 1.0: user '~ts' is not allowed to access virtual host '~ts'",
                 [User#user.username, vhost(Hostname)]),

@@ -45,7 +45,7 @@
 % [2.8.9]
 -type transfer_number() :: sequence_no().
 
--export([start_link/6,
+-export([start_link/7,
          process_frame/2,
          list_local/0]).
 
@@ -117,18 +117,55 @@
 
 -record(state, {
           cfg = #cfg{},
+          %%
+          %% The following 6 fields are state for session flow control.
+          %% See section 2.5.6.
+          %%
+          %% expected transfer-id of next incoming TRANSFER
+          next_incoming_id :: transfer_number(),
+          %% Defines the maximum number of incoming transfer frames that we can currently receive.
+          %% This value is chosen by us.
+          %% Purpose:
+          %% 1. It protects our session process from being overloaded, and
+          %% 2. Since frames have a maximum size for a given connection, this provides flow control based on the
+          %% number of bytes transmitted, and therefore protects our platform, i.e. RabbitMQ as a whole. We will set
+          %% this window to 0 if a cluster wide memory or disk alarm occurs (see module rabbit_alarm) to stop receiving
+          %% any incoming TRANSFERs.
+          %% (It's an optional feature: If we wanted we could always keep that window huge, i.e. not shrinking the window
+          %% when we receive a TRANSFER. However, we do want to use that feature due to aforementioned purposes.)
+          incoming_window :: non_neg_integer(),
+          %% transfer-id of our next outoing TRANSFER
+          next_outgoing_id :: transfer_number(),
+          %% Defines the maximum number of outgoing transfer frames that we can currently send.
+          %% (Sending is additionally limited by remote_incoming_window.)
+          %% This value is chosen by us.
+          %% Purpose: Protect memory usage of our session process by keeping the size of outgoing_unsettled_map below a
+          %% certain threshold.
+          %% (It's an optional feature: If we wanted we could always keep that window huge, i.e. not shrinking the window
+          %% when we send a TRANSFER. However, we do want to use that feature due to aforementioned purpose.)
+          outgoing_window :: non_neg_integer(),
+          %% Defines the maximum number of outgoing transfer frames that we are allowed to currently send.
+          %% (Sending is additionally limited by outgoing_window.)
+          %% This value is chosen by the AMQP client.
+          remote_incoming_window :: non_neg_integer(),
+          %% This field is informational.
+          %% It reflects the maximum number of incoming TRANSFERs that may arrive without exceeding
+          %% the AMQP client's own outgoing-window.
+          %% When this window shrinks, it is an indication of outstanding transfers (from AMQP client to us)
+          %% which we need to settle (after receiving confirmations from target queues) for the window to grow again.
+          remote_outgoing_window :: non_neg_integer(),
+          %%
           %% These messages were received from queues thanks to sufficient link credit.
-          %% However, they are buffered here due to session flow control before being sent to the client.
+          %% However, they are buffered here due to session flow control (remote_incoming_window or outgoing_window is 0)
+          %% before being sent to the AMQP client.
           pending_transfers = queue:new() :: queue:queue(#pending_transfer{}),
-          remote_incoming_window, % keep track of the window until we're told
-          remote_outgoing_window,
-          next_incoming_id, % just to keep a check
-          incoming_window,     % ) so we know when to open the session window
-          %% "The next-outgoing-id MAY be initialized to an arbitrary value and is incremented after each
-          %% successive transfer according to RFC-1982 [RFC1982] serial number arithmetic." [2.5.6]
-          next_outgoing_id = 0 :: transfer_number(),
+          %% Similar to next_outgoing_id.
+          %% next_delivery_id >= next_outgoing_id.
+          %% We need to track both separately because next_delivery_id can be assigned to a TRANSFER before it's
+          %% actually sent to the AMQP client. The TRANSFER might be buffered in pending_transfers.
+          %% During that time we need to send the next_outgoing_id in FLOWs to the AMQP client.
           next_delivery_id = 0 :: delivery_number(),
-          outgoing_window,
+          %%
           %% Links are unidirectional.
           %% We receive messages from clients on incoming links.
           incoming_links = #{} :: #{link_handle() => #incoming_link{}},
@@ -136,16 +173,18 @@
           outgoing_links = #{} :: #{link_handle() => #outgoing_link{}},
           %% TRANSFER delivery IDs published to consuming clients but not yet acknowledged by clients.
           outgoing_unsettled_map = #{} :: #{delivery_number() => #outgoing_unsettled{}},
+          %%
           %% Queue actions that we will process later such that we can confirm and reject
           %% delivery IDs in ranges to reduce the number of DISPOSITION frames sent to the client.
           stashed_rejected = [] :: [{rejected, rabbit_amqqueue:name(), [delivery_number(),...]}],
           stashed_settled = [] :: [{settled, rabbit_amqqueue:name(), [delivery_number(),...]}],
           stashed_eol = [] :: [rabbit_amqqueue:name()],
+          %%
           queue_states = rabbit_queue_type:init() :: rabbit_queue_type:state()
          }).
 
-start_link(ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost) ->
-    Args = {ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost},
+start_link(ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost, BeginFrame) ->
+    Args = {ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost, BeginFrame},
     Opts = [{hibernate_after, ?HIBERNATE_AFTER}],
     gen_server:start_link(?MODULE, Args, Opts).
 
@@ -154,13 +193,42 @@ process_frame(Pid, Frame) ->
     credit_flow:send(Pid),
     gen_server:cast(Pid, {frame, Frame, self()}).
 
-init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost}) ->
+init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
+      #'v1_0.begin'{next_outgoing_id = ?UINT(RemoteNextOut),
+                    incoming_window = ?UINT(RemoteInWindow),
+                    outgoing_window = ?UINT(RemoteOutWindow),
+                    handle_max = HandleMax0}}) ->
     %%TODO do we neeed to trap_exit?
     process_flag(trap_exit, true),
     ok = pg:join(node(), ?PROCESS_GROUP_NAME, self()),
+
     %% TODO tick_timer with consumer_timeout and permission expiry as done in channel?
     % put(permission_cache_can_expire, rabbit_access_control:permission_cache_can_expire(User)),
-    {ok, #state{cfg = #cfg{reader_pid = ReaderPid,
+
+    %% TODO set this to a large value to spot any clients early on that do not respect serial number arithmetic
+    %% because "The next-outgoing-id MAY be initialized to an arbitrary value"
+    LocalNextOut = 0,
+    IncomingWindow = ?MAX_SESSION_WINDOW_SIZE,
+    OutgoingWindow = ?MAX_SESSION_WINDOW_SIZE,
+
+    HandleMax = case HandleMax0 of
+                    ?UINT(Max) -> Max;
+                    _ -> ?DEFAULT_MAX_HANDLE
+                end,
+    Reply = #'v1_0.begin'{remote_channel = {ushort, ChannelNum},
+                          handle_max = ?UINT(HandleMax),
+                          next_outgoing_id = ?UINT(LocalNextOut),
+                          incoming_window = ?UINT(IncomingWindow),
+                          outgoing_window = ?UINT(OutgoingWindow)},
+    rabbit_amqp1_0_writer:send_command(WriterPid, ChannelNum, Reply),
+
+    {ok, #state{next_incoming_id = RemoteNextOut,
+                next_outgoing_id = LocalNextOut,
+                incoming_window = IncomingWindow,
+                outgoing_window = OutgoingWindow,
+                remote_incoming_window = RemoteInWindow,
+                remote_outgoing_window = RemoteOutWindow,
+                cfg = #cfg{reader_pid = ReaderPid,
                            writer_pid = WriterPid,
                            frame_max = FrameMax,
                            user = User,
@@ -507,55 +575,6 @@ disposition(DeliveryState, First, Last) ->
        state = DeliveryState,
        first = ?UINT(First),
        last = Last1}.
-
-%% Session window:
-%%
-%% Each session has two abstract[1] buffers, one to record the
-%% unsettled state of incoming messages, one to record the unsettled
-%% state of outgoing messages.  In general we want to bound these
-%% buffers; but if we bound them, and don't tell the other side, we
-%% may end up deadlocking the other party.
-%%
-%% Hence the flow frame contains a session window, expressed as the
-%% next-id and the window size for each of the buffers. The frame
-%% refers to the window of the sender of the frame, of course.
-%%
-%% The numbers work this way: for the outgoing window, the next-id
-%% counts the next transfer the session will send, and it will stop
-%% sending at next-id + window.  For the incoming window, the next-id
-%% counts the next transfer id expected, and it will not accept
-%% messages beyond next-id + window (in fact it will probably close
-%% the session, since sending outside the window is a transgression of
-%% the protocol).
-%%
-%% We may as well just pick a value for the incoming and outgoing
-%% windows; choosing based on what the client says may just stop
-%% things dead, if the value is zero for instance.
-%%
-%% [1] Abstract because there probably won't be a data structure with
-%% a size directly related to transfers; settlement is done with
-%% delivery-id, which may refer to one or more transfers.
-handle_control(#'v1_0.begin'{next_outgoing_id = ?UINT(RemoteNextOut),
-                             incoming_window = ?UINT(RemoteInWindow),
-                             outgoing_window = ?UINT(RemoteOutWindow),
-                             handle_max = HandleMax0},
-               State0 = #state{next_outgoing_id = LocalNextOut,
-                               cfg = #cfg{channel_num = Channel}}) ->
-    HandleMax = case HandleMax0 of
-                    ?UINT(Max) -> Max;
-                    _ -> ?DEFAULT_MAX_HANDLE
-                end,
-    Reply = #'v1_0.begin'{remote_channel = {ushort, Channel},
-                          handle_max = ?UINT(HandleMax),
-                          next_outgoing_id = ?UINT(LocalNextOut),
-                          incoming_window = ?UINT(?MAX_SESSION_WINDOW_SIZE),
-                          outgoing_window = ?UINT(?MAX_SESSION_WINDOW_SIZE)},
-    State = State0#state{outgoing_window = ?MAX_SESSION_WINDOW_SIZE,
-                         incoming_window = ?MAX_SESSION_WINDOW_SIZE,
-                         next_incoming_id = RemoteNextOut,
-                         remote_incoming_window = RemoteInWindow,
-                         remote_outgoing_window = RemoteOutWindow},
-    reply0(Reply, State);
 
 handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
                               name = LinkName,
