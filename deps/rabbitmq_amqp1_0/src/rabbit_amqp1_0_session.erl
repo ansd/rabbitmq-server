@@ -16,14 +16,13 @@
 -define(CREDIT_REPLY_TIMEOUT, 30_000).
 -define(UINT_OUTGOING_WINDOW, {uint, 16#ffffffff}).
 -define(MAX_INCOMING_WINDOW, 400).
-%% TODO set this to a large value to spot any clients early on that do not respect serial
-%% number arithmetic because "The next-outgoing-id MAY be initialized to an arbitrary value"
-%% Same as done in by .NET client in
-%% https://github.com/Azure/amqpnetlite/blob/58f4d15b46c1b1c6d984bbf12c36e78211086250/src/Session.cs#L504
--define(INITIAL_OUTGOING_ID, 0).
+%% "The next-outgoing-id MAY be initialized to an arbitrary value"
+%% We decide to set this to a large value to spot any clients early on that
+%% do not respect serial number arithmetic. Similar as done by the .NET client in
+%% https://github.com/Azure/amqpnetlite/blob/v2.4.7/src/Session.cs#L504
+-define(INITIAL_OUTGOING_TRANSFER_ID, 16#ffffffff - 3).
 -define(MAX_INCOMING_HANDLE, 65_535).
 -define(DEFAULT_MAX_HANDLE, 16#ffffffff).
--define(INIT_TXFR_COUNT, 0).
 %% [3.4]
 -define(OUTCOMES, [?V_1_0_SYMBOL_ACCEPTED,
                    ?V_1_0_SYMBOL_REJECTED,
@@ -75,7 +74,7 @@
           routing_key :: undefined | rabbit_types:routing_key(),
           %% Queue is only set if the link target address refers to a queue.
           queue :: undefined | rabbit_misc:resource_name(),
-          delivery_count = 0 :: sequence_no(),
+          delivery_count :: sequence_no(),
           credit = 0 :: non_neg_integer(),
           %% TRANSFER delivery IDs published to queues but not yet confirmed by queues
           incoming_unconfirmed_map = #{} :: #{delivery_number() =>
@@ -92,7 +91,7 @@
           %% Although the source address of a link might be an exchange name and binding key
           %% or a topic filter, an outgoing link will always consume from a queue.
           queue :: rabbit_misc:resource_name(),
-          delivery_count = 0 :: sequence_no(),
+          delivery_count :: sequence_no(),
           send_settled :: boolean()
          }).
 
@@ -124,7 +123,7 @@
 
 -record(state, {
           cfg = #cfg{},
-          %%
+
           %% The following 5 fields are state for session flow control.
           %% See section 2.5.6.
           %%
@@ -133,7 +132,7 @@
           %% #outgoing_unsettled{} entry in the outgoing_unsettled_map requires far less
           %% memory than holding the message payload in the pending_transfers queue.
           %%
-          %% expected transfer-id of next incoming TRANSFER
+          %% expected implicit transfer-id of next incoming TRANSFER
           next_incoming_id :: transfer_number(),
           %% Defines the maximum number of incoming transfer frames that we can currently receive.
           %% This value is chosen by us.
@@ -142,15 +141,15 @@
           %% 2. Since frames have a maximum size for a given connection, this provides flow control based
           %% on the number of bytes transmitted, and therefore protects our platform, i.e. RabbitMQ as a
           %% whole. We will set this window to 0 if a cluster wide memory or disk alarm occurs (see module
-          %% rabbit_alarm) to stop receiving any incoming TRANSFERs.
+          %% rabbit_alarm) to stop receiving incoming TRANSFERs.
           %% (It's an optional feature: If we wanted we could always keep that window huge, i.e. not
           %% shrinking the window when we receive a TRANSFER. However, we do want to use that feature
           %% due to aforementioned purposes.)
           incoming_window :: non_neg_integer(),
-          %% transfer-id of our next outoing TRANSFER
+          %% implicit transfer-id of our next outgoing TRANSFER
           next_outgoing_id :: transfer_number(),
-          %% Defines the maximum number of outgoing transfer frames that we are allowed to currently send.
-          %% This value is chosen by the AMQP client.
+          %% Defines the maximum number of outgoing transfer frames that we are
+          %% currently allowed to send. This value is chosen by the AMQP client.
           remote_incoming_window :: non_neg_integer(),
           %% This field is informational.
           %% It reflects the maximum number of incoming TRANSFERs that may arrive without exceeding
@@ -159,32 +158,41 @@
           %% to us) which we need to settle (after receiving confirmations from target queues) for
           %% the window to grow again.
           remote_outgoing_window :: non_neg_integer(),
-          %%
+
           %% These messages were received from queues thanks to sufficient link credit.
           %% However, they are buffered here due to session flow control
-          %% (remote_incoming_window is <= 0) before being sent to the AMQP client.
+          %% (when remote_incoming_window <= 0) before being sent to the AMQP client.
           pending_transfers = queue:new() :: queue:queue(#pending_transfer{}),
-          %% Similar to next_outgoing_id.
-          %% next_delivery_id >= next_outgoing_id.
-          %% We need to track both separately because next_delivery_id can be assigned to a TRANSFER before
-          %% it's actually sent to the AMQP client. The TRANSFER might be buffered in pending_transfers.
-          %% During that time we need to send the next_outgoing_id in FLOWs to the AMQP client.
-          next_delivery_id = 0 :: delivery_number(),
+
+          %% The link or session endpoint assigns each message a unique delivery-id
+          %% from a session scoped sequence number.
           %%
+          %% Do not confuse this field with next_outgoing_id:
+          %% Both are session scoped sequence numbers, but initialised at different arbitrary values.
+          %%
+          %% next_outgoing_id is an implicit ID, i.e. not sent in the TRANSFER frame.
+          %% outgoing_delivery_id is an explicit ID, i.e. sent in the TRANSFER frame.
+          %%
+          %% next_outgoing_id is incremented per TRANSFER frame.
+          %% outgoing_delivery_id is incremented per message.
+          %% Remember that a large message can be split up into multiple TRANSFER frames.
+          outgoing_delivery_id :: delivery_number(),
+
           %% Links are unidirectional.
           %% We receive messages from clients on incoming links.
           incoming_links = #{} :: #{link_handle() => #incoming_link{}},
           %% We send messages to clients on outgoing links.
           outgoing_links = #{} :: #{link_handle() => #outgoing_link{}},
+
           %% TRANSFER delivery IDs published to consuming clients but not yet acknowledged by clients.
           outgoing_unsettled_map = #{} :: #{delivery_number() => #outgoing_unsettled{}},
-          %%
+
           %% Queue actions that we will process later such that we can confirm and reject
           %% delivery IDs in ranges to reduce the number of DISPOSITION frames sent to the client.
           stashed_rejected = [] :: [{rejected, rabbit_amqqueue:name(), [delivery_number(),...]}],
           stashed_settled = [] :: [{settled, rabbit_amqqueue:name(), [delivery_number(),...]}],
           stashed_eol = [] :: [rabbit_amqqueue:name()],
-          %%
+
           queue_states = rabbit_queue_type:init() :: rabbit_queue_type:state()
          }).
 
@@ -210,7 +218,7 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
     %% TODO tick_timer with consumer_timeout and permission expiry as done in channel?
     % put(permission_cache_can_expire, rabbit_access_control:permission_cache_can_expire(User)),
 
-    NextOutgoingId = ?INITIAL_OUTGOING_ID,
+    NextOutgoingId = ?INITIAL_OUTGOING_TRANSFER_ID,
     IncomingWindow = ?MAX_INCOMING_WINDOW,
 
     HandleMax = case HandleMax0 of
@@ -229,6 +237,7 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
                 incoming_window = IncomingWindow,
                 remote_incoming_window = RemoteIncomingWindow,
                 remote_outgoing_window = RemoteOutgoingWindow,
+                outgoing_delivery_id = 0,
                 cfg = #cfg{reader_pid = ReaderPid,
                            writer_pid = WriterPid,
                            frame_max = FrameMax,
@@ -584,7 +593,7 @@ handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
                               snd_settle_mode = SndSettleMode,
                               rcv_settle_mode = RcvSettleMode,
                               target = Target,
-                              initial_delivery_count = ?UINT(InitTransfer)} = Attach,
+                              initial_delivery_count = ?UINT(DeliveryCount)} = Attach,
                State0 = #state{incoming_links = IncomingLinks0,
                                cfg = #cfg{vhost = Vhost,
                                           user = User}}) ->
@@ -595,7 +604,7 @@ handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
                               exchange = XName,
                               routing_key = RoutingKey,
                               queue = QNameBin,
-                              delivery_count = InitTransfer,
+                              delivery_count = DeliveryCount,
                               credit = ?LINK_CREDIT_RCV,
                               recv_settle_mode = RcvSettleMode},
             _Outcomes = outcomes(Source),
@@ -673,10 +682,11 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                            case rabbit_queue_type:consume(Q, Spec, QStates0) of
                                {ok, QStates} ->
                                    OutputHandle = output_handle(InputHandle),
+                                   InitialDeliveryCount = 0,
                                    AttachReply = #'v1_0.attach'{
                                                     name = LinkName,
                                                     handle = OutputHandle,
-                                                    initial_delivery_count = ?UINT(?INIT_TXFR_COUNT),
+                                                    initial_delivery_count = ?UINT(InitialDeliveryCount),
                                                     snd_settle_mode = EffectiveSndSettleMode,
                                                     rcv_settle_mode = RcvSettleMode,
                                                     %% The queue process monitors our session process. When our session process terminates
@@ -686,7 +696,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                                                                       default_outcome = #'v1_0.released'{},
                                                                       outcomes = outcomes(Source)},
                                                     role = ?SEND_ROLE},
-                                   Link = #outgoing_link{delivery_count = ?INIT_TXFR_COUNT,
+                                   Link = #outgoing_link{delivery_count = InitialDeliveryCount,
                                                          queue = QNameBin,
                                                          send_settled = SndSettled},
                                    %%TODO check that handle is not present in either incoming_links or outgoing_links:
@@ -723,13 +733,12 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                            [Reason])
     end;
 
-handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle),
-                                        delivery_id = ?UINT(DeliveryId)}, MsgPart},
+handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle)}, MsgPart},
                State0 = #state{incoming_links = IncomingLinks}) ->
     %%TODO check properties.user-id as done in rabbit_channel:check_user_id_header/2 ?
     case IncomingLinks of
         #{Handle := Link0} ->
-            {Flows, State1} = session_flow_control_received_transfer(DeliveryId, State0),
+            {Flows, State1} = session_flow_control_received_transfer(State0),
             case incoming_link_transfer(Txfr, MsgPart, Link0, State1) of
                 {ok, Reply0, Link, State2} ->
                     Reply = Reply0 ++ Flows,
@@ -1028,28 +1037,19 @@ reply0(Reply, State) ->
 
 %% Implements section "receiving a transfer" in 2.5.6
 session_flow_control_received_transfer(
-  DeliveryId,
   #state{next_incoming_id = NextIncomingId,
          incoming_window = InWindow0,
          remote_outgoing_window = RemoteOutgoingWindow} = State) ->
-    case compare(DeliveryId, NextIncomingId) of
-        equal ->
-            InWindow1 = InWindow0 - 1,
-            {Flows, InWindow} = if InWindow1 =< (?MAX_INCOMING_WINDOW div 2) ->
-                                       %% We've reached halfway, open the window.
-                                       {[#'v1_0.flow'{}], ?MAX_INCOMING_WINDOW};
-                                   true ->
-                                       {[], InWindow1}
-                                end,
-            {Flows, State#state{incoming_window = InWindow,
-                                next_incoming_id = add(NextIncomingId, 1),
-                                remote_outgoing_window = RemoteOutgoingWindow - 1}};
-        _ ->
-            protocol_error(
-              ?V_1_0_SESSION_ERROR_WINDOW_VIOLATION,
-              "Expected next-incoming-id ~p, but received delivery-id ~p",
-              [NextIncomingId, DeliveryId])
-    end.
+    InWindow1 = InWindow0 - 1,
+    {Flows, InWindow} = if InWindow1 =< (?MAX_INCOMING_WINDOW div 2) ->
+                               %% We've reached halfway, open the window.
+                               {[#'v1_0.flow'{}], ?MAX_INCOMING_WINDOW};
+                           true ->
+                               {[], InWindow1}
+                        end,
+    {Flows, State#state{incoming_window = InWindow,
+                        next_incoming_id = add(NextIncomingId, 1),
+                        remote_outgoing_window = RemoteOutgoingWindow - 1}}.
 
 %% Implements section "sending a transfer" in 2.5.6
 session_flow_control_sent_transfers(
@@ -1151,7 +1151,7 @@ session_flow_control_received_flow(
                   end;
               undefined ->
                   %% The AMQP client might not have yet received our #begin.next_outgoing_id
-                  ?INITIAL_OUTGOING_ID
+                  ?INITIAL_OUTGOING_TRANSFER_ID
           end,
 
     RemoteIncomingWindow0 = diff(add(Seq, FlowIncomingWindow), NextOutgoingId),
@@ -1276,7 +1276,7 @@ handle_queue_actions(Actions, State0) ->
 handle_deliver(ConsumerTag, AckRequired,
                {QName, QPid, MsgId, Redelivered, Mc0},
                State0 = #state{pending_transfers = Pendings,
-                               next_delivery_id = DeliveryId,
+                               outgoing_delivery_id = DeliveryId,
                                outgoing_links = OutgoingLinks,
                                cfg = #cfg{frame_max = FrameMax}}) ->
     Handle = ctag_to_handle(ConsumerTag),
@@ -1338,7 +1338,7 @@ handle_deliver(ConsumerTag, AckRequired,
                          queue_pid = QPid,
                          delivery_id = DeliveryId,
                          outgoing_unsettled = Del},
-            State = State0#state{next_delivery_id = add(DeliveryId, 1),
+            State = State0#state{outgoing_delivery_id = add(DeliveryId, 1),
                                  pending_transfers = queue:in(Pending, Pendings)},
             send_pending_transfers(State);
         _ ->
@@ -1355,8 +1355,8 @@ handle_deliver(ConsumerTag, AckRequired,
 
 incoming_link_transfer(
   #'v1_0.transfer'{delivery_id = DeliveryId,
-                   more        = true,
-                   settled     = Settled},
+                   more = true,
+                   settled = Settled},
   MsgPart,
   #incoming_link{msg_acc = MsgAcc,
                  send_settle_mode = SSM} = Link0,
@@ -1970,7 +1970,7 @@ format_status(
                     next_incoming_id = NextIncomingId,
                     incoming_window = IncomingWindow,
                     next_outgoing_id = NextOutgoingId,
-                    next_delivery_id = NextDeliveryId,
+                    outgoing_delivery_id = OutgoingDeliveryId,
                     incoming_links = IncomingLinks,
                     outgoing_links = OutgoingLinks,
                     outgoing_unsettled_map = OutgoingUnsettledMap,
@@ -1986,7 +1986,7 @@ format_status(
               next_incoming_id => NextIncomingId,
               incoming_window => IncomingWindow,
               next_outgoing_id => NextOutgoingId,
-              next_delivery_id => NextDeliveryId,
+              outgoing_delivery_id => OutgoingDeliveryId,
               incoming_links => IncomingLinks,
               outgoing_links => OutgoingLinks,
               outgoing_unsettled_map => OutgoingUnsettledMap,
