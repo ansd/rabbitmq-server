@@ -14,7 +14,9 @@
 
 -define(HIBERNATE_AFTER, 6_000).
 -define(CREDIT_REPLY_TIMEOUT, 30_000).
--define(MAX_SESSION_WINDOW_SIZE, 65_535).
+-define(UINT_OUTGOING_WINDOW, {uint, 16#ffffffff}).
+-define(MAX_INCOMING_WINDOW, 400).
+-define(MAX_INCOMING_HANDLE, 65_535).
 -define(DEFAULT_MAX_HANDLE, 16#ffffffff).
 -define(INIT_TXFR_COUNT, 0).
 %% [3.4]
@@ -118,8 +120,13 @@
 -record(state, {
           cfg = #cfg{},
           %%
-          %% The following 6 fields are state for session flow control.
+          %% The following 5 fields are state for session flow control.
           %% See section 2.5.6.
+          %%
+          %% We omit outgoing-window. We keep the outgoing-window always large and don't
+          %% restrict ourselves delivering messages fast to AMQP clients because keeping an
+          %% #outgoing_unsettled{} entry in the outgoing_unsettled_map requires far less
+          %% memory than holding the message payload in the pending_transfers queue.
           %%
           %% expected transfer-id of next incoming TRANSFER
           next_incoming_id :: transfer_number(),
@@ -127,42 +134,35 @@
           %% This value is chosen by us.
           %% Purpose:
           %% 1. It protects our session process from being overloaded, and
-          %% 2. Since frames have a maximum size for a given connection, this provides flow control based on the
-          %% number of bytes transmitted, and therefore protects our platform, i.e. RabbitMQ as a whole. We will set
-          %% this window to 0 if a cluster wide memory or disk alarm occurs (see module rabbit_alarm) to stop receiving
-          %% any incoming TRANSFERs.
-          %% (It's an optional feature: If we wanted we could always keep that window huge, i.e. not shrinking the window
-          %% when we receive a TRANSFER. However, we do want to use that feature due to aforementioned purposes.)
+          %% 2. Since frames have a maximum size for a given connection, this provides flow control based
+          %% on the number of bytes transmitted, and therefore protects our platform, i.e. RabbitMQ as a
+          %% whole. We will set this window to 0 if a cluster wide memory or disk alarm occurs (see module
+          %% rabbit_alarm) to stop receiving any incoming TRANSFERs.
+          %% (It's an optional feature: If we wanted we could always keep that window huge, i.e. not
+          %% shrinking the window when we receive a TRANSFER. However, we do want to use that feature
+          %% due to aforementioned purposes.)
           incoming_window :: non_neg_integer(),
           %% transfer-id of our next outoing TRANSFER
           next_outgoing_id :: transfer_number(),
-          %% Defines the maximum number of outgoing transfer frames that we can currently send.
-          %% (Sending is additionally limited by remote_incoming_window.)
-          %% This value is chosen by us.
-          %% Purpose: Protect memory usage of our session process by keeping the size of outgoing_unsettled_map below a
-          %% certain threshold.
-          %% (It's an optional feature: If we wanted we could always keep that window huge, i.e. not shrinking the window
-          %% when we send a TRANSFER. However, we do want to use that feature due to aforementioned purpose.)
-          outgoing_window :: non_neg_integer(),
           %% Defines the maximum number of outgoing transfer frames that we are allowed to currently send.
-          %% (Sending is additionally limited by outgoing_window.)
           %% This value is chosen by the AMQP client.
           remote_incoming_window :: non_neg_integer(),
           %% This field is informational.
           %% It reflects the maximum number of incoming TRANSFERs that may arrive without exceeding
           %% the AMQP client's own outgoing-window.
-          %% When this window shrinks, it is an indication of outstanding transfers (from AMQP client to us)
-          %% which we need to settle (after receiving confirmations from target queues) for the window to grow again.
+          %% When this window shrinks, it is an indication of outstanding transfers (from AMQP client
+          %% to us) which we need to settle (after receiving confirmations from target queues) for
+          %% the window to grow again.
           remote_outgoing_window :: non_neg_integer(),
           %%
           %% These messages were received from queues thanks to sufficient link credit.
-          %% However, they are buffered here due to session flow control (remote_incoming_window or outgoing_window is 0)
+          %% However, they are buffered here due to session flow control (remote_incoming_window is 0)
           %% before being sent to the AMQP client.
           pending_transfers = queue:new() :: queue:queue(#pending_transfer{}),
           %% Similar to next_outgoing_id.
           %% next_delivery_id >= next_outgoing_id.
-          %% We need to track both separately because next_delivery_id can be assigned to a TRANSFER before it's
-          %% actually sent to the AMQP client. The TRANSFER might be buffered in pending_transfers.
+          %% We need to track both separately because next_delivery_id can be assigned to a TRANSFER before
+          %% it's actually sent to the AMQP client. The TRANSFER might be buffered in pending_transfers.
           %% During that time we need to send the next_outgoing_id in FLOWs to the AMQP client.
           next_delivery_id = 0 :: delivery_number(),
           %%
@@ -208,8 +208,7 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
     %% TODO set this to a large value to spot any clients early on that do not respect serial number arithmetic
     %% because "The next-outgoing-id MAY be initialized to an arbitrary value"
     LocalNextOut = 0,
-    IncomingWindow = ?MAX_SESSION_WINDOW_SIZE,
-    OutgoingWindow = ?MAX_SESSION_WINDOW_SIZE,
+    IncomingWindow = ?MAX_INCOMING_WINDOW,
 
     HandleMax = case HandleMax0 of
                     ?UINT(Max) -> Max;
@@ -219,13 +218,12 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
                           handle_max = ?UINT(HandleMax),
                           next_outgoing_id = ?UINT(LocalNextOut),
                           incoming_window = ?UINT(IncomingWindow),
-                          outgoing_window = ?UINT(OutgoingWindow)},
+                          outgoing_window = ?UINT_OUTGOING_WINDOW},
     rabbit_amqp1_0_writer:send_command(WriterPid, ChannelNum, Reply),
 
     {ok, #state{next_incoming_id = RemoteNextOut,
                 next_outgoing_id = LocalNextOut,
                 incoming_window = IncomingWindow,
-                outgoing_window = OutgoingWindow,
                 remote_incoming_window = RemoteInWindow,
                 remote_outgoing_window = RemoteOutWindow,
                 cfg = #cfg{reader_pid = ReaderPid,
@@ -945,14 +943,12 @@ rabbit_queue_type_settle(QName, SettleOp, Ctag, MsgIds0, QStates) ->
     rabbit_queue_type:settle(QName, SettleOp, Ctag, MsgIds, QStates).
 
 send_pending_transfers(
-  State0 = #state{outgoing_window = LocalSpace,
-                  remote_incoming_window = RemoteSpace,
+  State0 = #state{remote_incoming_window = Space,
                   pending_transfers = Buf0,
                   queue_states = QStates,
                   cfg = #cfg{writer_pid = WriterPid,
                              channel_num = Ch}})
-  when RemoteSpace > 0 andalso LocalSpace > 0 ->
-    Space = erlang:min(LocalSpace, RemoteSpace),
+  when Space > 0 ->
     case queue:out(Buf0) of
         {empty, Buf} ->
             State0#state{pending_transfers = Buf};
@@ -996,14 +992,6 @@ send_pending_transfers(
                     send_pending_transfers(State#state{pending_transfers = Buf})
             end
     end;
-send_pending_transfers(
-  State0 = #state{remote_incoming_window = RemoteSpace,
-                  cfg = #cfg{writer_pid = WriterPid,
-                             channel_num = Ch}})
-  when RemoteSpace > 0 ->
-    {Flow = #'v1_0.flow'{}, State} = bump_outgoing_window(State0),
-    rabbit_amqp1_0_writer:send_command(WriterPid, Ch, flow_fields(Flow, State)),
-    send_pending_transfers(State);
 send_pending_transfers(State) ->
     State.
 
@@ -1043,8 +1031,8 @@ incr_incoming_id(#state{next_incoming_id = NextIn,
     NewNextIn = add(NextIn, 1),
     %% If we've reached halfway, open the window
     {Flows, NewInWindow} =
-    if InWindow1 =< (?MAX_SESSION_WINDOW_SIZE div 2) ->
-           {[#'v1_0.flow'{}], ?MAX_SESSION_WINDOW_SIZE};
+    if InWindow1 =< (?MAX_INCOMING_WINDOW div 2) ->
+           {[#'v1_0.flow'{}], ?MAX_INCOMING_WINDOW};
        true ->
            {[], InWindow1}
     end,
@@ -1054,17 +1042,9 @@ incr_incoming_id(#state{next_incoming_id = NextIn,
 
 record_transfers(NumTransfers,
                  #state{remote_incoming_window = RemoteInWindow,
-                        outgoing_window = OutWindow,
                         next_outgoing_id = NextOutId} = State) ->
     State#state{remote_incoming_window = RemoteInWindow - NumTransfers,
-                outgoing_window = OutWindow - NumTransfers,
                 next_outgoing_id = add(NextOutId, NumTransfers)}.
-
-%% Make sure we have "room" in our outgoing window by bumping the
-%% window if necessary. TODO this *could* be based on how much
-%% notional "room" there is in outgoing_unsettled.
-bump_outgoing_window(State) ->
-    {#'v1_0.flow'{}, State#state{outgoing_window = ?MAX_SESSION_WINDOW_SIZE}}.
 
 settle_delivery_ids(Current, Last, Settled, Unsettled) ->
     case compare(Current, Last) of
@@ -1128,11 +1108,10 @@ flow_fields(Frames, State)
 flow_fields(Flow = #'v1_0.flow'{},
             #state{next_outgoing_id = NextOut,
                    next_incoming_id = NextIn,
-                   outgoing_window = OutWindow,
                    incoming_window = InWindow}) ->
     Flow#'v1_0.flow'{
            next_outgoing_id = ?UINT(NextOut),
-           outgoing_window = ?UINT(OutWindow),
+           outgoing_window = ?UINT_OUTGOING_WINDOW,
            next_incoming_id = ?UINT(NextIn),
            incoming_window = ?UINT(InWindow)};
 flow_fields(Frame, _State) ->
@@ -2002,7 +1981,6 @@ format_status(
                     incoming_window = IncomingWindow,
                     next_outgoing_id = NextOutgoingId,
                     next_delivery_id = NextDeliveryId,
-                    outgoing_window = OutgoingWindow,
                     incoming_links = IncomingLinks,
                     outgoing_links = OutgoingLinks,
                     outgoing_unsettled_map = OutgoingUnsettledMap,
@@ -2019,7 +1997,6 @@ format_status(
               incoming_window => IncomingWindow,
               next_outgoing_id => NextOutgoingId,
               next_delivery_id => NextDeliveryId,
-              outgoing_window => OutgoingWindow,
               incoming_links => IncomingLinks,
               outgoing_links => OutgoingLinks,
               outgoing_unsettled_map => OutgoingUnsettledMap,
