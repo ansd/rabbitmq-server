@@ -101,17 +101,13 @@ stop_amqp10_client_app(Config) ->
 init_per_group(rabbitmq, Config0) ->
     Config = rabbit_ct_helpers:set_config(Config0,
                                           {sasl, {plain, <<"guest">>, <<"guest">>}}),
-    Config1 = rabbit_ct_helpers:merge_app_env(Config,
-                                              [{rabbitmq_amqp1_0,
-                                                [{protocol_strict_mode, true}]}]),
-    rabbit_ct_helpers:run_steps(Config1, rabbit_ct_broker_helpers:setup_steps());
+    rabbit_ct_helpers:run_steps(Config, rabbit_ct_broker_helpers:setup_steps());
 init_per_group(rabbitmq_strict, Config0) ->
     Config = rabbit_ct_helpers:set_config(Config0,
                                           {sasl, {plain, <<"guest">>, <<"guest">>}}),
     Config1 = rabbit_ct_helpers:merge_app_env(Config,
                                               [{rabbitmq_amqp1_0,
-                                                [{default_user, none},
-                                                 {protocol_strict_mode, true}]}]),
+                                                [{default_user, none}]}]),
     rabbit_ct_helpers:run_steps(Config1, rabbit_ct_broker_helpers:setup_steps());
 init_per_group(activemq, Config0) ->
     Config = rabbit_ct_helpers:set_config(Config0, {sasl, anon}),

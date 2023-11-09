@@ -21,8 +21,7 @@ load(
 
 APP_ENV = """[
 	    {default_user, "guest"},
-	    {default_vhost, <<"/">>},
-	    {protocol_strict_mode, false}
+	    {default_vhost, <<"/">>}
 	  ]"""
 
 APP_NAME = "rabbitmq_amqp1_0"

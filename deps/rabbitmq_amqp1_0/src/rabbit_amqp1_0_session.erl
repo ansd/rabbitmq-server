@@ -16,6 +16,11 @@
 -define(CREDIT_REPLY_TIMEOUT, 30_000).
 -define(UINT_OUTGOING_WINDOW, {uint, 16#ffffffff}).
 -define(MAX_INCOMING_WINDOW, 400).
+%% TODO set this to a large value to spot any clients early on that do not respect serial
+%% number arithmetic because "The next-outgoing-id MAY be initialized to an arbitrary value"
+%% Same as done in by .NET client in
+%% https://github.com/Azure/amqpnetlite/blob/58f4d15b46c1b1c6d984bbf12c36e78211086250/src/Session.cs#L504
+-define(INITIAL_OUTGOING_ID, 0).
 -define(MAX_INCOMING_HANDLE, 65_535).
 -define(DEFAULT_MAX_HANDLE, 16#ffffffff).
 -define(INIT_TXFR_COUNT, 0).
@@ -156,8 +161,8 @@
           remote_outgoing_window :: non_neg_integer(),
           %%
           %% These messages were received from queues thanks to sufficient link credit.
-          %% However, they are buffered here due to session flow control (remote_incoming_window is 0)
-          %% before being sent to the AMQP client.
+          %% However, they are buffered here due to session flow control
+          %% (remote_incoming_window is <= 0) before being sent to the AMQP client.
           pending_transfers = queue:new() :: queue:queue(#pending_transfer{}),
           %% Similar to next_outgoing_id.
           %% next_delivery_id >= next_outgoing_id.
@@ -194,9 +199,9 @@ process_frame(Pid, Frame) ->
     gen_server:cast(Pid, {frame, Frame, self()}).
 
 init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
-      #'v1_0.begin'{next_outgoing_id = ?UINT(RemoteNextOut),
-                    incoming_window = ?UINT(RemoteInWindow),
-                    outgoing_window = ?UINT(RemoteOutWindow),
+      #'v1_0.begin'{next_outgoing_id = ?UINT(RemoteNextOutgoingId),
+                    incoming_window = ?UINT(RemoteIncomingWindow),
+                    outgoing_window = ?UINT(RemoteOutgoingWindow),
                     handle_max = HandleMax0}}) ->
     %%TODO do we neeed to trap_exit?
     process_flag(trap_exit, true),
@@ -205,9 +210,7 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
     %% TODO tick_timer with consumer_timeout and permission expiry as done in channel?
     % put(permission_cache_can_expire, rabbit_access_control:permission_cache_can_expire(User)),
 
-    %% TODO set this to a large value to spot any clients early on that do not respect serial number arithmetic
-    %% because "The next-outgoing-id MAY be initialized to an arbitrary value"
-    LocalNextOut = 0,
+    NextOutgoingId = ?INITIAL_OUTGOING_ID,
     IncomingWindow = ?MAX_INCOMING_WINDOW,
 
     HandleMax = case HandleMax0 of
@@ -216,16 +219,16 @@ init({ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost,
                 end,
     Reply = #'v1_0.begin'{remote_channel = {ushort, ChannelNum},
                           handle_max = ?UINT(HandleMax),
-                          next_outgoing_id = ?UINT(LocalNextOut),
+                          next_outgoing_id = ?UINT(NextOutgoingId),
                           incoming_window = ?UINT(IncomingWindow),
                           outgoing_window = ?UINT_OUTGOING_WINDOW},
     rabbit_amqp1_0_writer:send_command(WriterPid, ChannelNum, Reply),
 
-    {ok, #state{next_incoming_id = RemoteNextOut,
-                next_outgoing_id = LocalNextOut,
+    {ok, #state{next_incoming_id = RemoteNextOutgoingId,
+                next_outgoing_id = NextOutgoingId,
                 incoming_window = IncomingWindow,
-                remote_incoming_window = RemoteInWindow,
-                remote_outgoing_window = RemoteOutWindow,
+                remote_incoming_window = RemoteIncomingWindow,
+                remote_outgoing_window = RemoteOutgoingWindow,
                 cfg = #cfg{reader_pid = ReaderPid,
                            writer_pid = WriterPid,
                            frame_max = FrameMax,
@@ -310,7 +313,7 @@ handle_cast({queue_event, _, _} = QEvent,
                               channel_num = Ch}} = State0) ->
     {Reply, State} = handle_queue_event(QEvent, State0),
     [rabbit_amqp1_0_writer:send_command(WriterPid, Ch, F) ||
-     F <- flow_fields(Reply, State)],
+     F <- session_flow_fields(Reply, State)],
     noreply_coalesce(State).
 
 %% Batch confirms / rejects to publishers.
@@ -354,7 +357,7 @@ send_delivery_state_changes(State0 = #state{cfg = #cfg{writer_pid = Writer,
                   end, DetachFrames),
     maps:foreach(fun(HandleInt, DeliveryCount) ->
                          F0 = flow(?UINT(HandleInt), DeliveryCount),
-                         F = flow_fields(F0, State),
+                         F = session_flow_fields(F0, State),
                          rabbit_amqp1_0_writer:send_command(Writer, ChannelNum, F)
                  end, GrantCredits),
     State.
@@ -720,12 +723,13 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                            [Reason])
     end;
 
-handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle)}, MsgPart},
+handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle),
+                                        delivery_id = ?UINT(DeliveryId)}, MsgPart},
                State0 = #state{incoming_links = IncomingLinks}) ->
     %%TODO check properties.user-id as done in rabbit_channel:check_user_id_header/2 ?
     case IncomingLinks of
         #{Handle := Link0} ->
-            {Flows, State1} = incr_incoming_id(State0),
+            {Flows, State1} = session_flow_control_received_transfer(DeliveryId, State0),
             case incoming_link_transfer(Txfr, MsgPart, Link0, State1) of
                 {ok, Reply0, Link, State2} ->
                     Reply = Reply0 ++ Flows,
@@ -750,7 +754,7 @@ handle_control({Txfr = #'v1_0.transfer'{handle = ?UINT(Handle)}, MsgPart},
 handle_control(#'v1_0.flow'{handle = Handle} = Flow,
                #state{incoming_links = IncomingLinks,
                       outgoing_links = OutgoingLinks} = State0) ->
-    State1 = handle_session_flow_control(Flow, State0),
+    State1 = session_flow_control_received_flow(Flow, State0),
     State2 = send_pending_transfers(State1),
     case Handle of
         undefined ->
@@ -942,12 +946,13 @@ rabbit_queue_type_settle(QName, SettleOp, Ctag, MsgIds0, QStates) ->
     MsgIds = lists:usort(MsgIds0),
     rabbit_queue_type:settle(QName, SettleOp, Ctag, MsgIds, QStates).
 
-send_pending_transfers(
-  State0 = #state{remote_incoming_window = Space,
-                  pending_transfers = Buf0,
-                  queue_states = QStates,
-                  cfg = #cfg{writer_pid = WriterPid,
-                             channel_num = Ch}})
+send_pending_transfers(#state{remote_incoming_window = 0} = State) ->
+    State;
+send_pending_transfers(#state{remote_incoming_window = Space,
+                              pending_transfers = Buf0,
+                              queue_states = QStates,
+                              cfg = #cfg{writer_pid = WriterPid,
+                                         channel_num = Ch}} = State0)
   when Space > 0 ->
     case queue:out(Buf0) of
         {empty, Buf} ->
@@ -974,7 +979,7 @@ send_pending_transfers(
             %% rabbit_basic:maybe_gc_large_msg(Content, GCThreshold)
             case send_frames(SendFun, Frames, Space) of
                 {all, SpaceLeft} ->
-                    State1 = #state{outgoing_links = OutgoingLinks0} = record_transfers(
+                    State1 = #state{outgoing_links = OutgoingLinks0} = session_flow_control_sent_transfers(
                                                                          Space - SpaceLeft, State0),
                     HandleInt = ctag_to_handle(Ctag),
                     OutgoingLinks = maps:update_with(
@@ -987,13 +992,11 @@ send_pending_transfers(
                     State = record_outgoing_unsettled(Pending, State2),
                     send_pending_transfers(State#state{pending_transfers = Buf1});
                 {some, Rest} ->
-                    State = record_transfers(Space, State0),
+                    State = session_flow_control_sent_transfers(Space, State0),
                     Buf = queue:in_r(Pending#pending_transfer{frames = Rest}, Buf1),
                     send_pending_transfers(State#state{pending_transfers = Buf})
             end
-    end;
-send_pending_transfers(State) ->
-    State.
+    end.
 
 send_frames(_, [], Left) ->
     {all, Left};
@@ -1021,30 +1024,40 @@ record_outgoing_unsettled(#pending_transfer{queue_ack_required = false}, State) 
 reply0([], State) ->
     {noreply, State};
 reply0(Reply, State) ->
-    {reply, flow_fields(Reply, State), State}.
+    {reply, session_flow_fields(Reply, State), State}.
 
-incr_incoming_id(#state{next_incoming_id = NextIn,
-                        incoming_window = InWindow,
-                        remote_outgoing_window = RemoteOut} = State) ->
-    NewOutWindow = RemoteOut - 1,
-    InWindow1 = InWindow - 1,
-    NewNextIn = add(NextIn, 1),
-    %% If we've reached halfway, open the window
-    {Flows, NewInWindow} =
-    if InWindow1 =< (?MAX_INCOMING_WINDOW div 2) ->
-           {[#'v1_0.flow'{}], ?MAX_INCOMING_WINDOW};
-       true ->
-           {[], InWindow1}
-    end,
-    {Flows, State#state{next_incoming_id = NewNextIn,
-                        incoming_window = NewInWindow,
-                        remote_outgoing_window = NewOutWindow}}.
+%% Implements section "receiving a transfer" in 2.5.6
+session_flow_control_received_transfer(
+  DeliveryId,
+  #state{next_incoming_id = NextIncomingId,
+         incoming_window = InWindow0,
+         remote_outgoing_window = RemoteOutgoingWindow} = State) ->
+    case compare(DeliveryId, NextIncomingId) of
+        equal ->
+            InWindow1 = InWindow0 - 1,
+            {Flows, InWindow} = if InWindow1 =< (?MAX_INCOMING_WINDOW div 2) ->
+                                       %% We've reached halfway, open the window.
+                                       {[#'v1_0.flow'{}], ?MAX_INCOMING_WINDOW};
+                                   true ->
+                                       {[], InWindow1}
+                                end,
+            {Flows, State#state{incoming_window = InWindow,
+                                next_incoming_id = add(NextIncomingId, 1),
+                                remote_outgoing_window = RemoteOutgoingWindow - 1}};
+        _ ->
+            protocol_error(
+              ?V_1_0_SESSION_ERROR_WINDOW_VIOLATION,
+              "Expected next-incoming-id ~p, but received delivery-id ~p",
+              [NextIncomingId, DeliveryId])
+    end.
 
-record_transfers(NumTransfers,
-                 #state{remote_incoming_window = RemoteInWindow,
-                        next_outgoing_id = NextOutId} = State) ->
-    State#state{remote_incoming_window = RemoteInWindow - NumTransfers,
-                next_outgoing_id = add(NextOutId, NumTransfers)}.
+%% Implements section "sending a transfer" in 2.5.6
+session_flow_control_sent_transfers(
+  NumTransfers,
+  #state{remote_incoming_window = RemoteIncomingWindow,
+         next_outgoing_id = NextOutgoingId} = State) ->
+    State#state{remote_incoming_window = RemoteIncomingWindow - NumTransfers,
+                next_outgoing_id = add(NextOutgoingId, NumTransfers)}.
 
 settle_delivery_ids(Current, Last, Settled, Unsettled) ->
     case compare(Current, Last) of
@@ -1102,80 +1115,57 @@ flow(Handle, DeliveryCount) ->
                  delivery_count = ?UINT(DeliveryCount),
                  link_credit = ?UINT(?LINK_CREDIT_RCV)}.
 
-flow_fields(Frames, State)
+session_flow_fields(Frames, State)
   when is_list(Frames) ->
-    [flow_fields(F, State) || F <- Frames];
-flow_fields(Flow = #'v1_0.flow'{},
-            #state{next_outgoing_id = NextOut,
-                   next_incoming_id = NextIn,
-                   incoming_window = InWindow}) ->
+    [session_flow_fields(F, State) || F <- Frames];
+session_flow_fields(Flow = #'v1_0.flow'{},
+                    #state{next_outgoing_id = NextOutgoingId,
+                           next_incoming_id = NextIncomingId,
+                           incoming_window = IncomingWindow}) ->
     Flow#'v1_0.flow'{
-           next_outgoing_id = ?UINT(NextOut),
+           next_outgoing_id = ?UINT(NextOutgoingId),
            outgoing_window = ?UINT_OUTGOING_WINDOW,
-           next_incoming_id = ?UINT(NextIn),
-           incoming_window = ?UINT(InWindow)};
-flow_fields(Frame, _State) ->
+           next_incoming_id = ?UINT(NextIncomingId),
+           incoming_window = ?UINT(IncomingWindow)};
+session_flow_fields(Frame, _State) ->
     Frame.
 
-%% We should already know the next outgoing transfer sequence number,
-%% because it's one more than the last transfer we saw; and, we don't
-%% need to know the next incoming transfer sequence number (although
-%% we might use it to detect congestion -- e.g., if it's lagging far
-%% behind our outgoing sequence number). We probably care about the
-%% outgoing window, since we want to keep it open by sending back
-%% settlements, but there's not much we can do to hurry things along.
-%%
-%% We do care about the incoming window, because we must not send
-%% beyond it. This may cause us problems, even in normal operation,
-%% since we want our unsettled transfers to be exactly those that are
-%% held as unacked by the backing channel; however, the far side may
-%% close the window while we still have messages pending transfer, and
-%% indeed, an individual message may take more than one 'slot'.
-%%
-%% Note that this isn't a race so far as AMQP 1.0 is concerned; it's
-%% only because AMQP 0-9-1 defines QoS in terms of the total number of
-%% unacked messages, whereas 1.0 has an explicit window.
-handle_session_flow_control(
-  #'v1_0.flow'{next_incoming_id = FlowNextIn0,
-               incoming_window  = ?UINT(FlowInWindow),
-               next_outgoing_id = ?UINT(FlowNextOut),
-               outgoing_window  = ?UINT(FlowOutWindow)},
-  #state{next_incoming_id = LocalNextIn,
-         next_outgoing_id = LocalNextOut} = State) ->
-    %% The far side may not have our begin{} with our next-transfer-id
-    FlowNextIn = case FlowNextIn0 of
-                     ?UINT(Id) -> Id;
-                     undefined  -> LocalNextOut
-                 end,
-    case compare(FlowNextOut, LocalNextIn) of
-        equal ->
-            case compare(FlowNextIn, LocalNextOut) of
-                greater ->
-                    protocol_error(?V_1_0_SESSION_ERROR_WINDOW_VIOLATION,
-                                   "Remote incoming id (~tp) leads "
-                                   "local outgoing id (~tp)",
-                                   [FlowNextIn, LocalNextOut]);
-                equal ->
-                    State#state{
-                      remote_outgoing_window = FlowOutWindow,
-                      remote_incoming_window = FlowInWindow};
-                less ->
-                    State#state{
-                      remote_outgoing_window = FlowOutWindow,
-                      remote_incoming_window = diff(add(FlowNextIn, FlowInWindow),
-                                                    LocalNextOut)}
-            end;
-        _ ->
-            case application:get_env(rabbitmq_amqp1_0, protocol_strict_mode) of
-                {ok, false} ->
-                    State#state{next_incoming_id = FlowNextOut};
-                {ok, true} ->
-                    protocol_error(?V_1_0_SESSION_ERROR_WINDOW_VIOLATION,
-                                   "Remote outgoing id (~tp) not equal to "
-                                   "local incoming id (~tp)",
-                                   [FlowNextOut, LocalNextIn])
-            end
-    end.
+%% Implements section "receiving a flow" in 2.5.6
+session_flow_control_received_flow(
+  #'v1_0.flow'{next_incoming_id = FlowNextIncomingId,
+               incoming_window = ?UINT(FlowIncomingWindow),
+               next_outgoing_id = ?UINT(FlowNextOutgoingId),
+               outgoing_window = ?UINT(FlowOutgoingWindow)},
+  #state{next_outgoing_id = NextOutgoingId} = State) ->
+
+    Seq = case FlowNextIncomingId of
+              ?UINT(Id) ->
+                  case compare(Id, NextOutgoingId) of
+                      greater ->
+                          protocol_error(
+                            ?V_1_0_SESSION_ERROR_WINDOW_VIOLATION,
+                            "next-incoming-id from FLOW (~b) leads next-outgoing-id (~b)",
+                            [Id, NextOutgoingId]);
+                      _ ->
+                          Id
+                  end;
+              undefined ->
+                  %% The AMQP client might not have yet received our #begin.next_outgoing_id
+                  ?INITIAL_OUTGOING_ID
+          end,
+
+    RemoteIncomingWindow0 = diff(add(Seq, FlowIncomingWindow), NextOutgoingId),
+    %% RemoteIncomingWindow0 can be negative, for example if we sent a TRANSFER to the
+    %% client between the point in time the client sent us a FLOW with updated
+    %% incoming_window=0 and we received that FLOW. Whether 0 or negative doesn't matter:
+    %% In both cases we're blocked sending more TRANSFERs to the client until it sends us
+    %% a new FLOW with a positive incoming_window. For better understandibility
+    %% across the code base, we ensure a floor of 0 here.
+    RemoteIncomingWindow = max(0, RemoteIncomingWindow0),
+
+    State#state{next_incoming_id = FlowNextOutgoingId,
+                remote_outgoing_window = FlowOutgoingWindow,
+                remote_incoming_window = RemoteIncomingWindow}.
 
 set_delivery_id(?UINT(D), #incoming_link{delivery_id = undefined} = Link) ->
     %% "The delivery-id MUST be supplied on the first transfer of a multi-transfer delivery.
