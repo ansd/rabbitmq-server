@@ -36,7 +36,8 @@ groups() ->
        mqtt_amqpl_alt,
        mqtt_amqp,
        mqtt_amqp_alt,
-       amqp_mqtt
+       amqp_mqtt,
+       x_annotations
       ]}
     ].
 
@@ -499,6 +500,41 @@ amqp_mqtt(_Config) ->
                           }
                 }, Mqtt),
     ok.
+
+x_annotations(_Config) ->
+    Msg0 = #mqtt_msg{
+              qos = 1,
+              topic = <<"/my/topic">>,
+              payload = <<"my payload">>,
+              props = #{'User-Property' => [{<<"x-key-1">>, <<"val-1">>}]}},
+    Anns0 = #{routing_keys => [rabbit_mqtt_util:mqtt_to_amqp(Msg0#mqtt_msg.topic)],
+              <<"x-ann-1">> => 1,
+              <<"x-ann-2">> => '2',
+              <<"x-ann-3">> => <<"3">>,
+              %% Value contains null byte, and is therefore invalid UTF-8.
+              <<"x-ann-4">> => <<0>>,
+              <<"ann-5">> => <<"5">>
+             },
+    Mc0 = mc:init(mc_mqtt, Msg0, Anns0),
+    #mqtt_msg{props = Props0} = mc:protocol_state(Mc0),
+    #{'User-Property' := UserProp0} = Props0,
+    ?assert(lists:member({<<"x-key-1">>, <<"val-1">>}, UserProp0)),
+    ?assert(lists:member({<<"x-ann-1">>, <<"1">>}, UserProp0)),
+    ?assert(lists:member({<<"x-ann-2">>, <<"2">>}, UserProp0)),
+    ?assert(lists:member({<<"x-ann-3">>, <<"3">>}, UserProp0)),
+    ?assertEqual(4, length(UserProp0)),
+
+    Msg1 = #mqtt_msg{
+              qos = 1,
+              topic = <<"/my/topic">>,
+              payload = <<"my payload">>,
+              props = #{}},
+    Anns1 = #{routing_keys => [rabbit_mqtt_util:mqtt_to_amqp(Msg1#mqtt_msg.topic)],
+              <<"x-ann-1">> => 1},
+    Mc1 = mc:init(mc_mqtt, Msg1, Anns1),
+    #mqtt_msg{props = Props} = mc:protocol_state(Mc1),
+    #{'User-Property' := UserProp1} = Props,
+    ?assertEqual([{<<"x-ann-1">>, <<"1">>}], UserProp1).
 
 mqtt_msg() ->
     #mqtt_msg{qos = 0,

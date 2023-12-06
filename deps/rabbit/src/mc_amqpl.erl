@@ -390,7 +390,6 @@ convert_to(_TargetProto, _Content, _Env) ->
 
 protocol_state(#content{properties = #'P_basic'{headers = H00} = B0} = C,
                Anns) ->
-    %% Add any x- annotations as headers
     H0 = case H00 of
              undefined -> [];
              _ ->
@@ -398,6 +397,7 @@ protocol_state(#content{properties = #'P_basic'{headers = H00} = B0} = C,
          end,
     Deaths = maps:get(deaths, Anns, undefined),
     Headers0 = deaths_to_headers(Deaths, H0),
+    %% Add any x- annotations as headers
     Headers1 = maps:fold(
                  fun (<<"x-", _/binary>> = Key, Val, H) when is_integer(Val) ->
                          [{Key, long, Val} | H];

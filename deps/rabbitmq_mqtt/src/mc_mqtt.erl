@@ -427,36 +427,64 @@ protocol_state(Msg = #mqtt_msg{props = Props0,
                               error -> {0, Props1};
                               ValMap -> ValMap
                           end,
-    Props = case maps:get(ttl, Anns, undefined) of
-                undefined ->
-                    Props2;
-                Ttl ->
-                    case maps:get(timestamp, Anns) of
-                        undefined ->
-                            Props2;
-                        Timestamp ->
-                            SourceProtocolIsMqtt = Topic =/= undefined,
-                            %% Only if source protocol is MQTT we know that
-                            %% timestamp was set by the server.
-                            case SourceProtocolIsMqtt of
-                                false ->
-                                    Props2;
-                                true ->
-                                    %% "The PUBLISH packet sent to a Client by
-                                    %% the Server MUST contain a
-                                    %% Message Expiry Interval set to the received
-                                    %% value minus the time that
-                                    %% the Application Message has been waiting
-                                    %% in the Server" [MQTT-3.3.2-6]
-                                    WaitingMillis0 = os:system_time(millisecond) - Timestamp,
-                                    %% For a delayed Will Message, the waiting
-                                    %% time starts when the Will Message was published.
-                                    WaitingMillis = WaitingMillis0 - WillDelay * 1000,
-                                    MEIMillis = max(0, Ttl - WaitingMillis),
-                                    Props2#{'Message-Expiry-Interval' => MEIMillis div 1000}
-                            end
-                    end
+    Props3 = case maps:get(ttl, Anns, undefined) of
+                 undefined ->
+                     Props2;
+                 Ttl ->
+                     case maps:get(timestamp, Anns) of
+                         undefined ->
+                             Props2;
+                         Timestamp ->
+                             SourceProtocolIsMqtt = Topic =/= undefined,
+                             %% Only if source protocol is MQTT we know that
+                             %% timestamp was set by the server.
+                             case SourceProtocolIsMqtt of
+                                 false ->
+                                     Props2;
+                                 true ->
+                                     %% "The PUBLISH packet sent to a Client by
+                                     %% the Server MUST contain a
+                                     %% Message Expiry Interval set to the received
+                                     %% value minus the time that
+                                     %% the Application Message has been waiting
+                                     %% in the Server" [MQTT-3.3.2-6]
+                                     WaitingMillis0 = os:system_time(millisecond) - Timestamp,
+                                     %% For a delayed Will Message, the waiting
+                                     %% time starts when the Will Message was published.
+                                     WaitingMillis = WaitingMillis0 - WillDelay * 1000,
+                                     MEIMillis = max(0, Ttl - WaitingMillis),
+                                     Props2#{'Message-Expiry-Interval' => MEIMillis div 1000}
+                             end
+                     end
+             end,
+
+    %% Add any x-* annotations as User Property.
+    L = maps:fold(fun(<<"x-", _/binary>> = Key, Val, L0) ->
+                          if is_atom(Val) ->
+                                 [{Key, atom_to_binary(Val)} | L0];
+                             is_integer(Val) ->
+                                 [{Key, integer_to_binary(Val)} | L0];
+                             true ->
+                                 case mc_util:is_utf8_no_null(Val) of
+                                     true ->
+                                         [{Key, Val} | L0];
+                                     false ->
+                                         L0
+                                 end
+                          end;
+                     (_, _, L0) ->
+                          L0
+                  end, [], Anns),
+    Props = case L of
+                [] ->
+                    Props3;
+                _ ->
+                    maps:update_with('User-Property',
+                                     fun(UserProps) -> L ++ UserProps end,
+                                     L,
+                                     Props3)
             end,
+
     [RoutingKey | _] = maps:get(routing_keys, Anns),
     Msg#mqtt_msg{topic = rabbit_mqtt_util:amqp_to_mqtt(RoutingKey),
                  props = Props}.
