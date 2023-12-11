@@ -13,6 +13,7 @@
 -include_lib("amqp10_common/include/amqp10_types.hrl").
 -include("rabbit_amqp1_0.hrl").
 
+-define(PROTOCOL, amqp10).
 -define(HIBERNATE_AFTER, 6_000).
 -define(CREDIT_REPLY_TIMEOUT, 30_000).
 -define(UINT_OUTGOING_WINDOW, {uint, ?UINT_MAX}).
@@ -89,7 +90,8 @@
 -record(outgoing_link, {
           %% Although the source address of a link might be an exchange name and binding key
           %% or a topic filter, an outgoing link will always consume from a queue.
-          queue :: rabbit_misc:resource_name(),
+          queue_name :: rabbit_misc:resource_name(),
+          queue_type :: rabbit_queue_type:queue_type(),
           send_settled :: boolean(),
           max_message_size :: unlimited | pos_integer(),
           %% When credit API v1 is used, our session process holds the delivery-count
@@ -274,7 +276,17 @@ init({ReaderPid, WriterPid, ChannelNum, MaxFrameSize, User, Vhost,
                            resource_alarms = Alarms
                           }}}.
 
-terminate(_Reason, #state{queue_states = QStates}) ->
+terminate(_Reason, #state{incoming_links = IncomingLinks,
+                          outgoing_links = OutgoingLinks,
+                          queue_states = QStates}) ->
+    maps:foreach(
+      fun (_, _) ->
+              rabbit_global_counters:publisher_deleted(?PROTOCOL)
+      end, IncomingLinks),
+    maps:foreach(
+      fun (_, _) ->
+              rabbit_global_counters:consumer_deleted(?PROTOCOL)
+      end, OutgoingLinks),
     ok = rabbit_queue_type:close(QStates).
 
 -spec list_local() -> [pid()].
@@ -435,6 +447,7 @@ send_delivery_state_changes(State0 = #state{cfg = #cfg{writer_pid = Writer,
     send_dispositions(ReleasedIds, #'v1_0.released'{}, Writer, ChannelNum),
     AcceptedIds = AcceptedIds1 ++ AcceptedIds0,
     send_dispositions(AcceptedIds, #'v1_0.accepted'{}, Writer, ChannelNum),
+    rabbit_global_counters:messages_confirmed(?PROTOCOL, length(AcceptedIds)),
     %% Send DETACH frames after DISPOSITION frames such that
     %% clients can handle DISPOSITIONs before closing their links.
     lists:foreach(fun(Frame) ->
@@ -616,25 +629,26 @@ destroy_links(#resource{kind = queue,
                          outgoing_unsettled_map = Unsettled},
     {Frames, GrantCredits, State}.
 
-destroy_incoming_link(Handle, #incoming_link{queue = QNameBin}, QNameBin, {Frames, GrantCreds, Links}) ->
-    {[detach(Handle, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
+destroy_incoming_link(Handle, Link = #incoming_link{queue = QNameBin}, QNameBin, {Frames, GrantCreds, Links}) ->
+    {[detach(Handle, Link, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
      %% Don't grant credits for a link that we destroy.
      maps:remove(Handle, GrantCreds),
      maps:remove(Handle, Links)};
 destroy_incoming_link(_, _, _, Acc) ->
     Acc.
 
-destroy_outgoing_link(Handle, #outgoing_link{queue = QNameBin}, QNameBin, {Frames, Unsettled0, Links}) ->
+destroy_outgoing_link(Handle, Link = #outgoing_link{queue_name = QNameBin}, QNameBin, {Frames, Unsettled0, Links}) ->
     {Unsettled, _RemovedMsgIds} = remove_link_from_outgoing_unsettled_map(Handle, Unsettled0),
-    {[detach(Handle, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
+    {[detach(Handle, Link, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED) | Frames],
      Unsettled,
      maps:remove(Handle, Links)};
 destroy_outgoing_link(_, _, _, Acc) ->
     Acc.
 
-detach(Handle, ErrorCondition) ->
+detach(Handle, Link, ErrorCondition) ->
     rabbit_log:warning("Detaching link handle ~b due to error condition: ~tp",
                        [Handle, ErrorCondition]),
+    publisher_or_consumer_deleted(Link),
     #'v1_0.detach'{handle = ?UINT(Handle),
                    closed = true,
                    error = #'v1_0.error'{condition = ErrorCondition}}.
@@ -682,8 +696,6 @@ handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
                               delivery_count = DeliveryCount,
                               credit = ?LINK_CREDIT_RCV},
             _Outcomes = outcomes(Source),
-            % rabbit_global_counters:publisher_created(ProtoVer),
-
             OutputHandle = output_handle(InputHandle),
             Reply = #'v1_0.attach'{
                        name = LinkName,
@@ -708,6 +720,7 @@ handle_control(#'v1_0.attach'{role = ?SEND_ROLE,
             %% with an immediate close carrying a handle-in-use session-error."
             IncomingLinks = IncomingLinks0#{HandleInt => IncomingLink},
             State = State0#state{incoming_links = IncomingLinks},
+            rabbit_global_counters:publisher_created(?PROTOCOL),
             reply0([Reply, Flow], State);
         {error, Reason} ->
             %% TODO proper link establishment protocol here?
@@ -744,6 +757,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
             case rabbit_amqqueue:with(
                    QName,
                    fun(Q) ->
+                           QType = amqqueue:get_type(Q),
                            %% Whether credit API v1 or v2 is used is decided only here at link attachment time.
                            %% This decision applies to the whole life time of the link.
                            %% This means even when feature flag credit_api_v2 will be enabled later, this consumer will
@@ -756,7 +770,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                            %% flow control state. Hence, credit API mixed version isn't an issue for streams.
                            {Mode,
                             DeliveryCount} = case rabbit_feature_flags:is_enabled(credit_api_v2) orelse
-                                                  amqqueue:get_type(Q) =:= rabbit_stream_queue of
+                                                  QType =:= rabbit_stream_queue of
                                                  true ->
                                                      {{credited, ?INITIAL_DELIVERY_COUNT}, credit_api_v2};
                                                  false ->
@@ -799,7 +813,8 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                                                             %% maximum size imposed by the link endpoint."
                                                             unlimited
                                                     end,
-                                   Link = #outgoing_link{queue = QNameBin,
+                                   Link = #outgoing_link{queue_name = QNameBin,
+                                                         queue_type = QType,
                                                          send_settled = SndSettled,
                                                          max_message_size = MaxMessageSize,
                                                          delivery_count = DeliveryCount},
@@ -810,6 +825,7 @@ handle_control(#'v1_0.attach'{role = ?RECV_ROLE,
                                    OutgoingLinks = OutgoingLinks0#{HandleInt => Link},
                                    State1 = State0#state{queue_states = QStates,
                                                          outgoing_links = OutgoingLinks},
+                                   rabbit_global_counters:consumer_created(?PROTOCOL),
                                    {ok, [A], State1};
                                {error, Reason} ->
                                    protocol_error(
@@ -914,7 +930,7 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
     %% TODO keep the state around depending on the lifetime
     {QStates, Unsettled, OutgoingLinks}
     = case maps:take(HandleInt, OutgoingLinks0) of
-          {#outgoing_link{queue = QNameBin}, OutgoingLinks1} ->
+          {#outgoing_link{queue_name = QNameBin}, OutgoingLinks1} ->
               QName = rabbit_misc:r(Vhost, queue, QNameBin),
               case rabbit_amqqueue:lookup(QName) of
                   {ok, Q} ->
@@ -967,6 +983,7 @@ handle_control(#'v1_0.detach'{handle = Handle = ?UINT(HandleInt),
     ok = rabbit_amqp1_0_writer:send_command(
            WriterPid, Ch, #'v1_0.detach'{handle = Handle,
                                          closed = Closed}),
+    publisher_or_consumer_deleted(State, State0),
     {noreply, State};
 
 handle_control(#'v1_0.end'{},
@@ -1041,6 +1058,7 @@ handle_control(#'v1_0.disposition'{role = ?RECV_ROLE,
               fun({QName, Ctag}, MsgIds, {QS0, ActionsAcc}) ->
                       case rabbit_queue_type_settle(QName, SettleOp, Ctag, MsgIds, QS0) of
                           {ok, QS, Actions0} ->
+                              messages_acknowledged(SettleOp, QName, QS, MsgIds),
                               {QS, ActionsAcc ++ Actions0};
                           {protocol_error, _ErrorType, Reason, ReasonArgs} ->
                               protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
@@ -1377,7 +1395,8 @@ handle_deliver(ConsumerTag, AckRequired,
                               cfg = #cfg{outgoing_max_frame_size = MaxFrameSize}}) ->
     Handle = ctag_to_handle(ConsumerTag),
     case OutgoingLinks of
-        #{Handle := #outgoing_link{send_settled = SendSettled,
+        #{Handle := #outgoing_link{queue_type = QType,
+                                   send_settled = SendSettled,
                                    max_message_size = MaxMessageSize}} ->
             %% "The delivery-tag MUST be unique amongst all deliveries that could be
             %% considered unsettled by either end of the link." [2.6.12]
@@ -1418,6 +1437,7 @@ handle_deliver(ConsumerTag, AckRequired,
                              TLen = iolist_size(amqp10_framing:encode_bin(Transfer)),
                              encode_frames(Transfer, Sections, MaxFrameSize - TLen, [])
                      end,
+            messages_delivered(Redelivered, QType),
             Del = #outgoing_unsettled{
                      msg_id = MsgId,
                      consumer_tag = ConsumerTag,
@@ -1484,10 +1504,10 @@ incoming_link_transfer(
 incoming_link_transfer(
   #'v1_0.transfer'{handle = ?UINT(HandleInt)},
   _,
-  #incoming_link{credit = Credit},
+  #incoming_link{credit = Credit} = Link,
   _)
   when Credit =< 0 ->
-    Detach = detach(HandleInt, ?V_1_0_LINK_ERROR_TRANSFER_LIMIT_EXCEEDED),
+    Detach = detach(HandleInt, Link, ?V_1_0_LINK_ERROR_TRANSFER_LIMIT_EXCEEDED),
     {error, [Detach]};
 incoming_link_transfer(
   #'v1_0.transfer'{delivery_id = MaybeDeliveryId,
@@ -1533,7 +1553,7 @@ incoming_link_transfer(
     RoutingKeys = mc:get_annotation(routing_keys, Mc),
     RoutingKey = routing_key(RoutingKeys, XName),
     % Mc1 = rabbit_message_interceptor:intercept(Mc),
-    % rabbit_global_counters:messages_received(ProtoVer, 1),
+    messages_received(Settled),
     case rabbit_exchange:lookup(XName) of
         {ok, Exchange} ->
             check_write_permitted_on_topic(Exchange, User, RoutingKey),
@@ -1551,7 +1571,6 @@ incoming_link_transfer(
             case rabbit_queue_type:deliver(Qs, Mc, Opts, QStates0) of
                 {ok, QStates, Actions} ->
                     State1 = State0#state{queue_states = QStates},
-                    % rabbit_global_counters:messages_routed(ProtoVer, length(Qs)),
                     %% Confirms must be registered before processing actions
                     %% because actions may contain rejections of publishes.
                     {U, Reply0} = process_routing_confirm(
@@ -1577,21 +1596,23 @@ incoming_link_transfer(
             end;
         {error, not_found} ->
             Disposition = released(DeliveryId),
-            Detach = detach(HandleInt, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED),
+            Detach = detach(HandleInt, Link0, ?V_1_0_AMQP_ERROR_RESOURCE_DELETED),
             {error, [Disposition, Detach]}
     end.
 
 process_routing_confirm([], _SenderSettles = true, _, U) ->
-    % rabbit_global_counters:messages_unroutable_dropped(ProtoVer, 1),
+    rabbit_global_counters:messages_unroutable_dropped(?PROTOCOL, 1),
     {U, []};
 process_routing_confirm([], _SenderSettles = false, DeliveryId, U) ->
-    % rabbit_global_counters:messages_unroutable_returned(ProtoVer, 1),
+    rabbit_global_counters:messages_unroutable_returned(?PROTOCOL, 1),
     Disposition = released(DeliveryId),
     {U, [Disposition]};
 process_routing_confirm([_|_] = Qs, SenderSettles, DeliveryId, U0) ->
     QNames = rabbit_amqqueue:queue_names(Qs),
     false = maps:is_key(DeliveryId, U0),
-    U = U0#{DeliveryId => {maps:from_keys(QNames, ok), SenderSettles, false}},
+    Map = maps:from_keys(QNames, ok),
+    U = U0#{DeliveryId => {Map, SenderSettles, false}},
+    rabbit_global_counters:messages_routed(?PROTOCOL, map_size(Map)),
     {U, []}.
 
 released(DeliveryId) ->
@@ -1656,7 +1677,7 @@ ensure_target(#'v1_0.target'{address = Address,
     end.
 
 handle_outgoing_link_flow_control(
-  #outgoing_link{queue = QNameBin,
+  #outgoing_link{queue_name = QNameBin,
                  delivery_count = MaybeDeliveryCountSnd},
   #'v1_0.flow'{handle = ?UINT(HandleInt),
                delivery_count = MaybeDeliveryCountRcv,
@@ -2102,6 +2123,48 @@ routing_key(undefined, XName) ->
                    [rabbit_misc:rs(XName)]);
 routing_key([RoutingKey], _XName) ->
     RoutingKey.
+
+messages_received(Settled) ->
+    rabbit_global_counters:messages_received(?PROTOCOL, 1),
+    case Settled of
+        true -> ok;
+        false -> rabbit_global_counters:messages_received_confirm(?PROTOCOL, 1)
+    end.
+
+messages_delivered(Redelivered, QueueType) ->
+    rabbit_global_counters:messages_delivered(?PROTOCOL, QueueType, 1),
+    case Redelivered of
+        true -> rabbit_global_counters:messages_redelivered(?PROTOCOL, QueueType, 1);
+        false -> ok
+    end.
+
+messages_acknowledged(complete, QName, QS, MsgIds) ->
+    case rabbit_queue_type:module(QName, QS) of
+        {ok, QType} ->
+            rabbit_global_counters:messages_acknowledged(?PROTOCOL, QType, length(MsgIds));
+        _ ->
+            ok
+    end;
+messages_acknowledged(_, _, _, _) ->
+    ok.
+
+publisher_or_consumer_deleted(#incoming_link{}) ->
+    rabbit_global_counters:publisher_deleted(?PROTOCOL);
+publisher_or_consumer_deleted(#outgoing_link{}) ->
+    rabbit_global_counters:consumer_deleted(?PROTOCOL).
+
+publisher_or_consumer_deleted(
+  #state{incoming_links = NewIncomingLinks,
+         outgoing_links = NewOutgoingLinks},
+  #state{incoming_links = OldIncomingLinks,
+         outgoing_links = OldOutgoingLinks}) ->
+    if map_size(NewIncomingLinks) < map_size(OldIncomingLinks) ->
+           rabbit_global_counters:publisher_deleted(?PROTOCOL);
+       map_size(NewOutgoingLinks) < map_size(OldOutgoingLinks) ->
+           rabbit_global_counters:consumer_deleted(?PROTOCOL);
+       true ->
+           ok
+    end.
 
 check_internal_exchange(#exchange{internal = true,
                                   name = XName}) ->

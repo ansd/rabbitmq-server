@@ -82,6 +82,7 @@ groups() ->
        max_message_size_client_to_server,
        max_message_size_server_to_client,
        receive_transfer_flow_order,
+       global_counters,
        stream_filtering
       ]},
 
@@ -157,6 +158,10 @@ init_per_testcase(Testcase, Config) ->
 end_per_testcase(Testcase, Config) ->
     %% Assert that every testcase cleaned up.
     eventually(?_assertEqual([], rpc(Config, rabbit_amqqueue, list, []))),
+    %% Assert that global counters count correctly.
+    eventually(?_assertMatch(#{publishers := 0,
+                               consumers := 0},
+                             get_global_counters(Config))),
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
 
 reliable_send_receive_with_outcomes_classic_queue(Config) ->
@@ -896,6 +901,7 @@ server_closes_link_exchange(Config) ->
     {ok, Sender} = amqp10_client:attach_sender_link(
                      Session, <<"test-sender">>, Address),
     ok = wait_for_credit(Sender),
+    ?assertMatch(#{publishers := 1}, get_global_counters(Config)),
 
     %% Server closes the link endpoint due to some AMQP 1.0 external condition:
     %% In this test, the external condition is that an AMQP 0.9.1 client deletes the exchange.
@@ -906,15 +912,13 @@ server_closes_link_exchange(Config) ->
     %% 1. that the message is released because the exchange doesn't exist anymore, and
     DTag = <<255>>,
     ok = amqp10_client:send_msg(Sender, amqp10_msg:new(DTag, <<"body">>, false)),
-    receive {amqp10_disposition, {released, DTag}} -> ok
-    after 5000 -> ct:fail(released_timeout)
-    end,
+    ok = wait_for_settlement(DTag, released),
     %% 2. that the server closes the link, i.e. sends us a DETACH frame.
-
     ExpectedError = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_RESOURCE_DELETED},
     receive {amqp10_event, {link, Sender, {detached, ExpectedError}}} -> ok
     after 5000 -> ct:fail("server did not close our outgoing link")
     end,
+    ?assertMatch(#{publishers := 0}, get_global_counters(Config)),
 
     ok = end_session_sync(Session),
     ok = amqp10_client:close_connection(Connection).
@@ -965,9 +969,7 @@ link_target_queue_deleted(QType, Config) ->
     %% If we now delete that target queue, RabbitMQ must not reply to us with ACCEPTED.
     %% Instead, we expect RabbitMQ to reply with RELEASED since no queue ever received our 2nd message.
     delete_queue(Config, QName),
-    receive {amqp10_disposition, {released, DTag2}} -> ok
-    after 5000 -> ct:fail(released_timeout)
-    end,
+    ok = wait_for_settlement(DTag2, released),
 
     %% After the 2nd message got released, we additionally expect RabbitMQ to close the link given
     %% that the target link endpoint - the queue - got deleted.
@@ -2430,6 +2432,158 @@ queue_and_client_different_nodes(QueueLeaderNode, ClientNode, QueueType, Config)
     ok = rabbit_ct_client_helpers:close_channel(Ch),
     ok = amqp10_client:close_connection(Connection).
 
+global_counters(Config) ->
+    #{publishers := 0,
+      consumers := 0,
+      messages_received_total := Received0,
+      messages_received_confirm_total := ReceivedConfirm0,
+      messages_confirmed_total := Confirmed0,
+      messages_routed_total := Routed0,
+      messages_unroutable_dropped_total := UnroutableDropped0,
+      messages_unroutable_returned_total := UnroutableReturned0} = get_global_counters(Config),
+
+    #{messages_delivered_total := CQDelivered0,
+      messages_redelivered_total := CQRedelivered0,
+      messages_acknowledged_total := CQAcknowledged0} = get_global_counters(Config, rabbit_classic_queue),
+
+    #{messages_delivered_total := QQDelivered0,
+      messages_redelivered_total := QQRedelivered0,
+      messages_acknowledged_total := QQAcknowledged0} = get_global_counters(Config, rabbit_quorum_queue),
+
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    CQ = <<"my classic queue">>,
+    QQ = <<"my quorum queue">>,
+    CQAddress = <<"/amq/queue/", CQ/binary>>,
+    QQAddress = <<"/amq/queue/", QQ/binary>>,
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = CQ,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"classic">>}]}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{
+                                     queue = QQ,
+                                     durable = true,
+                                     arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
+
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, CQSender} = amqp10_client:attach_sender_link(Session, <<"test-sender-cq">>, CQAddress),
+    {ok, QQSender} = amqp10_client:attach_sender_link(Session, <<"test-sender-qq">>, QQAddress),
+    ok = wait_for_credit(CQSender),
+    ok = wait_for_credit(QQSender),
+    {ok, CQReceiver} = amqp10_client:attach_receiver_link(Session, <<"test-receiver-cq">>, CQAddress, settled),
+    {ok, QQReceiver} = amqp10_client:attach_receiver_link(Session, <<"test-receiver-qq">>, QQAddress, unsettled),
+    ok = amqp10_client:send_msg(CQSender, amqp10_msg:new(<<0>>, <<"m0">>, true)),
+    ok = amqp10_client:send_msg(QQSender, amqp10_msg:new(<<1>>, <<"m1">>, false)),
+    ok = wait_for_settlement(<<1>>),
+
+    {ok, Msg0} = amqp10_client:get_msg(CQReceiver),
+    ?assertEqual([<<"m0">>], amqp10_msg:body(Msg0)),
+
+    {ok, Msg1} = amqp10_client:get_msg(QQReceiver),
+    ?assertEqual([<<"m1">>], amqp10_msg:body(Msg1)),
+    ok = amqp10_client:accept_msg(QQReceiver, Msg1),
+
+    #{publishers := 2,
+      consumers := 2,
+      messages_received_total := Received1,
+      messages_received_confirm_total := ReceivedConfirm1,
+      messages_confirmed_total := Confirmed1,
+      messages_routed_total := Routed1,
+      messages_unroutable_dropped_total := UnroutableDropped1,
+      messages_unroutable_returned_total := UnroutableReturned1} = get_global_counters(Config),
+    ?assertEqual(Received0 + 2, Received1),
+    ?assertEqual(ReceivedConfirm0 + 1, ReceivedConfirm1),
+    ?assertEqual(Confirmed0 + 1, Confirmed1),
+    ?assertEqual(Routed0 + 2, Routed1),
+    ?assertEqual(UnroutableDropped0, UnroutableDropped1),
+    ?assertEqual(UnroutableReturned0, UnroutableReturned1),
+
+    #{messages_delivered_total := CQDelivered1,
+      messages_redelivered_total := CQRedelivered1,
+      messages_acknowledged_total := CQAcknowledged1} = get_global_counters(Config, rabbit_classic_queue),
+    ?assertEqual(CQDelivered0 + 1, CQDelivered1),
+    ?assertEqual(CQRedelivered0, CQRedelivered1),
+    ?assertEqual(CQAcknowledged0, CQAcknowledged1),
+
+    #{messages_delivered_total := QQDelivered1,
+      messages_redelivered_total := QQRedelivered1,
+      messages_acknowledged_total := QQAcknowledged1} = get_global_counters(Config, rabbit_quorum_queue),
+    ?assertEqual(QQDelivered0 + 1, QQDelivered1),
+    ?assertEqual(QQRedelivered0, QQRedelivered1),
+    ?assertEqual(QQAcknowledged0 + 1, QQAcknowledged1),
+
+    %% Test re-delivery.
+    ok = amqp10_client:send_msg(QQSender, amqp10_msg:new(<<2>>, <<"m2">>, false)),
+    ok = wait_for_settlement(<<2>>),
+    {ok, Msg2a} = amqp10_client:get_msg(QQReceiver),
+    ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2a)),
+    %% Releasing causes the message to be requeued.
+    ok = amqp10_client:settle_msg(QQReceiver, Msg2a, released),
+    %% The message should be re-delivered.
+    {ok, Msg2b} = amqp10_client:get_msg(QQReceiver),
+    ?assertEqual([<<"m2">>], amqp10_msg:body(Msg2b)),
+    #{messages_delivered_total := QQDelivered2,
+      messages_redelivered_total := QQRedelivered2,
+      messages_acknowledged_total := QQAcknowledged2} = get_global_counters(Config, rabbit_quorum_queue),
+    %% m2 was delivered 2 times
+    ?assertEqual(QQDelivered1 + 2, QQDelivered2),
+    %% m2 was re-delivered 1 time
+    ?assertEqual(QQRedelivered1 + 1, QQRedelivered2),
+    %% Releasing a message shouldn't count as acknowledged.
+    ?assertEqual(QQAcknowledged1, QQAcknowledged2),
+    ok = amqp10_client:accept_msg(QQReceiver, Msg2b),
+
+    %% Server closes the link endpoint due to some AMQP 1.0 external condition:
+    %% In this test, the external condition is that an AMQP 0.9.1 client deletes the queue.
+    %% Gauges for publishers and consumers should be decremented.
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QQ}),
+    ExpectedError = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_RESOURCE_DELETED},
+    receive {amqp10_event, {link, QQSender, {detached, ExpectedError}}} -> ok
+    after 5000 -> ct:fail("server did not close our sending link")
+    end,
+    receive {amqp10_event, {link, QQReceiver, {detached, ExpectedError}}} -> ok
+    after 5000 -> ct:fail("server did not close our receiving link")
+    end,
+    ?assertMatch(#{publishers := 1,
+                   consumers := 1},
+                 get_global_counters(Config)),
+
+    %% Gauges for publishers and consumers should also be decremented for normal link detachments.
+    ok = amqp10_client:detach_link(CQSender),
+    receive {amqp10_event, {link, CQSender, {detached, normal}}} -> ok
+    after 5000 -> ct:fail("missing detached")
+    end,
+    ok = amqp10_client:detach_link(CQReceiver),
+    receive {amqp10_event, {link, CQReceiver, {detached, normal}}} -> ok
+    after 5000 -> ct:fail("missing detached")
+    end,
+    ?assertMatch(#{publishers := 0,
+                   consumers := 0},
+                 get_global_counters(Config)),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = CQ}),
+
+    flush("testing unroutable..."),
+    %% Send 2 messages to the fanout exchange that has no bound queues.
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"test-sender-fanout">>, <<"/exchange/amq.fanout/ignored">>),
+    ok = wait_for_credit(Sender),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<3>>, <<"m3">>, true)),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<4>>, <<"m4">>, false)),
+    ok = wait_for_settlement(<<4>>, released),
+    #{messages_unroutable_dropped_total := UnroutableDropped2,
+      messages_unroutable_returned_total := UnroutableReturned2} = get_global_counters(Config),
+    %% m3 was dropped
+    ?assertEqual(UnroutableDropped1 + 1, UnroutableDropped2),
+    %% m4 was returned
+    ?assertEqual(UnroutableReturned1 + 1, UnroutableReturned2),
+
+    ok = rabbit_ct_client_helpers:close_channel(Ch),
+    ok = amqp10_client:detach_link(Sender),
+    ok = end_session_sync(Session),
+    ok = amqp10_client:close_connection(Connection).
 
 stream_filtering(Config) ->
     ok = rabbit_ct_broker_helpers:enable_feature_flag(Config, ?FUNCTION_NAME),
@@ -2770,3 +2924,14 @@ gen_server_state(Pid) ->
     L1 = lists:last(L0),
     {data, L2} = lists:last(L1),
     proplists:get_value("State", L2).
+
+get_global_counters(Config) ->
+    get_global_counters0(Config, [{protocol, amqp10}]).
+
+get_global_counters(Config, QType) ->
+    get_global_counters0(Config, [{protocol, amqp10},
+                                  {queue_type, QType}]).
+
+get_global_counters0(Config, Key) ->
+    Overview = rpc(Config, rabbit_global_counters, overview, []),
+    maps:get(Key, Overview).
