@@ -549,20 +549,21 @@ deliver0(MsgId, Msg,
                          correlation = Correlation,
                          slow = Slow}, Actions}.
 
-stream_message(Msg, _FilteringSupported = true) ->
-    MsgData = msg_to_iodata(Msg),
-    case mc:x_header(<<"x-stream-filter-value">>, Msg) of
-        undefined ->
-            MsgData;
-        {utf8, Value} ->
-            {Value, MsgData}
-    end;
-stream_message(Msg, _FilteringSupported = false) ->
-    msg_to_iodata(Msg).
-
-msg_to_iodata(Msg0) ->
-    Sections = mc:protocol_state(mc:convert(mc_amqp, Msg0)),
-    mc_amqp:serialize(Sections).
+stream_message(Msg, FilteringSupported) ->
+    McAmqp = mc:convert(mc_amqp, Msg),
+    Sections = mc:protocol_state(McAmqp),
+    MsgData = mc_amqp:serialize(Sections),
+    case FilteringSupported of
+        true ->
+            case mc:x_header(<<"x-stream-filter-value">>, McAmqp) of
+                undefined ->
+                    MsgData;
+                {utf8, Value} ->
+                    {Value, MsgData}
+            end;
+        false ->
+            MsgData
+    end.
 
 -spec dequeue(_, _, _, _, client()) -> no_return().
 dequeue(_, _, _, _, #stream_client{name = Name}) ->
