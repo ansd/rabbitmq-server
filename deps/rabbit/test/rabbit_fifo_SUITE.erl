@@ -39,12 +39,6 @@ groups() ->
      {machine_version_conversion, [shuffle], [convert_v2_to_v3]}
     ].
 
-init_per_suite(Config) ->
-    Config.
-
-end_per_suite(_Config) ->
-    ok.
-
 init_per_group(machine_version_2, Config) ->
     [{machine_version, 2} | Config];
 init_per_group(machine_version_3, Config) ->
@@ -53,24 +47,6 @@ init_per_group(machine_version_conversion, Config) ->
     Config.
 
 end_per_group(_Group, _Config) ->
-    ok.
-
-init_per_testcase(T, Config) ->
-    case lists:member(T, [credit_enq_enq_checkout_settled_credit_test,
-                          credit_with_drained_test,
-                          credit_and_drain_test,
-                          single_active_with_credited_test]) of
-        true ->
-            Mod = rabbit_feature_flags,
-            meck:new(Mod),
-            %% TODO write tests where credit_api_v2 is enabled
-            meck:expect(Mod, is_enabled, fun(credit_api_v2) -> false end);
-        false ->
-            ok
-    end,
-    Config.
-
-end_per_testcase(_TestCase, _Config) ->
     ok.
 
 %%%===================================================================
@@ -120,6 +96,8 @@ enq_enq_checkout_test(C) ->
     ?ASSERT_EFF({monitor, _, _}, Effects),
     ?ASSERT_EFF({log, [1,2], _Fun, _Local}, Effects),
     ok.
+
+%%TODO add credit API v2 tests?
 
 credit_enq_enq_checkout_settled_credit_test(C) ->
     Cid = {?FUNCTION_NAME, self()},
