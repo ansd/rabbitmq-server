@@ -1655,10 +1655,10 @@ ensure_target(#'v1_0.target'{address = Address,
                              durable = Durable}, Vhost, User) ->
     case Address of
         {utf8, Destination} ->
-            case rabbit_routing_util:parse_endpoint(Destination, true) of
+            case rabbit_routing_parser:parse_endpoint(Destination, true) of
                 {ok, Dest} ->
                     QNameBin = ensure_terminus(target, Dest, Vhost, User, Durable),
-                    {XNameList1, RK} = rabbit_routing_util:parse_routing(Dest),
+                    {XNameList1, RK} = rabbit_routing_parser:parse_routing(Dest),
                     XName = rabbit_misc:r(Vhost, exchange, list_to_binary(XNameList1)),
                     {ok, X} = rabbit_exchange:lookup(XName),
                     check_internal_exchange(X),
@@ -1804,12 +1804,10 @@ ensure_source(#'v1_0.source'{address = Address,
               User = #user{username = Username}) ->
     case Address of
         {utf8, SourceAddr} ->
-            case rabbit_routing_util:parse_endpoint(SourceAddr, false) of
+            case rabbit_routing_parser:parse_endpoint(SourceAddr, false) of
                 {ok, Src} ->
                     QNameBin = ensure_terminus(source, Src, Vhost, User, Durable),
-                    %%TODO remove dependency on rabbit_routing_util
-                    %% and always operator on binaries
-                    case rabbit_routing_util:parse_routing(Src) of
+                    case rabbit_routing_parser:parse_routing(Src) of
                         {"", QNameList} ->
                             true = string:equal(QNameList, QNameBin),
                             {ok, QNameBin};

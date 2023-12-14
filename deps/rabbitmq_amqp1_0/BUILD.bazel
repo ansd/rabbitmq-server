@@ -36,8 +36,6 @@ all_srcs(name = "all_srcs")
 
 test_suite_beam_files(name = "test_suite_beam_files")
 
-# gazelle:erlang_app_dep amqp_client
-
 rabbitmq_app(
     name = "erlang_app",
     srcs = [":all_srcs"],
@@ -51,7 +49,6 @@ rabbitmq_app(
     priv = [":priv"],
     deps = [
         "//deps/amqp10_common:erlang_app",
-        "//deps/amqp_client:erlang_app",
         "//deps/rabbit:erlang_app",
         "//deps/rabbit_common:erlang_app",
     ],

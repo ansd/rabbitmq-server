@@ -912,6 +912,7 @@ rabbit_common:
 - rabbit_registry
 - rabbit_registry_class
 - rabbit_resource_monitor_misc
+- rabbit_routing_parser
 - rabbit_runtime
 - rabbit_runtime_parameter
 - rabbit_semver
