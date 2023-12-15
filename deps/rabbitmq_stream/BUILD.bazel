@@ -101,9 +101,6 @@ eunit(
 )
 
 broker_for_integration_suites(
-    extra_plugins = [
-        "//deps/rabbitmq_amqp1_0:erlang_app",
-    ],
 )
 
 rabbitmq_integration_suite(

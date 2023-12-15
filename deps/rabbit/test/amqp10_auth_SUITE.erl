@@ -4,7 +4,7 @@
 %%
 %% Copyright (c) 2007-2023 VMware, Inc. or its affiliates.  All rights reserved.
 
--module(auth_SUITE).
+-module(amqp10_auth_SUITE).
 
 -compile([export_all,
           nowarn_export_all]).

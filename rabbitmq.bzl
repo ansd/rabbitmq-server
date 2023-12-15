@@ -45,7 +45,6 @@ BROKER_VERSION_REQUIREMENTS_ANY = """
 
 ALL_PLUGINS = [
     "//deps/rabbit:erlang_app",
-    "//deps/rabbitmq_amqp1_0:erlang_app",
     "//deps/rabbitmq_auth_backend_cache:erlang_app",
     "//deps/rabbitmq_auth_backend_http:erlang_app",
     "//deps/rabbitmq_auth_backend_ldap:erlang_app",

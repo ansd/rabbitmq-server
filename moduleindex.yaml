@@ -629,6 +629,7 @@ ra:
 - ra_system_sup
 - ra_systems_sup
 rabbit:
+- Elixir.RabbitMQ.CLI.Ctl.Commands.ListAmqp10ConnectionsCommand
 - amqqueue
 - background_gc
 - code_server_cache
@@ -648,6 +649,12 @@ rabbit:
 - rabbit
 - rabbit_access_control
 - rabbit_alarm
+- rabbit_amqp1_0
+- rabbit_amqp1_0_reader
+- rabbit_amqp1_0_session
+- rabbit_amqp1_0_session_sup
+- rabbit_amqp1_0_util
+- rabbit_amqp1_0_writer
 - rabbit_amqqueue
 - rabbit_amqqueue_control
 - rabbit_amqqueue_process
@@ -925,14 +932,6 @@ rabbit_common:
 - worker_pool
 - worker_pool_sup
 - worker_pool_worker
-rabbitmq_amqp1_0:
-- Elixir.RabbitMQ.CLI.Ctl.Commands.ListAmqp10ConnectionsCommand
-- rabbit_amqp1_0
-- rabbit_amqp1_0_reader
-- rabbit_amqp1_0_session
-- rabbit_amqp1_0_session_sup
-- rabbit_amqp1_0_util
-- rabbit_amqp1_0_writer
 rabbitmq_auth_backend_cache:
 - rabbit_auth_backend_cache
 - rabbit_auth_backend_cache_app

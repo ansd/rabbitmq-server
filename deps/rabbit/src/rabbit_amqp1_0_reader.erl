@@ -486,7 +486,7 @@ handle_1_0_sasl_frame(#'v1_0.sasl_init'{mechanism = {symbol, <<"ANONYMOUS">>},
                                         hostname = _Hostname},
                       State = #v1{connection_state = starting,
                                   sock             = Sock}) ->
-    case application:get_env(rabbitmq_amqp1_0, default_user) of
+    case application:get_env(rabbit, amqp1_0_default_user) of
         {ok, none} ->
             %% No need to do anything, we will blow up in start_connection
             ok;
@@ -567,7 +567,7 @@ init(Mode, PackedState) ->
 start_1_0_connection(sasl, State = #v1{sock = Sock}) ->
     send_1_0_handshake(Sock, <<"AMQP",3,1,0,0>>),
     Ms = {array, symbol,
-          case application:get_env(rabbitmq_amqp1_0, default_user)  of
+          case application:get_env(rabbit, amqp1_0_default_user)  of
               {ok, none} -> [];
               {ok, _}    -> [{symbol, <<"ANONYMOUS">>}]
           end ++
@@ -579,14 +579,13 @@ start_1_0_connection(sasl, State = #v1{sock = Sock}) ->
 start_1_0_connection(amqp,
                      State = #v1{sock       = Sock,
                                  connection = C = #v1_connection{user = User}}) ->
-    {ok, NoAuthUsername} = application:get_env(rabbitmq_amqp1_0, default_user),
+    {ok, NoAuthUsername} = application:get_env(rabbit, amqp1_0_default_user),
     case {User, NoAuthUsername} of
         {none, none} ->
             send_1_0_handshake(Sock, <<"AMQP",3,1,0,0>>),
             throw(banned_unauthenticated_connection);
         {none, Username} ->
-            case rabbit_access_control:check_user_login(
-                   list_to_binary(Username), []) of
+            case rabbit_access_control:check_user_login(Username, []) of
                 {ok, NoAuthUser} ->
                     State1 = State#v1{
                                connection = C#v1_connection{user = NoAuthUser}},
@@ -594,7 +593,7 @@ start_1_0_connection(amqp,
                     start_1_0_connection0(amqp, State1);
                 _ ->
                     send_1_0_handshake(Sock, <<"AMQP",3,1,0,0>>),
-                    throw(default_user_missing)
+                    throw(amqp1_0_default_user_missing)
             end;
         _ ->
             send_1_0_handshake(Sock, <<"AMQP",0,1,0,0>>),
@@ -776,7 +775,7 @@ send_to_new_1_0_session(
 vhost({utf8, <<"vhost:", VHost/binary>>}) ->
     VHost;
 vhost(_) ->
-    application:get_env(rabbitmq_amqp1_0, default_vhost,
+    application:get_env(rabbit, amqp1_0_default_vhost,
                         application:get_env(rabbit, default_vhost, <<"/">>)).
 
 %% End 1-0

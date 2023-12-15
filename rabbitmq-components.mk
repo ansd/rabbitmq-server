@@ -42,7 +42,6 @@ dep_amqp10_client                     = git_rmq-subfolder rabbitmq-amqp1.0-clien
 dep_amqp10_common                     = git_rmq-subfolder rabbitmq-amqp1.0-common $(current_rmq_ref) $(base_rmq_ref) main
 dep_rabbit                            = git_rmq-subfolder rabbitmq-server $(current_rmq_ref) $(base_rmq_ref) main
 dep_rabbit_common                     = git_rmq-subfolder rabbitmq-common $(current_rmq_ref) $(base_rmq_ref) main
-dep_rabbitmq_amqp1_0                  = git_rmq-subfolder rabbitmq-amqp1.0 $(current_rmq_ref) $(base_rmq_ref) main
 dep_rabbitmq_auth_backend_amqp        = git_rmq           rabbitmq-auth-backend-amqp $(current_rmq_ref) $(base_rmq_ref) main
 dep_rabbitmq_auth_backend_cache       = git_rmq-subfolder rabbitmq-auth-backend-cache $(current_rmq_ref) $(base_rmq_ref) main
 dep_rabbitmq_auth_backend_http        = git_rmq-subfolder rabbitmq-auth-backend-http $(current_rmq_ref) $(base_rmq_ref) main
@@ -132,7 +131,6 @@ RABBITMQ_COMPONENTS = amqp_client \
 		      amqp10_client \
 		      rabbit \
 		      rabbit_common \
-		      rabbitmq_amqp1_0 \
 		      rabbitmq_auth_backend_amqp \
 		      rabbitmq_auth_backend_cache \
 		      rabbitmq_auth_backend_http \

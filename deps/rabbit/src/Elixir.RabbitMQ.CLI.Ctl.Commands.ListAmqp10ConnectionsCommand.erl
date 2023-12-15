@@ -54,7 +54,7 @@ usage_additional() ->
 description() -> <<"Lists AMQP 1.0 connections on the target node">>.
 
 help_section() ->
-    {plugin, 'amqp1.0'}.
+    {plugin, 'observability_and_health_checks'}.
 
 run(Args, #{node := NodeName,
             timeout := Timeout,

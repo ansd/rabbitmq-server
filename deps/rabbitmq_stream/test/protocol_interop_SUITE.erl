@@ -40,13 +40,11 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     rabbit_ct_helpers:run_teardown_steps(Config).
 
-init_per_group(_Group, Config0) ->
-    Config = rabbit_ct_helpers:run_steps(
-               Config0,
-               rabbit_ct_broker_helpers:setup_steps() ++
-               rabbit_ct_client_helpers:setup_steps()),
-    ok = rabbit_ct_broker_helpers:enable_plugin(Config, 0, rabbitmq_amqp1_0),
-    Config.
+init_per_group(_Group, Config) ->
+    rabbit_ct_helpers:run_steps(
+      Config,
+      rabbit_ct_broker_helpers:setup_steps() ++
+      rabbit_ct_client_helpers:setup_steps()).
 
 end_per_group(_Group, Config) ->
     rabbit_ct_helpers:run_steps(

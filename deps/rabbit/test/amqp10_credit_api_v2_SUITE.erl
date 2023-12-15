@@ -4,7 +4,7 @@
 %%
 %% Copyright (c) 2016-2023 VMware, Inc. or its affiliates.  All rights reserved.
 
--module(ff_SUITE).
+-module(amqp10_credit_api_v2_SUITE).
 
 -compile([export_all, nowarn_export_all]).
 

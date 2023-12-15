@@ -5,7 +5,7 @@
 %% Copyright (c) 2017-2023 VMware, Inc. or its affiliates.  All rights reserved.
 %%
 
--module(proxy_protocol_SUITE).
+-module(amqp10_proxy_protocol_SUITE).
 
 -compile([export_all, nowarn_export_all]).
 

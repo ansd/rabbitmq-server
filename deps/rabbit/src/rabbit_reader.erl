@@ -1044,44 +1044,24 @@ handle_input({frame_payload, Type, Channel, PayloadSize}, Data, State) ->
                                         Type, Channel, Payload, State)
     end;
 handle_input(handshake, <<"AMQP", A, B, C, D, Rest/binary>>, State) ->
-    {Rest, handshake({A, B, C, D}, State)};
+    {Rest, version_negotiation({A, B, C, D}, State)};
 handle_input(handshake, <<Other:8/binary, _/binary>>, #v1{sock = Sock}) ->
     refuse_connection(Sock, {bad_header, Other});
 handle_input(Callback, Data, _State) ->
     throw({bad_input, Callback, Data}).
 
-%% The two rules pertaining to version negotiation:
-%%
-%% * If the server cannot support the protocol specified in the
-%% protocol header, it MUST respond with a valid protocol header and
-%% then close the socket connection.
-%%
-%% * The server MUST provide a protocol version that is lower than or
-%% equal to that requested by the client in the protocol header.
-handshake({0, 0, 9, 1}, State) ->
-    start_connection({0, 9, 1}, rabbit_framing_amqp_0_9_1, State);
-
-%% This is the protocol header for 0-9, which we can safely treat as
-%% though it were 0-9-1.
-handshake({1, 1, 0, 9}, State) ->
-    start_connection({0, 9, 0}, rabbit_framing_amqp_0_9_1, State);
-
-%% This is what most clients send for 0-8.  The 0-8 spec, confusingly,
-%% defines the version as 8-0.
-handshake({1, 1, 8, 0}, State) ->
-    start_connection({8, 0, 0}, rabbit_framing_amqp_0_8, State);
-
-%% The 0-8 spec as on the AMQP web site actually has this as the
-%% protocol header; some libraries e.g., py-amqplib, send it when they
-%% want 0-8.
-handshake({1, 1, 9, 1}, State) ->
-    start_connection({8, 0, 0}, rabbit_framing_amqp_0_8, State);
-
-%% ... and finally, the 1.0 spec is crystal clear!
-handshake({Id, 1, 0, 0}, State) ->
+%% AMQP 1.0 §2.2
+version_negotiation({Id, 1, 0, 0}, State) ->
     become_1_0(Id, State);
-
-handshake(Vsn, #v1{sock = Sock}) ->
+version_negotiation({0, 0, 9, 1}, State) ->
+    start_connection({0, 9, 1}, rabbit_framing_amqp_0_9_1, State);
+version_negotiation({1, 1, 0, 9}, State) ->
+    %% This is the protocol header for 0-9, which we can safely treat as though it were 0-9-1.
+    start_connection({0, 9, 0}, rabbit_framing_amqp_0_9_1, State);
+version_negotiation(Vsn = {0, 0, Minor, _}, #v1{sock = Sock})
+  when Minor >= 9 ->
+    refuse_connection(Sock, {bad_version, Vsn}, {0, 0, 9, 1});
+version_negotiation(Vsn, #v1{sock = Sock}) ->
     refuse_connection(Sock, {bad_version, Vsn}).
 
 %% Offer a protocol version to the client.  Connection.start only
@@ -1104,15 +1084,15 @@ start_connection({ProtocolMajor, ProtocolMinor, _ProtocolRevision},
                              connection_state = starting},
                     frame_header, 7).
 
+-spec refuse_connection(rabbit_net:socket(), any()) -> no_return().
+refuse_connection(Sock, Exception) ->
+    refuse_connection(Sock, Exception, {0, 1, 0, 0}).
+
 -spec refuse_connection(_, _, _) -> no_return().
 refuse_connection(Sock, Exception, {A, B, C, D}) ->
     ok = inet_op(fun () -> rabbit_net:send(Sock, <<"AMQP",A,B,C,D>>) end),
     throw(Exception).
 
--spec refuse_connection(rabbit_net:socket(), any()) -> no_return().
-
-refuse_connection(Sock, Exception) ->
-    refuse_connection(Sock, Exception, {0, 0, 9, 1}).
 
 ensure_stats_timer(State = #v1{connection_state = running}) ->
     rabbit_event:ensure_stats_timer(State, #v1.stats_timer, emit_stats);
@@ -1608,23 +1588,19 @@ emit_stats(State) ->
 
 %% 1.0 stub
 -spec become_1_0(non_neg_integer(), #v1{}) -> no_return().
-
 become_1_0(Id, State = #v1{sock = Sock}) ->
-    case code:is_loaded(rabbit_amqp1_0_reader) of
-        false -> refuse_connection(Sock, amqp1_0_plugin_not_enabled);
-        _     -> Mode = case Id of
-                            0 -> amqp;
-                            3 -> sasl;
-                            _ -> refuse_connection(
-                                   Sock, {unsupported_amqp1_0_protocol_id, Id},
-                                   {3, 1, 0, 0})
-                        end,
-                 F = fun (_Deb, Buf, BufLen, S) ->
-                             {rabbit_amqp1_0_reader, init,
-                              [Mode, pack_for_1_0(Buf, BufLen, S)]}
-                     end,
-                 State#v1{connection_state = {become, F}}
-    end.
+    Mode = case Id of
+               0 -> amqp;
+               3 -> sasl;
+               _ -> refuse_connection(
+                      Sock, {unsupported_amqp1_0_protocol_id, Id},
+                      {3, 1, 0, 0})
+           end,
+    F = fun (_Deb, Buf, BufLen, S) ->
+                {rabbit_amqp1_0_reader, init,
+                 [Mode, pack_for_1_0(Buf, BufLen, S)]}
+        end,
+    State#v1{connection_state = {become, F}}.
 
 pack_for_1_0(Buf, BufLen, #v1{parent       = Parent,
                               sock         = Sock,

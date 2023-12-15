@@ -2568,6 +2568,35 @@ end}.
 }.
 
 % ===============================
+% AMQP 1.0
+% ===============================
+
+%% Connections that are not authenticated with SASL will connect as this
+%% account.
+%%
+%% Please note that setting this will allow clients to connect without
+%% authenticating!
+{mapping, "amqp1_0.default_user", "rabbit.amqp1_0_default_user",
+    [{datatype, [{enum, [none]}, string]}]}.
+
+{mapping, "amqp1_0.default_vhost", "rabbit.amqp1_0_default_vhost",
+    [{datatype, string}]}.
+
+{translation, "rabbit.amqp1_0_default_user",
+fun(Conf) ->
+        case cuttlefish:conf_get("amqp1_0.default_user", Conf) of
+            none -> none;
+            User -> list_to_binary(User)
+        end
+end}.
+
+{translation , "rabbit.amqp1_0_default_vhost",
+fun(Conf) ->
+    list_to_binary(cuttlefish:conf_get("amqp1_0.default_vhost", Conf))
+end}.
+
+
+% ===============================
 % Validators
 % ===============================
 

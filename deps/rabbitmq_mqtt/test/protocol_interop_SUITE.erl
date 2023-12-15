@@ -60,8 +60,7 @@ init_per_group(_Group, Config0) ->
                rabbit_ct_client_helpers:setup_steps()),
     ok = rabbit_ct_broker_helpers:enable_feature_flag(Config, mqtt_v5),
 
-    Plugins = [rabbitmq_amqp1_0,
-               rabbitmq_stomp,
+    Plugins = [rabbitmq_stomp,
                rabbitmq_stream],
     [ok = rabbit_ct_broker_helpers:enable_plugin(Config, 0, Plugin) || Plugin <- Plugins],
     Config.

@@ -5,7 +5,7 @@
 %% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
--module(system_SUITE).
+-module(amqp10_system_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
@@ -170,10 +170,11 @@ message_annotations(_Config) ->
     %     {dotnet, "message_annotations"}
     %   ]).
 
-footer(Config) ->
-    run(Config, [
-        {dotnet, "footer"}
-      ]).
+footer(_Config) ->
+    {skip, "TODO fix https://github.com/Azure/amqpnetlite/issues/575"}.
+    % run(Config, [
+    %     {dotnet, "footer"}
+    %   ]).
 
 data_types(_Config) ->
     {skip, "TODO fix https://github.com/Azure/amqpnetlite/issues/575"}.

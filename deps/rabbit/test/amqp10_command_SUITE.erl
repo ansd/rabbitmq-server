@@ -5,8 +5,9 @@
 %% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 
 
--module(command_SUITE).
--compile([export_all]).
+-module(amqp10_command_SUITE).
+-compile([export_all,
+          nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
