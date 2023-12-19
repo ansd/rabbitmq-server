@@ -141,9 +141,9 @@ init_per_group(Group, Config) ->
             Plugin = rabbitmq_amqp1_0,
             try rabbit_ct_broker_helpers:enable_plugin(Config2, 1, Plugin) of
                 Res ->
-                    ct:pal("Enabled plugin ~s on node 1: ~p", [Plugin, Res])
+                    ct:pal("aaa Enabled plugin ~s on node 1: ~p", [Plugin, Res])
             catch error:_ ->
-                      ct:pal("Could not enable plugin ~s on node 1", [Plugin])
+                      ct:pal("aaa Could not enable plugin ~s on node 1", [Plugin])
             end
     end,
     Config2.

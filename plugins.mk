@@ -5,7 +5,9 @@
 # release. So if you want to add or remove a plugin to the distribution,
 # you need to update the server-release pipeline!
 
-PLUGINS := rabbitmq_auth_backend_cache \
+PLUGINS := rabbitmq_amqp1_0 \
+	   rabbitmq_auth_backend_cache \
+	   rabbitmq_auth_backend_http \
 	   rabbitmq_auth_backend_http \
 	   rabbitmq_auth_backend_ldap \
 	   rabbitmq_auth_backend_oauth2 \

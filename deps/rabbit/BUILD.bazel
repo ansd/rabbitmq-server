@@ -1250,6 +1250,7 @@ rabbitmq_integration_suite(
     shard_count = 3,
     runtime_deps = [
         "//deps/amqp10_client:erlang_app",
+        "//deps/rabbitmq_amqp1_0:erlang_app",
     ],
 )
 
@@ -1401,3 +1402,9 @@ eunit(
         "COVERDATA_TO_LCOV_APPS_DIRS": "deps:deps/rabbit/apps",
     },
 )
+
+# broker_for_integration_suites(
+#     extra_plugins = [
+#         "//deps/rabbitmq_amqp1_0:erlang_app",
+#     ],
+# )
