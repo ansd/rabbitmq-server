@@ -19,6 +19,7 @@ suite() ->
 
 all() ->
     [
+     {group, my_group},
      {group, mnesia_store},
      {group, khepri_store},
      {group, khepri_migration}
@@ -26,6 +27,7 @@ all() ->
 
 groups() ->
     [
+     {my_group, [], [my_case]},
      {mnesia_store, [], all_tests()},
      {khepri_store, [], all_tests()},
      {khepri_migration, [], [
@@ -35,6 +37,7 @@ groups() ->
 
 all_tests() ->
     [
+     my_case,
      direct_exchange,
      headers_exchange,
      topic_exchange,
@@ -53,6 +56,9 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     rabbit_ct_helpers:run_teardown_steps(Config).
 
+init_per_group(my_group = Group, Config0) ->
+    Config = rabbit_ct_helpers:set_config(Config0, [{metadata_store, mnesia}]),
+    init_per_group_common(Group, Config, 3);
 init_per_group(mnesia_store = Group, Config0) ->
     Config = rabbit_ct_helpers:set_config(Config0, [{metadata_store, mnesia}]),
     init_per_group_common(Group, Config, 1);
@@ -98,6 +104,32 @@ end_per_testcase(Testcase, Config) ->
 %% -------------------------------------------------------------------
 %% Testcases.
 %% -------------------------------------------------------------------
+my_case(Config) ->
+    Plugin = rabbitmq_amqp1_0,
+
+    try rabbit_ct_broker_helpers:enable_plugin(Config, 0, Plugin) of
+        Res0 ->
+            ct:pal("aaa Enabled plugin ~s on node 0: ~p", [Plugin, Res0])
+    catch error:_ ->
+              ct:pal("aaa Could not enable plugin ~s on node 0", [Plugin])
+    end,
+
+    try rabbit_ct_broker_helpers:enable_plugin(Config, 1, Plugin) of
+        Res1 ->
+            ct:pal("aaa Enabled plugin ~s on node 1: ~p", [Plugin, Res1])
+    catch error:_ ->
+              ct:pal("aaa Could not enable plugin ~s on node 1", [Plugin])
+    end,
+
+    try rabbit_ct_broker_helpers:enable_plugin(Config, 2, Plugin) of
+        Res2 ->
+            ct:pal("aaa Enabled plugin ~s on node 2: ~p", [Plugin, Res2])
+    catch error:_ ->
+              ct:pal("aaa Could not enable plugin ~s on node 2", [Plugin])
+    end,
+
+    ok.
+
 direct_exchange(Config) ->
     Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
 
