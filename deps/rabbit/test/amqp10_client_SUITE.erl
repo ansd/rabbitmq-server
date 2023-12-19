@@ -130,10 +130,23 @@ init_per_group(Group, Config) ->
     Config1 = rabbit_ct_helpers:set_config(
                 Config, [{rmq_nodes_count, Nodes},
                          {rmq_nodename_suffix, Suffix}]),
-    rabbit_ct_helpers:run_setup_steps(
-      Config1,
-      rabbit_ct_broker_helpers:setup_steps() ++
-      rabbit_ct_client_helpers:setup_steps()).
+    Config2 = rabbit_ct_helpers:run_setup_steps(
+                Config1,
+                rabbit_ct_broker_helpers:setup_steps() ++
+                rabbit_ct_client_helpers:setup_steps()),
+    case Nodes of
+        1 ->
+            ok;
+        3 ->
+            Plugin = rabbitmq_amqp1_0,
+            try rabbit_ct_broker_helpers:enable_plugin(Config2, 1, Plugin) of
+                Res ->
+                    ct:pal("Enabled plugin ~s on node 1: ~p", [Plugin, Res])
+            catch error:_ ->
+                      ct:pal("Could not enable plugin ~s on node 1", [Plugin])
+            end
+    end,
+    Config2.
 
 end_per_group(_, Config) ->
     rabbit_ct_helpers:run_teardown_steps(Config,
@@ -2365,7 +2378,7 @@ queue_and_client_different_nodes(QueueLeaderNode, ClientNode, QueueType, Config)
                                Ch, #'queue.declare'{queue = QName,
                                                     durable = true,
                                                     arguments = [{<<"x-queue-type">>, longstr, QueueType}]}),
-    %% Connect AMQP client to the new node causing queue client to run the new code.
+    %% Connect AMQP client to the new (or old) node causing queue client to run the new (or old) code.
     OpnConf = connection_config(ClientNode, Config),
     {ok, Connection} = amqp10_client:open_connection(OpnConf),
     {ok, Session} = amqp10_client:begin_session_sync(Connection),

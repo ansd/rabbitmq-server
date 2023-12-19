@@ -932,6 +932,8 @@ rabbit_common:
 - worker_pool
 - worker_pool_sup
 - worker_pool_worker
+rabbitmq_amqp1_0:
+- rabbitmq_amqp1_0_noop
 rabbitmq_auth_backend_cache:
 - rabbit_auth_backend_cache
 - rabbit_auth_backend_cache_app

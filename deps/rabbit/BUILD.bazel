@@ -7,6 +7,7 @@ load(
     "//:rabbitmq.bzl",
     "RABBITMQ_DIALYZER_OPTS",
     "assert_suites",
+    "broker_for_integration_suites",
     "rabbitmq_app",
     "rabbitmq_integration_suite",
     "rabbitmq_suite",
@@ -282,6 +283,7 @@ rabbitmq_home(
     plugins = [
         ":test_erlang_app",
         "//deps/rabbitmq_ct_client_helpers:erlang_app",
+        "//deps/rabbitmq_amqp1_0:erlang_app",
         "@inet_tcp_proxy_dist//:erlang_app",
         "@meck//:erlang_app",
     ],
