@@ -194,7 +194,8 @@ convert_to(TargetProto, Msg, Env) ->
 serialize(Sections) ->
     encode_bin(Sections).
 
-protocol_state(Msg0 = #msg{header = Header0}, Anns) ->
+protocol_state(Msg0 = #msg{header = Header0,
+                           properties = Props0}, Anns) ->
     Redelivered = maps:get(redelivered, Anns, false),
     FirstAcquirer = not Redelivered,
     Header = case Header0 of
@@ -203,12 +204,29 @@ protocol_state(Msg0 = #msg{header = Header0}, Anns) ->
                  #'v1_0.header'{} ->
                      Header0#'v1_0.header'{first_acquirer = FirstAcquirer}
              end,
-    Msg = Msg0#msg{header = Header},
+    Props = case Anns of
+                #{?ANN_TIMESTAMP := Ts} ->
+                    Timestamp = {timestamp, Ts},
+                    case Props0 of
+                        undefined ->
+                            #'v1_0.properties'{creation_time = Timestamp};
+                        #'v1_0.properties'{} ->
+                            Props0#'v1_0.properties'{creation_time = Timestamp}
+                    end;
+                _ ->
+                    Props0
+            end,
+    Msg = Msg0#msg{header = Header,
+                   properties = Props},
 
     #{?ANN_EXCHANGE := Exchange,
       ?ANN_ROUTING_KEYS := [RKey | _]} = Anns,
     %% any x-* annotations get added as message annotations
-    AnnsToAdd = maps:filter(fun (Key, _) -> mc_util:is_x_header(Key) end, Anns),
+    AnnsToAdd = maps:filter(fun(<<"timestamp_in_ms">>, _) ->
+                                    true;
+                               (Key, _) ->
+                                    mc_util:is_x_header(Key)
+                            end, Anns),
 
     MACFun = fun(MAC) ->
                      add_message_annotations(

@@ -157,6 +157,8 @@ convert_from(mc_amqp, Sections, _Env) ->
                                            true ->
                                                false
                                        end;
+                                  ({{symbol, <<"timestamp_in_ms">> = K}, V}) ->
+                                       {true, to_091(K, V)};
                                   (_) ->
                                        false
                                end, MA),
