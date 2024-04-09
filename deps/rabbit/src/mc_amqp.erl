@@ -194,8 +194,7 @@ convert_to(TargetProto, Msg, Env) ->
 serialize(Sections) ->
     encode_bin(Sections).
 
-protocol_state(Msg0 = #msg{header = Header0,
-                           properties = Props0}, Anns) ->
+protocol_state(Msg0 = #msg{header = Header0}, Anns) ->
     Redelivered = maps:get(redelivered, Anns, false),
     FirstAcquirer = not Redelivered,
     Header = case Header0 of
@@ -204,36 +203,22 @@ protocol_state(Msg0 = #msg{header = Header0,
                  #'v1_0.header'{} ->
                      Header0#'v1_0.header'{first_acquirer = FirstAcquirer}
              end,
-    Props = case Anns of
-                #{?ANN_TIMESTAMP := Ts} ->
-                    Timestamp = {timestamp, Ts},
-                    case Props0 of
-                        undefined ->
-                            #'v1_0.properties'{creation_time = Timestamp};
-                        #'v1_0.properties'{} ->
-                            Props0#'v1_0.properties'{creation_time = Timestamp}
-                    end;
-                _ ->
-                    Props0
-            end,
-    Msg = Msg0#msg{header = Header,
-                   properties = Props},
-
-    #{?ANN_EXCHANGE := Exchange,
-      ?ANN_ROUTING_KEYS := [RKey | _]} = Anns,
-    %% any x-* annotations get added as message annotations
-    AnnsToAdd = maps:filter(fun(<<"timestamp_in_ms">>, _) ->
-                                    true;
-                               (Key, _) ->
-                                    mc_util:is_x_header(Key)
-                            end, Anns),
+    Msg = Msg0#msg{header = Header},
 
     MACFun = fun(MAC) ->
-                     add_message_annotations(
-                       AnnsToAdd#{<<"x-exchange">> => wrap(utf8, Exchange),
-                                  <<"x-routing-key">> => wrap(utf8, RKey)}, MAC)
+                     maps:fold(fun(?ANN_EXCHANGE, Exchange, L) ->
+                                       map_upsert(<<"x-exchange">>, wrap(utf8, Exchange), L);
+                                  (?ANN_ROUTING_KEYS, [RKey | _], L) ->
+                                       map_upsert(<<"x-routing-key">>, wrap(utf8, RKey), L);
+                                  (<<"x-", _binary>> = K, V, L) ->
+                                       %% any x-* annotations get added as message annotations
+                                       map_upsert(K, V, L);
+                                  (<<"timestamp_in_ms">>, V, L) ->
+                                       map_upsert(<<"x-opt-rabbitmq-received-time">>, V, L);
+                                  (_, _, Acc) ->
+                                       Acc
+                               end, MAC, Anns)
              end,
-
     msg_to_sections(Msg, MACFun).
 
 prepare(_For, Msg) ->
@@ -285,9 +270,11 @@ msg_to_sections(#msg{header = H,
             [H | S4]
     end.
 
-
-
-
+map_upsert(Key, Val, KVList) ->
+    TaggedKey = wrap(symbol, Key),
+    TaggedVal = mc_util:infer_type(Val),
+    Elem = {TaggedKey, TaggedVal},
+    lists:keystore(TaggedKey, 1, KVList, Elem).
 
 encode_bin(undefined) ->
     <<>>;
@@ -395,17 +382,6 @@ decode([#'v1_0.amqp_value'{} = B | Rem], #msg{} = Msg) ->
     %% an amqp value can only be a singleton
     decode(Rem, Msg#msg{data = B}).
 
-add_message_annotations(Anns, MA0) ->
-    maps:fold(fun (K, V, Acc) ->
-                      map_add(symbol, K, mc_util:infer_type(V), Acc)
-              end, MA0, Anns).
-
-map_add(_T, _Key, undefined, Acc) ->
-    Acc;
-map_add(KeyType, Key, TaggedValue, Acc0) ->
-    TaggedKey = wrap(KeyType, Key),
-    lists_upsert({TaggedKey, TaggedValue}, Acc0).
-
 wrap(_Type, undefined) ->
     undefined;
 wrap(Type, Val) ->
@@ -496,13 +472,3 @@ essential_properties(#msg{message_annotations = MA} = Msg) ->
                       Acc
               end, Anns, MA)
     end.
-
-lists_upsert(New, L) ->
-    lists_upsert(New, L, [], L).
-
-lists_upsert({Key, _} = New, [{Key, _} | Rem], Pref, _All) ->
-    lists:reverse(Pref, [New | Rem]);
-lists_upsert(New, [Item | Rem], Pref, All) ->
-    lists_upsert(New, Rem, [Item | Pref], All);
-lists_upsert(New, [], _Pref, All) ->
-    [New | All].
