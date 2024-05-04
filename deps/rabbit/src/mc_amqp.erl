@@ -402,6 +402,11 @@ protocol_state_message_annotations(MA, Anns) ->
               maps_upsert(K, mc_util:infer_type(V), L);
          (<<"timestamp_in_ms">>, V, L) ->
               maps_upsert(<<"x-opt-rabbitmq-received-time">>, {timestamp, V}, L);
+         (deaths_v2, Deaths, L) ->
+              Descriptor = {symbol, <<"rabbitmq:death:list">>},
+              Constructor = {described, Descriptor, list},
+              Array = encode_deaths(Deaths, Descriptor),
+              maps_upsert(<<"x-opt-deaths">>, {array, Constructor, Array}, L);
          (_, _, Acc) ->
               Acc
       end, MA, Anns).
@@ -569,13 +574,6 @@ msg_body_encoded([{{pos, Pos}, {body, Code}}], BarePos, Msg)
 binary_part_bare_and_footer(Payload, Start) ->
     binary_part(Payload, Start, byte_size(Payload) - Start).
 
-key_find(K, [{{_, K}, {_, V}} | _]) ->
-    V;
-key_find(K, [_ | Rem]) ->
-    key_find(K, Rem);
-key_find(_K, []) ->
-    undefined.
-
 -spec first_acquirer(mc:annotations()) -> boolean().
 first_acquirer(Anns) ->
     Redelivered = case Anns of
@@ -584,48 +582,45 @@ first_acquirer(Anns) ->
                   end,
     not Redelivered.
 
-recover_deaths([], Acc) ->
-    Acc;
-recover_deaths([{map, Kvs} | Rem], Acc) ->
-    Queue = key_find(<<"queue">>, Kvs),
-    Reason = binary_to_existing_atom(key_find(<<"reason">>, Kvs)),
-    DA0 = case key_find(<<"original-expiration">>, Kvs) of
-              undefined ->
-                  #{};
-              Exp ->
-                  #{ttl => binary_to_integer(Exp)}
-          end,
-    RKeys = [RK || {_, RK} <- key_find(<<"routing-keys">>, Kvs)],
-    Ts = key_find(<<"time">>, Kvs),
-    DA = DA0#{first_time => Ts,
-              last_time => Ts},
-    recover_deaths(Rem,
-                   Acc#{{Queue, Reason} =>
-                        #death{anns = DA,
-                               exchange = key_find(<<"exchange">>, Kvs),
-                               count = key_find(<<"count">>, Kvs),
-                               routing_keys = RKeys}}).
+% <type name=“death” class="composite" source="list">
+%     <descriptor name=“rabbitmq:death:list"/>
+%     <field name=“queue” type=“string” mandatory=“true” label=“the name of the queue the message was dead lettered from”/>
+%     <field name=“reason” type=“symbol” mandatory=“true” label=“the reason why this message was dead lettered”/>
+%     <field name="count" type="ulong” default=“1” label=“how many times this message was dead lettered from this queue for this reason”/>
+%     <field name=“time" mandatory=“true” type="timestamp" label=“the first time when this message was dead lettered from this queue for this reason”/>
+% 	  <field name=“exchange” type=“string” default=“” label=“the exchange this message was published to before it was dead lettered for the first time from this queue for this reason”/>
+%     <field name=“routing-keys” type=“string” mandatory=“true” multiple=“true” label=“the routing keys this message was published with before it was dead lettered for the first time from this queue for this reason”/>
+%     <field name=“ttl” type=“milliseconds” label=“the time to live of this message before it was dead lettered for the first time from this queue for reason ‘expired’”/>
+% </type>
+encode_deaths(Deaths, Descriptor) ->
+    lists:map(fun(#death_v2{source_queue = Queue,
+                            reason = Reason,
+                            count = Count,
+                            first_death_timestamp = Timestamp,
+                            original_exchange = Exchange,
+                            original_routing_keys = RoutingKeys,
+                            original_ttl = Ttl}) ->
+                      RKeys = [{utf8, Rk} || Rk <- RoutingKeys],
+                      TaggedTtl = if Ttl =:= undefined -> null;
+                                     is_integer(Ttl) -> {uint, Ttl}
+                                  end,
+                      Fields = [
+                                {utf8, Queue},
+                                {symbol, atom_to_binary(Reason)},
+                                {ulong, Count},
+                                {timestamp, Timestamp},
+                                {utf8, Exchange},
+                                {array, utf8, RKeys},
+                                TaggedTtl
+                               ],
+                      {described, Descriptor, {list, Fields}}
+              end, Deaths).
 
 essential_properties(#msg_body_encoded{message_annotations = MA} = Msg) ->
     Durable = get_property(durable, Msg),
     Priority = get_property(priority, Msg),
     Timestamp = get_property(timestamp, Msg),
     Ttl = get_property(ttl, Msg),
-
-    Deaths = case message_annotation(<<"x-death">>, Msg, undefined) of
-                 {list, DeathMaps}  ->
-                     %% TODO: make more correct?
-                     Def = {utf8, <<>>},
-                     {utf8, FstQ} = message_annotation(<<"x-first-death-queue">>, Msg, Def),
-                     {utf8, FstR} = message_annotation(<<"x-first-death-reason">>, Msg, Def),
-                     {utf8, LastQ} = message_annotation(<<"x-last-death-queue">>, Msg, Def),
-                     {utf8, LastR} = message_annotation(<<"x-last-death-reason">>, Msg, Def),
-                     #deaths{first = {FstQ, binary_to_existing_atom(FstR)},
-                             last = {LastQ, binary_to_existing_atom(LastR)},
-                             records = recover_deaths(DeathMaps, #{})};
-                 _ ->
-                     undefined
-             end,
     Anns0 = #{?ANN_DURABLE => Durable},
     Anns = maps_put_truthy(
              ?ANN_PRIORITY, Priority,
@@ -633,9 +628,7 @@ essential_properties(#msg_body_encoded{message_annotations = MA} = Msg) ->
                ?ANN_TIMESTAMP, Timestamp,
                maps_put_truthy(
                  ttl, Ttl,
-                 maps_put_truthy(
-                   deaths, Deaths,
-                   Anns0)))),
+                 Anns0))),
     case MA of
         [] ->
             Anns;

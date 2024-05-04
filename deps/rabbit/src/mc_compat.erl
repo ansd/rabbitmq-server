@@ -29,7 +29,6 @@
          record_death/3,
          is_death_cycle/2,
          %deaths/1,
-         last_death/1,
          death_queue_names/1
          ]).
 
@@ -359,26 +358,6 @@ death_queue_names(#basic_message{content = Content}) ->
              end || {table, D} <- Deaths];
         _ ->
             []
-    end.
-
-last_death(#basic_message{content = Content}) ->
-    #content{properties = #'P_basic'{headers = Headers}} =
-        rabbit_binary_parser:ensure_content_decoded(Content),
-    %% TODO: review this conversion and/or change the API
-    case rabbit_misc:table_lookup(Headers, <<"x-death">>) of
-        {array, [{table, Info} | _]} ->
-            X = x_death_event_key(Info, <<"exchange">>),
-            Q = x_death_event_key(Info, <<"queue">>),
-            T = x_death_event_key(Info, <<"time">>, 0),
-            Keys = x_death_event_key(Info, <<"routing_keys">>),
-            Count = x_death_event_key(Info, <<"count">>),
-            {Q, #death{exchange = X,
-                       anns = #{first_time => T * 1000,
-                                last_time => T * 1000},
-                       routing_keys = Keys,
-                       count = Count}};
-        _ ->
-            undefined
     end.
 
 get_property(P, #content{properties = none} = Content) ->

@@ -3497,6 +3497,7 @@ dead_letter_headers_exchange(Config) ->
            #{<<"x-my key">> => 6},
            amqp10_msg:new(<<"tag 4">>, <<"m4">>, false)),
 
+    Now = os:system_time(millisecond),
     [ok = amqp10_client:send_msg(Sender, M) || M <- [M1, M2, M3, M4]],
     ok = wait_for_accepts(4),
     flush(accepted),
@@ -3507,9 +3508,39 @@ dead_letter_headers_exchange(Config) ->
     ?assertEqual(<<"m2">>, amqp10_msg:body_bin(Msg2)),
     ?assertEqual(#{message_id => <<"my ID">>}, amqp10_msg:properties(Msg1)),
     ?assertEqual(0, maps:size(amqp10_msg:properties(Msg2))),
+    case rpc(Config, rabbit_feature_flags, is_enabled, [message_containers_deaths_v2]) of
+        true ->
+            Descriptor = {symbol, <<"rabbitmq:death:list">>},
+            Constructor = {described, Descriptor, list},
+            ?assertMatch(
+               #{<<"x-first-death-queue">> := QName1,
+                 <<"x-first-death-exchange">> := <<>>,
+                 <<"x-first-death-reason">> := <<"expired">>,
+                 <<"x-last-death-queue">> := QName1,
+                 <<"x-last-death-exchange">> := <<>>,
+                 <<"x-last-death-reason">> := <<"expired">>,
+                 <<"x-opt-deaths">> := {array,
+                                        Constructor,
+                                        [{described, Descriptor,
+                                          {list, [
+                                                  {utf8, QName1},
+                                                  {symbol, <<"expired">>},
+                                                  {ulong, 1},
+                                                  {timestamp, Timestamp},
+                                                  {utf8, _Exchange = <<>>},
+                                                  {array, utf8, _RoutingKeys = [{utf8, QName1}]},
+                                                  _Ttl = null
+                                                 ]}}
+                                        ]}}
+                 when is_integer(Timestamp) andalso
+                      Timestamp > Now - 5000 andalso
+                      Timestamp < Now + 5000,
+                      amqp10_msg:message_annotations(Msg1));
+        false ->
+            ok
+    end,
 
     %% We expect M3 and M4 to get dropped.
-    %% Since the queue has no messages yet, we shouldn't receive any message.
     receive Unexp -> ct:fail({unexpected, Unexp})
     after 10 -> ok
     end,
