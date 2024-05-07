@@ -168,6 +168,7 @@ encode_described(map, CodeNumber,
     {described, {ulong, CodeNumber}, {map, Content}};
 encode_described(map, CodeNumber,
                  #'v1_0.message_annotations'{content = Content}) ->
+    rabbit_log:info("aaa ~s:~b Content=~p", [?MODULE, ?LINE, Content]),
     {described, {ulong, CodeNumber}, {map, Content}};
 encode_described(map, CodeNumber,
                  #'v1_0.footer'{content = Content}) ->

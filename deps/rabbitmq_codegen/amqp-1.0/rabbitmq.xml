@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+
+<amqp name="rabbitmq">
+    <section name="custom-types">
+        <type name="death" class="composite" source="list">
+            <descriptor name="rabbitmq:death:list" code="0x00000000:0x000000255"/>
+            <field name="queue" type="string" mandatory="true" label="the name of the queue the message was dead lettered from"/>
+            <field name="reason" type="symbol" mandatory="true" label="the reason why this message was dead lettered"/>
+            <field name="count" type="ulong" default="1" label="how many times this message was dead lettered from this queue for this reason"/>
+            <field name="time" mandatory="true" type="timestamp" label="the first time when this message was dead lettered from this queue for this reason"/>
+            <field name="exchange" type="string" default="" label="the exchange this message was published to before it was dead lettered for the first time from this queue for this reason"/>
+            <field name="routing-keys" type="string" default="" multiple="true" label="the routing keys this message was published with before it was dead lettered for the first time from this queue for this reason"/>
+            <field name="ttl" type="milliseconds" label="the time to live of this message before it was dead lettered for the first time from this queue for reason ‘expired’"/>
+        </type>
+    </section>
+</amqp>

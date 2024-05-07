@@ -3510,32 +3510,30 @@ dead_letter_headers_exchange(Config) ->
     ?assertEqual(0, maps:size(amqp10_msg:properties(Msg2))),
     case rpc(Config, rabbit_feature_flags, is_enabled, [message_containers_deaths_v2]) of
         true ->
-            Descriptor = {symbol, <<"rabbitmq:death:list">>},
-            Constructor = {described, Descriptor, list},
-            ?assertMatch(
-               #{<<"x-first-death-queue">> := QName1,
-                 <<"x-first-death-exchange">> := <<>>,
-                 <<"x-first-death-reason">> := <<"expired">>,
-                 <<"x-last-death-queue">> := QName1,
-                 <<"x-last-death-exchange">> := <<>>,
-                 <<"x-last-death-reason">> := <<"expired">>,
-                 <<"x-opt-deaths">> := {array,
-                                        Constructor,
-                                        [{described, Descriptor,
-                                          {list, [
-                                                  {utf8, QName1},
-                                                  {symbol, <<"expired">>},
-                                                  {ulong, 1},
-                                                  {timestamp, Timestamp},
-                                                  {utf8, _Exchange = <<>>},
-                                                  {array, utf8, _RoutingKeys = [{utf8, QName1}]},
-                                                  _Ttl = null
-                                                 ]}}
-                                        ]}}
-                 when is_integer(Timestamp) andalso
-                      Timestamp > Now - 5000 andalso
-                      Timestamp < Now + 5000,
-                      amqp10_msg:message_annotations(Msg1));
+            MessageAnnotations = amqp10_msg:message_annotations(Msg1),
+            ?assertMatch(#{<<"x-first-death-queue">> := QName1,
+                           <<"x-first-death-exchange">> := <<>>,
+                           <<"x-first-death-reason">> := <<"expired">>,
+                           <<"x-last-death-queue">> := QName1,
+                           <<"x-last-death-exchange">> := <<>>,
+                           <<"x-last-death-reason">> := <<"expired">>},
+                         MessageAnnotations),
+
+            {ok, Array} = maps:find(<<"x-opt-deaths">>, MessageAnnotations),
+            Constructor = {described, ?V_1_0_SYMBOL_DEATH, list},
+            {array, Constructor, [{described, ?V_1_0_SYMBOL_DEATH, Death}]} = Array,
+            ?assertMatch(#'v1_0.death'{
+                            queue = {utf8, QName1},
+                            reason = {symbol, <<"expired">>},
+                            count = {ulong, 1},
+                            time = {timestamp, Timestamp},
+                            exchange = {utf8, <<>>},
+                            routing_keys = {array, utf8, [{utf8, QName1}]},
+                            ttl = undefined}
+                           when is_integer(Timestamp) andalso
+                                Timestamp > Now - 5000 andalso
+                                Timestamp < Now + 5000,
+                                Death);
         false ->
             ok
     end,

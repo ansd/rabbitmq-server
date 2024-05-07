@@ -10,7 +10,8 @@ CODEGEN_AMQP  = $(CODEGEN_DIR)/amqp_codegen.py
 AMQP_SPEC_1_0 = $(CODEGEN_DIR)/amqp-1.0/messaging.xml			\
 		$(CODEGEN_DIR)/amqp-1.0/security.xml			\
 		$(CODEGEN_DIR)/amqp-1.0/transport.xml			\
-		$(CODEGEN_DIR)/amqp-1.0/transactions.xml
+		$(CODEGEN_DIR)/amqp-1.0/transactions.xml		\
+		$(CODEGEN_DIR)/amqp-1.0/rabbitmq.xml
 
 include/amqp10_framing.hrl:: $(CODEGEN) $(CODEGEN_AMQP) $(AMQP_SPEC_1_0)
 	$(verbose) mkdir -p $(dir $@)
