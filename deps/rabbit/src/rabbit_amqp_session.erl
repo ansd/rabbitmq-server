@@ -156,7 +156,7 @@
          }).
 
 -record(pending_transfer, {
-          frames :: iolist(),
+          frames :: [[#'v1_0.transfer'{} | Payload :: iolist()], ...],
           queue_ack_required :: boolean(),
           %% Queue that sent us this message.
           %% When feature flag credit_api_v2 becomes required, this field should be deleted.
@@ -166,7 +166,7 @@
          }).
 
 -record(pending_management_transfer, {
-          frames :: iolist()
+          frames :: [[#'v1_0.transfer'{} | Payload :: iolist()], ...]
          }).
 
 -record(cfg, {
