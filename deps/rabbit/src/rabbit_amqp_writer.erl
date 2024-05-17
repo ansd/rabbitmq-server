@@ -211,10 +211,13 @@ flush(State = #state{pending = []}) ->
     State;
 flush(State = #state{sock = Sock,
                      pending = Pending}) ->
+    T1 = erlang:monotonic_time(millisecond),
     case rabbit_net:send(Sock, lists:reverse(Pending)) of
         ok ->
             State#state{pending = [],
                         pending_size = 0};
         {error, Reason} ->
+            T2 = erlang:monotonic_time(millisecond),
+            rabbit_log:error("aaa Reason=~p millis=~b", [Reason, T2 - T1]),
             exit({writer, send_failed, Reason})
     end.

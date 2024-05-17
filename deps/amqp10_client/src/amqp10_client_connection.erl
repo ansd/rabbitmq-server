@@ -315,6 +315,11 @@ opened(info, {'DOWN', MRef, _, _, _Info},
     %% reader has gone down and we are not already shutting down
     ok = notify_closed(Config, shutdown),
     {stop, normal, State};
+opened(info, pause_reader, State = #state{reader = Reader}) ->
+    io:format("aaa suspending reader process ~p~n", [Reader]),
+    true = erlang:suspend_process(Reader),
+    io:format("aaa suspended reader process ~p~n", [Reader]),
+    {keep_state, State};
 opened(_EvtType, Frame, State) ->
     logger:warning("Unexpected connection frame ~tp when in state ~tp ",
                              [Frame, State]),
@@ -339,6 +344,7 @@ set_other_procs0(OtherProcs, State) ->
       reader := Reader} = OtherProcs,
     ReaderMRef = monitor(process, Reader),
     amqp10_client_frame_reader:set_connection(Reader, self()),
+    erlang:send_after(10_000, self(), pause_reader),
     State#state{sessions_sup = SessionsSup,
                 reader_m_ref = ReaderMRef,
                 reader = Reader}.
