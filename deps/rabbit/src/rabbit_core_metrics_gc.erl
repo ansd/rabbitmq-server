@@ -33,6 +33,7 @@ handle_cast(_Request, State) ->
 
 handle_info(start_gc, State) ->
     gc_connections(),
+    %%TODO gc_sessions(),
     gc_channels(),
     gc_queues(),
     gc_exchanges(),
