@@ -36,8 +36,10 @@ init_per_suite(Config) ->
     Config1 = rabbit_ct_helpers:set_config(
                 Config,
                 [{rmq_nodename_suffix, ?MODULE}]),
+    Config2 = rabbit_ct_helpers:merge_app_env(
+                Config1, {rabbit, [{authorization_failure_disclosure, true}]}),
     rabbit_ct_helpers:run_setup_steps(
-      Config1,
+      Config2,
       rabbit_ct_broker_helpers:setup_steps() ++
       rabbit_ct_client_helpers:setup_steps()).
 
@@ -109,10 +111,12 @@ amqp_x_cc_annotation(Config) ->
               condition = ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
               description = {utf8, Description1}}}}} ->
             ?assertEqual(
-               <<"write access to topic 'x.1' in exchange 'amq.topic' in vhost '/' refused for user 'guest'">>,
+               <<"write access to topic 'x.1' in exchange 'amq.topic' in vhost '/' "
+                 "refused for user 'guest' by backend rabbit_auth_backend_internal: "
+                 "topic 'x.1' does not match the regex '^a'">>,
                Description1)
     after 30_000 -> amqp_utils:flush(missing_ended),
-                  ct:fail({missing_event, ?LINE})
+                    ct:fail({missing_event, ?LINE})
     end,
 
     {ok, Session3} = amqp10_client:begin_session_sync(Connection),
@@ -132,10 +136,12 @@ amqp_x_cc_annotation(Config) ->
               condition = ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
               description = {utf8, Description2}}}}} ->
             ?assertEqual(
-               <<"write access to topic 'x.2' in exchange 'amq.topic' in vhost '/' refused for user 'guest'">>,
+               <<"write access to topic 'x.2' in exchange 'amq.topic' in vhost '/' "
+                 "refused for user 'guest' by backend rabbit_auth_backend_internal: "
+                 "topic 'x.2' does not match the regex '^a'">>,
                Description2)
     after 30_000 -> amqp_utils:flush(missing_ended),
-                  ct:fail({missing_event, ?LINE})
+                    ct:fail({missing_event, ?LINE})
     end,
 
     {ok, #{message_count := 0}} = rabbitmq_amqp_client:delete_queue(LinkPair, QName1),
@@ -190,8 +196,9 @@ amqpl_headers(Header, Config) ->
                 props = #'P_basic'{headers = [{Header, array, [{longstr, <<"a.2">>}]}]}}),
     ok = assert_channel_down(
            Ch1,
-           <<"ACCESS_REFUSED - write access to topic 'x.1' in exchange "
-             "'amq.topic' in vhost '/' refused for user 'guest'">>),
+           <<"ACCESS_REFUSED - write access to topic 'x.1' in exchange 'amq.topic' "
+             "in vhost '/' refused for user 'guest' by backend rabbit_auth_backend_internal: "
+             "topic 'x.1' does not match the regex '^a'">>),
 
     Ch2 = rabbit_ct_client_helpers:open_channel(Config),
     monitor(process, Ch2),
@@ -203,8 +210,9 @@ amqpl_headers(Header, Config) ->
                 props = #'P_basic'{headers = [{Header, array, [{longstr, <<"x.2">>}]}]}}),
     ok = assert_channel_down(
            Ch2,
-           <<"ACCESS_REFUSED - write access to topic 'x.2' in exchange "
-             "'amq.topic' in vhost '/' refused for user 'guest'">>),
+           <<"ACCESS_REFUSED - write access to topic 'x.2' in exchange 'amq.topic' "
+             "in vhost '/' refused for user 'guest' by backend rabbit_auth_backend_internal: "
+             "topic 'x.2' does not match the regex '^a'">>),
 
     Ch3 = rabbit_ct_client_helpers:open_channel(Config),
     ?assertEqual(#'queue.delete_ok'{message_count = 1},
@@ -337,12 +345,14 @@ topic_permission_checks1(_Config) ->
         Context
     ) || Perm <- Permissions],
     %% user has access to exchange, routing key does not match
-    [false = rabbit_auth_backend_internal:check_topic_access(
-        User,
-        Topic,
-        Perm,
-        #{routing_key => <<"x.y.z">>}
-    ) || Perm <- Permissions],
+    [?assertEqual(
+        {false, "topic 'x.y.z' does not match the regex '^a'"},
+        rabbit_auth_backend_internal:check_topic_access(
+          User,
+          Topic,
+          Perm,
+          #{routing_key => <<"x.y.z">>}
+         )) || Perm <- Permissions],
     %% user has access to exchange but not on this vhost
     %% let pass when there's no match
     [true = rabbit_auth_backend_internal:check_topic_access(
@@ -379,17 +389,20 @@ topic_permission_checks1(_Config) ->
         }
     ) || Perm <- Permissions],
     %% routing key KO
-    [false = rabbit_auth_backend_internal:check_topic_access(
-        User,
-        Topic#resource{virtual_host = <<"other-vhost">>},
-        Perm,
-        #{routing_key   => <<"services.default.accounts.dummy.notifications">>,
-          variable_map  => #{
-              <<"username">> => <<"guest">>,
-              <<"vhost">>    => <<"other-vhost">>
-          }
-        }
-    ) || Perm <- Permissions],
+    [?assertEqual(
+        {false, "topic 'services.default.accounts.dummy.notifications' does not "
+         "match the regex 'services.other-vhost.accounts.guest.notifications'"},
+        rabbit_auth_backend_internal:check_topic_access(
+          User,
+          Topic#resource{virtual_host = <<"other-vhost">>},
+          Perm,
+          #{routing_key   => <<"services.default.accounts.dummy.notifications">>,
+            variable_map  => #{
+                               <<"username">> => <<"guest">>,
+                               <<"vhost">>    => <<"other-vhost">>
+                              }
+           }
+         )) || Perm <- Permissions],
 
     ok.
 
@@ -407,11 +420,10 @@ clear_topic_permissions(Config) ->
            Config, 0, rabbit_auth_backend_internal, clear_topic_permissions,
            [<<"guest">>, <<"/">>, <<"acting-user">>]).
 
-assert_channel_down(Ch, Reason) ->
+assert_channel_down(Ch, ExpectedReason) ->
     receive {'DOWN', _MonitorRef, process, Ch,
-             {shutdown,
-              {server_initiated_close, 403, Reason}}} ->
-                ok
+             {shutdown, {server_initiated_close, 403, ActualReason}}} ->
+                ?assertEqual(ExpectedReason, ActualReason)
     after 30_000 ->
-              ct:fail({did_not_receive, Reason})
+              ct:fail({missing_down, ExpectedReason})
     end.

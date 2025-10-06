@@ -120,34 +120,34 @@ check_vhost_access(#auth_user{username = Username, tags = Tags}, VHost,
 
 do_check_vhost_access(Username, Tags, VHost, Ip, AuthzData) ->
     OptionsParameters = context_as_parameters(AuthzData),
-    bool_req(vhost_path, [{username, Username},
-                          {vhost,    VHost},
-                          {ip,       Ip},
-                          {tags,     join_tags(Tags)}] ++ OptionsParameters).
+    req(vhost_path, [{username, Username},
+                     {vhost,    VHost},
+                     {ip,       Ip},
+                     {tags,     join_tags(Tags)}] ++ OptionsParameters).
 
 check_resource_access(#auth_user{username = Username, tags = Tags},
                       #resource{virtual_host = VHost, kind = Type, name = Name},
                       Permission,
                       AuthzContext) ->
     OptionsParameters = context_as_parameters(AuthzContext),
-    bool_req(resource_path, [{username,   Username},
-                             {vhost,      VHost},
-                             {resource,   Type},
-                             {name,       Name},
-                             {permission, Permission},
-                             {tags, join_tags(Tags)}] ++ OptionsParameters).
+    req(resource_path, [{username,   Username},
+                        {vhost,      VHost},
+                        {resource,   Type},
+                        {name,       Name},
+                        {permission, Permission},
+                        {tags, join_tags(Tags)}] ++ OptionsParameters).
 
 check_topic_access(#auth_user{username = Username, tags = Tags},
                    #resource{virtual_host = VHost, kind = topic = Type, name = Name},
                    Permission,
                    Context) ->
     OptionsParameters = context_as_parameters(Context),
-    bool_req(topic_path, [{username,   Username},
-        {vhost,      VHost},
-        {resource,   Type},
-        {name,       Name},
-        {permission, Permission},
-        {tags, join_tags(Tags)}] ++ OptionsParameters).
+    req(topic_path, [{username,   Username},
+                     {vhost,      VHost},
+                     {resource,   Type},
+                     {name,       Name},
+                     {permission, Permission},
+                     {tags, join_tags(Tags)}] ++ OptionsParameters).
 
 expiry_timestamp(_) -> never.
 
@@ -163,7 +163,7 @@ context_as_parameters(Options) when is_map(Options) ->
 context_as_parameters(_) ->
     [].
 
-bool_req(PathName, Props) ->
+req(PathName, Props) ->
     Path = p(PathName),
     Query = q(Props),
     case http_req(Path, Query) of
@@ -172,7 +172,7 @@ bool_req(PathName, Props) ->
         "deny " ++ Reason ->
             ?LOG_INFO("HTTP authorisation denied for path ~ts with query ~ts: ~ts",
                       [Path, Query, Reason]),
-            false;
+            {false, Reason};
         Body ->
             case string:lowercase(Body) of
                 "deny" ->

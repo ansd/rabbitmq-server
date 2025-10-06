@@ -378,14 +378,15 @@ configure_refused(Vhost, Resource, Scope) ->
     resource_perm(Vhost, Resource, Scope, configure, false).
 
 
-resource_perm(Vhost, Resource, Scopes, Permission, Result) when is_list(Scopes) ->
-    [ ?assertEqual(Result, rabbit_oauth2_scope:resource_access(
-          #resource{virtual_host = Vhost,
-                    kind = Kind,
-                    name = Resource},
-          Permission,
-          Scopes)) || Kind <- [queue, exchange] ];
-
+resource_perm(Vhost, Name, Scopes, Permission, Expected) when is_list(Scopes) ->
+    [begin
+         Resource = #resource{virtual_host = Vhost,
+                              kind = Kind,
+                              name = Name},
+         Actual = rabbit_oauth2_scope:resource_access(Resource, Permission, Scopes),
+         assert(Expected, Actual)
+     end
+     || Kind <- [queue, exchange]];
 resource_perm(Vhost, Resource, Scope, Permission, Result) ->
     resource_perm(Vhost, Resource, [Scope], Permission, Result).
 
@@ -401,14 +402,19 @@ topic_read_refused(Vhost, Resource, RoutingKey, Scopes) when is_list(Scopes) ->
 topic_read_refused(Vhost, Resource, RoutingKey, Scope) ->
     topic_perm(Vhost, Resource, RoutingKey, Scope, read, false).
 
-topic_perm(Vhost, Resource, RoutingKey, Scopes, Permission, Result) when is_list(Scopes) ->
-    ?assertEqual(Result, rabbit_oauth2_scope:topic_access(
-        #resource{virtual_host = Vhost,
-                  kind = topic,
-                  name = Resource},
-        Permission,
-        #{routing_key => RoutingKey},
-        Scopes));
-
+topic_perm(Vhost, Name, RoutingKey, Scopes, Permission, Expected) when is_list(Scopes) ->
+    Resource = #resource{virtual_host = Vhost,
+                         kind = topic,
+                         name = Name},
+    Actual = rabbit_oauth2_scope:topic_access(Resource,
+                                              Permission,
+                                              #{routing_key => RoutingKey},
+                                              Scopes),
+    assert(Expected, Actual);
 topic_perm(Vhost, Resource, RoutingKey, Scope, Permission, Result) ->
     topic_perm(Vhost, Resource, RoutingKey, [Scope], Permission, Result).
+
+assert(true, Actual) ->
+    ?assert(Actual);
+assert(false, Actual) ->
+    ?assertMatch({false, _Reason}, Actual).

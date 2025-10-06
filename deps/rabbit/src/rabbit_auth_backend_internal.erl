@@ -143,7 +143,8 @@ check_resource_access(#auth_user{username = Username},
                       _AuthContext) ->
     case rabbit_db_user:get_user_permissions(Username, VHostPath) of
         undefined ->
-            false;
+            {false, rabbit_misc:format("user '~ts' has no permissions for vhost '~ts'",
+                                       [Username, VHostPath])};
         #user_permission{permission = P} ->
             PermRegexp = case element(permission_index(Permission), P) of
                              %% <<"^$">> breaks Emacs' erlang mode
@@ -151,8 +152,12 @@ check_resource_access(#auth_user{username = Username},
                              RE     -> RE
                          end,
             case re:run(Name, PermRegexp, [{capture, none}]) of
-                match    -> true;
-                nomatch  -> false
+                match ->
+                    true;
+                nomatch ->
+                    {false, rabbit_misc:format(
+                              "'~ts' does not match the permission regex '~ts'",
+                              [Name, PermRegexp])}
             end
     end.
 
@@ -170,12 +175,17 @@ check_topic_access(#auth_user{username = Username},
                              RE     -> RE
                          end,
             PermRegexpExpanded = expand_topic_permission(
-                PermRegexp,
-                maps:get(variable_map, Context, undefined)
-            ),
-            case re:run(maps:get(routing_key, Context), PermRegexpExpanded, [{capture, none}]) of
-                match    -> true;
-                nomatch  -> false
+                                   PermRegexp,
+                                   maps:get(variable_map, Context, undefined)
+                                  ),
+            Topic = maps:get(routing_key, Context),
+            case re:run(Topic, PermRegexpExpanded, [{capture, none}]) of
+                match ->
+                    true;
+                nomatch ->
+                    {false, rabbit_misc:format(
+                              "topic '~ts' does not match the regex '~ts'",
+                              [Topic, PermRegexpExpanded])}
             end
     end.
 

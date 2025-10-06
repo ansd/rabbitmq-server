@@ -361,6 +361,15 @@ check_access(Fun, Module, ErrStr, ErrArgs, ErrName) ->
             ok;
         false ->
             rabbit_misc:protocol_error(ErrName, ErrStr, ErrArgs);
+        {false, Reason} ->
+            case application:get_env(rabbit, authorization_failure_disclosure) of
+                {ok, true} ->
+                    FullErrStr = ErrStr ++ " by backend ~ts: ~ts",
+                    FullErrArgs = ErrArgs ++ [Module, Reason],
+                    rabbit_misc:protocol_error(ErrName, FullErrStr, FullErrArgs);
+                _ ->
+                    rabbit_misc:protocol_error(ErrName, ErrStr, ErrArgs)
+            end;
         {error, E}  ->
             FullErrStr = ErrStr ++ ", backend ~ts returned an error: ~tp",
             FullErrArgs = ErrArgs ++ [Module, E],

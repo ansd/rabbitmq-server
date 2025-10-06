@@ -24,37 +24,56 @@
 -spec vhost_access(binary(), [binary()]) -> boolean().
 vhost_access(VHost, Scopes) ->
     PermissionScopes = get_scope_permissions(Scopes),
-    lists:any(
-        fun({VHostPattern, _, _, _}) ->
-            wildcard:match(VHost, VHostPattern)
-        end,
-        PermissionScopes).
+    case lists:any(
+           fun({VHostPattern, _, _, _}) ->
+                   wildcard:match(VHost, VHostPattern)
+           end,
+           PermissionScopes) of
+        true ->
+            true;
+        false ->
+            {false, rabbit_misc:format("no scope in ~tp matches vhost '~ts'",
+                                       [Scopes, VHost])}
+    end.
 
 -spec resource_access(rabbit_types:r(atom()), permission(), [binary()]) -> boolean().
-resource_access(#resource{virtual_host = VHost, name = Name},
+resource_access(#resource{virtual_host = VHost, name = Name} = Resource,
                 Permission, Scopes) ->
-    lists:any(
-        fun({VHostPattern, NamePattern, _, ScopeGrantedPermission}) ->
-            wildcard:match(VHost, VHostPattern) andalso
-            wildcard:match(Name, NamePattern) andalso
-            Permission =:= ScopeGrantedPermission
-        end,
-        get_scope_permissions(Scopes)).
+    case lists:any(
+           fun({VHostPattern, NamePattern, _, ScopeGrantedPermission}) ->
+                   wildcard:match(VHost, VHostPattern) andalso
+                   wildcard:match(Name, NamePattern) andalso
+                   Permission =:= ScopeGrantedPermission
+           end,
+           get_scope_permissions(Scopes)) of
+        true ->
+            true;
+        false ->
+            {false, rabbit_misc:format("no scope in ~tp has '~s' permission for ~ts",
+                                       [Scopes, Permission, rabbit_misc:rs(Resource)])}
+    end.
 
 -spec topic_access(rabbit_types:r(atom()), permission(), map(), [binary()]) -> boolean().
-topic_access(#resource{virtual_host = VHost, name = ExchangeName},
+topic_access(#resource{virtual_host = VHost, name = ExchangeName} = Resource,
              Permission,
              #{routing_key := RoutingKey},
              Scopes) ->
-    lists:any(
-        fun({VHostPattern, ExchangeNamePattern, RoutingKeyPattern, ScopeGrantedPermission}) ->
-            is_binary(RoutingKeyPattern) andalso
-            wildcard:match(VHost, VHostPattern) andalso
-            wildcard:match(ExchangeName, ExchangeNamePattern) andalso
-            wildcard:match(RoutingKey, RoutingKeyPattern) andalso
-            Permission =:= ScopeGrantedPermission
-        end,
-        get_scope_permissions(Scopes)).
+    case lists:any(
+           fun({VHostPattern, ExchangeNamePattern, RoutingKeyPattern, ScopeGrantedPermission}) ->
+                   is_binary(RoutingKeyPattern) andalso
+                   wildcard:match(VHost, VHostPattern) andalso
+                   wildcard:match(ExchangeName, ExchangeNamePattern) andalso
+                   wildcard:match(RoutingKey, RoutingKeyPattern) andalso
+                   Permission =:= ScopeGrantedPermission
+           end,
+           get_scope_permissions(Scopes)) of
+        true ->
+            true;
+        false ->
+            {false, rabbit_misc:format(
+                      "no scope in ~tp has '~s' permission for exchange ~ts and topic '~ts'",
+                      [Scopes, Permission, rabbit_misc:rs(Resource), RoutingKey])}
+    end.
 
 %% Internal -------------------------------------------------------------------
 

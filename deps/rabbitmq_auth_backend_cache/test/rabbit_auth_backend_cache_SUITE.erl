@@ -6,6 +6,7 @@
 %%
 -module(rabbit_auth_backend_cache_SUITE).
 
+-include_lib("eunit/include/eunit.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 
 -compile(export_all).
@@ -89,14 +90,24 @@ access_response(Config) ->
     true = rpc(Config,rabbit_auth_backend_internal, check_resource_access, [Auth, AvailableResource, configure, #{}]),
     true = rpc(Config,rabbit_auth_backend_cache, check_resource_access, [Auth, AvailableResource, configure, #{}]),
 
-    false = rpc(Config,rabbit_auth_backend_internal, check_resource_access, [Auth, RestrictedResource, configure, #{}]),
-    false = rpc(Config,rabbit_auth_backend_cache, check_resource_access, [Auth, RestrictedResource, configure, #{}]),
+    ExpectedResourceAccess = {false, "user 'guest' has no permissions for vhost 'restricted'"},
+    ?assertEqual(
+       ExpectedResourceAccess,
+       rpc(Config,rabbit_auth_backend_internal, check_resource_access, [Auth, RestrictedResource, configure, #{}])),
+    ?assertEqual(
+       ExpectedResourceAccess,
+       rpc(Config,rabbit_auth_backend_cache, check_resource_access, [Auth, RestrictedResource, configure, #{}])),
 
     true = rpc(Config,rabbit_auth_backend_internal, check_topic_access, [Auth, TopicResource, write, AuthorisedTopicContext]),
     true = rpc(Config,rabbit_auth_backend_cache, check_topic_access, [Auth, TopicResource, write, AuthorisedTopicContext]),
 
-    false = rpc(Config,rabbit_auth_backend_internal, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]),
-    false = rpc(Config,rabbit_auth_backend_cache, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]).
+    ExpectedTopicAccess = {false, "topic 'b.b' does not match the regex '^a'"},
+    ?assertEqual(
+       ExpectedTopicAccess,
+       rpc(Config, rabbit_auth_backend_internal, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext])),
+    ?assertEqual(
+       ExpectedTopicAccess,
+       rpc(Config,rabbit_auth_backend_cache, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext])).
 
 cache_expiration(Config) ->
     AvailableVhost = <<"/">>,
@@ -124,7 +135,7 @@ cache_expiration(Config) ->
     false = rpc(Config,rabbit_auth_backend_internal, check_vhost_access, [Auth, AvailableVhost, undefined]),
     true = rpc(Config,rabbit_auth_backend_cache, check_vhost_access, [Auth, AvailableVhost, undefined]),
 
-    false = rpc(Config,rabbit_auth_backend_internal, check_resource_access, [Auth, AvailableResource, configure, #{}]),
+    {false, _} = rpc(Config,rabbit_auth_backend_internal, check_resource_access, [Auth, AvailableResource, configure, #{}]),
     true = rpc(Config,rabbit_auth_backend_cache, check_resource_access, [Auth, AvailableResource, configure, #{}]),
 
     {ok, TTL} = rpc(Config, application, get_env, [rabbitmq_auth_backend_cache, cache_ttl]),
@@ -135,8 +146,8 @@ cache_expiration(Config) ->
     false = rpc(Config,rabbit_auth_backend_internal, check_vhost_access, [Auth, AvailableVhost, undefined]),
     false = rpc(Config,rabbit_auth_backend_cache, check_vhost_access, [Auth, AvailableVhost, undefined]),
 
-    false = rpc(Config,rabbit_auth_backend_internal, check_resource_access, [Auth, AvailableResource, configure, #{}]),
-    false = rpc(Config,rabbit_auth_backend_cache, check_resource_access, [Auth, AvailableResource, configure, #{}]).
+    {false, _} = rpc(Config,rabbit_auth_backend_internal, check_resource_access, [Auth, AvailableResource, configure, #{}]),
+    {false, _} = rpc(Config,rabbit_auth_backend_cache, check_resource_access, [Auth, AvailableResource, configure, #{}]).
 
 cache_expiration_topic(Config) ->
     AvailableVhost = <<"/">>,
@@ -153,14 +164,14 @@ cache_expiration_topic(Config) ->
         <<"guest">>, <<"/">>, <<"amq.topic">>, <<"^a">>, <<"^b">>, <<"acting-user">>
     ]),
 
-    false = rpc(Config,rabbit_auth_backend_internal, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]),
+    {false, _} = rpc(Config,rabbit_auth_backend_internal, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]),
     true = rpc(Config,rabbit_auth_backend_cache, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]),
 
     {ok, TTL} = rpc(Config, application, get_env, [rabbitmq_auth_backend_cache, cache_ttl]),
     timer:sleep(TTL),
 
-    false = rpc(Config,rabbit_auth_backend_internal, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]),
-    false = rpc(Config,rabbit_auth_backend_cache, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]).
+    {false, _} = rpc(Config,rabbit_auth_backend_internal, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]),
+    {false, _} = rpc(Config,rabbit_auth_backend_cache, check_topic_access, [Auth, TopicResource, write, RestrictedTopicContext]).
 
 rpc(Config, M, F, A) ->
     rabbit_ct_broker_helpers:rpc(Config, 0, M, F, A).
