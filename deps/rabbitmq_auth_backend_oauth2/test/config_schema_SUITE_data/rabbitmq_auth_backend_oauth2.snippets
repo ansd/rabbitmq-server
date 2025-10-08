@@ -14,6 +14,7 @@
         auth_oauth2.jwks_uri = https://my-jwt-issuer/jwks.json
         auth_oauth2.jwks_url = https://my-jwt-issuer/jwks.json
         auth_oauth2.issuer = https://my-jwt-issuer
+        auth_oauth2.authorization_failure_disclosure = true
         auth_oauth2.https.cacertfile = test/config_schema_SUITE_data/certs/cacert.pem
         auth_oauth2.https.peer_verification = verify_none
         auth_oauth2.https.depth = 5
@@ -33,6 +34,7 @@
             {preferred_username_claims, [<<"user_name">>, <<"username">>, <<"email">>]},
             {verify_aud, true},
             {issuer, "https://my-jwt-issuer"},
+            {authorization_failure_disclosure, true},
             {discovery_endpoint_path, "/.well-known/openid-configuration"},
             {discovery_endpoint_params, [
                 {<<"param1">>, <<"value1">>}

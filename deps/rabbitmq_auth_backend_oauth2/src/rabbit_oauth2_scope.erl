@@ -24,37 +24,57 @@
 -spec vhost_access(binary(), [binary()]) -> boolean().
 vhost_access(VHost, Scopes) ->
     PermissionScopes = get_scope_permissions(Scopes),
-    lists:any(
-        fun({VHostPattern, _, _, _}) ->
-            wildcard:match(VHost, VHostPattern)
-        end,
-        PermissionScopes).
+    case lists:any(
+           fun({VHostPattern, _, _, _}) ->
+                   wildcard:match(VHost, VHostPattern)
+           end,
+           PermissionScopes) of
+        true ->
+            true;
+        false ->
+            deny(rabbit_misc:format("no scope in ~tp matches vhost '~ts'",
+                                    [Scopes, VHost]))
+    end.
 
 -spec resource_access(rabbit_types:r(atom()), permission(), [binary()]) -> boolean().
-resource_access(#resource{virtual_host = VHost, name = Name},
+resource_access(#resource{virtual_host = VHost, name = Name} = Resource,
                 Permission, Scopes) ->
-    lists:any(
-        fun({VHostPattern, NamePattern, _, ScopeGrantedPermission}) ->
-            wildcard:match(VHost, VHostPattern) andalso
-            wildcard:match(Name, NamePattern) andalso
-            Permission =:= ScopeGrantedPermission
-        end,
-        get_scope_permissions(Scopes)).
+    case lists:any(
+           fun({VHostPattern, NamePattern, _, ScopeGrantedPermission}) ->
+                   wildcard:match(VHost, VHostPattern) andalso
+                   wildcard:match(Name, NamePattern) andalso
+                   Permission =:= ScopeGrantedPermission
+           end,
+           get_scope_permissions(Scopes)) of
+        true ->
+            true;
+        false ->
+            deny(rabbit_misc:format(
+                   "no scope in ~tp has '~s' permission for ~ts",
+                   [Scopes, Permission, rabbit_misc:rs(Resource)]))
+    end.
 
 -spec topic_access(rabbit_types:r(atom()), permission(), map(), [binary()]) -> boolean().
-topic_access(#resource{virtual_host = VHost, name = ExchangeName},
+topic_access(#resource{virtual_host = VHost, name = ExchangeName} = Resource,
              Permission,
              #{routing_key := RoutingKey},
              Scopes) ->
-    lists:any(
-        fun({VHostPattern, ExchangeNamePattern, RoutingKeyPattern, ScopeGrantedPermission}) ->
-            is_binary(RoutingKeyPattern) andalso
-            wildcard:match(VHost, VHostPattern) andalso
-            wildcard:match(ExchangeName, ExchangeNamePattern) andalso
-            wildcard:match(RoutingKey, RoutingKeyPattern) andalso
-            Permission =:= ScopeGrantedPermission
-        end,
-        get_scope_permissions(Scopes)).
+    case lists:any(
+           fun({VHostPattern, ExchangeNamePattern, RoutingKeyPattern, ScopeGrantedPermission}) ->
+                   is_binary(RoutingKeyPattern) andalso
+                   wildcard:match(VHost, VHostPattern) andalso
+                   wildcard:match(ExchangeName, ExchangeNamePattern) andalso
+                   wildcard:match(RoutingKey, RoutingKeyPattern) andalso
+                   Permission =:= ScopeGrantedPermission
+           end,
+           get_scope_permissions(Scopes)) of
+        true ->
+            true;
+        false ->
+            deny(rabbit_misc:format(
+                   "no scope in ~tp has '~s' permission for exchange ~ts and topic '~ts'",
+                   [Scopes, Permission, rabbit_misc:rs(Resource), RoutingKey]))
+    end.
 
 %% Internal -------------------------------------------------------------------
 
@@ -73,7 +93,8 @@ get_scope_permissions(Scopes) when is_list(Scopes) ->
 concat_scopes(Scopes, Separator) when is_list(Scopes) ->
     lists:concat(lists:join(Separator, lists:map(fun rabbit_data_coercion:to_list/1, Scopes))).
 
--spec parse_permission_pattern(binary()) -> {rabbit_types:vhost(), binary(), binary() | none, permission()} | 'ignore'.
+-spec parse_permission_pattern(binary()) ->
+    {rabbit_types:vhost(), binary(), binary() | none, permission()} | 'ignore'.
 parse_permission_pattern(<<"read:", ResourcePatternBin/binary>>) ->
     Permission = read,
     parse_resource_pattern(ResourcePatternBin, Permission);
@@ -106,7 +127,7 @@ filter_matching_scope_prefix(
             filter_matching_scope_prefix_and_drop_it(Scopes, ScopePrefix)};
 filter_matching_scope_prefix(_, Payload) -> Payload.
 
--spec filter_matching_scope_prefix_and_drop_it(list(), binary()|list()) -> list().
+-spec filter_matching_scope_prefix_and_drop_it(list(), binary() | list()) -> list().
 filter_matching_scope_prefix_and_drop_it(Scopes, <<>>) -> Scopes;
 filter_matching_scope_prefix_and_drop_it(Scopes, PrefixPattern)  ->
     PatternLength = byte_size(PrefixPattern),
@@ -122,3 +143,12 @@ filter_matching_scope_prefix_and_drop_it(Scopes, PrefixPattern)  ->
             end
         end,
         Scopes).
+
+deny(Reason) ->
+    case application:get_env(rabbitmq_auth_backend_oauth2,
+                             authorization_failure_disclosure) of
+        {ok, true} ->
+            {false, Reason};
+        _ ->
+            false
+    end.

@@ -159,6 +159,11 @@
  [{datatype, string}, {validators, ["uri", "https_uri"]}]}.
 
 {mapping,
+ "auth_oauth2.authorization_failure_disclosure",
+ "rabbitmq_auth_backend_oauth2.authorization_failure_disclosure",
+ [{datatype, {enum, [true, false]}}]}.
+
+{mapping,
  "auth_oauth2.token_endpoint",
  "rabbitmq_auth_backend_oauth2.token_endpoint",
  [{datatype, string}, {validators, ["uri", "https_uri"]}]}.

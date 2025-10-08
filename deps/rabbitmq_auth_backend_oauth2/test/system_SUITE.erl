@@ -324,6 +324,8 @@ preconfigure_node(Config) ->
                                       [rabbitmq_auth_backend_oauth2, key_config, KeyConfig]),
     ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
                                       [rabbitmq_auth_backend_oauth2, resource_server_id, ?RESOURCE_SERVER_ID]),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
+                                      [rabbitmq_auth_backend_oauth2, authorization_failure_disclosure, true]),
 
     rabbit_ct_helpers:set_config(Config, {fixture_jwk, Jwk}).
 
@@ -726,7 +728,11 @@ amqp_token_refresh_revoked_permissions(Config) ->
           {ended,
            #'v1_0.error'{
               condition = ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
-              description = {utf8, <<"write access to exchange 'amq.fanout' in vhost '/' refused", _/binary>>}}}}} -> ok
+              description = {utf8, <<"write access to exchange 'amq.fanout' in vhost '/' refused for "
+                                     "user 'unknown' by backend rabbit_auth_backend_oauth2: no scope in "
+                                     "[<<\"configure:%2F/*1/nope\">>,<<\"read:%2F/nope/nope\">>,\n"
+                                     "             <<\"write:%2F/amq.topic/nope\">>] has 'write' "
+                                     "permission for exchange 'amq.fanout' in vhost '/'">>}}}}} -> ok
     after 5000 -> ct:fail({missing_event, ?LINE})
     end,
 
@@ -771,8 +777,11 @@ amqp_token_refresh_revoked_permissions(Config) ->
           {ended,
            #'v1_0.error'{
               condition = ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
-              description = {utf8, <<"write access to topic 'topic-1' in exchange"
-                                     " 'amq.topic' in vhost '/' refused", _/binary>>}}}}} -> ok
+              description = {utf8, <<"write access to topic 'topic-1' in exchange 'amq.topic' in vhost "
+                                     "'/' refused for user 'unknown' by backend rabbit_auth_backend_oauth2: "
+                                     "no scope in [<<\"configure:%2F/*1/nope\">>,<<\"read:%2F/nope/nope\">>,\n"
+                                     "             <<\"write:%2F/amq.topic/nope\">>] has 'write' permission "
+                                     "for exchange 'amq.topic' in vhost '/' and topic 'topic-1'">>}}}}} -> ok
     after 5000 -> ct:fail({missing_event, ?LINE})
     end,
 
@@ -919,7 +928,13 @@ test_failed_connection_with_a_token_with_variable_expansion(Config) ->
     ),
     Conn     = open_unmanaged_connection(Config, 0, <<"vhost2">>, <<"username">>, Token),    
     {ok, Ch} = amqp_connection:open_channel(Conn),
-    ?assertExit({{shutdown, {server_initiated_close, 403, _}}, _},
+    ?assertExit(
+       {{shutdown,
+         {server_initiated_close, 403,
+          <<"ACCESS_REFUSED - configure access to queue 'vhost1-username-3' in vhost 'vhost2' "
+            "refused for user 'unknown' by backend rabbit_auth_backend_oauth2: no scope in "
+            "[<<\"configure:*/vhost2-sub-*\">>,<<\"read:*/*\">>,<<\"write:*/*\">>] has "
+            "'configure' permission ", _Truncated/binary>>}}, _},
        amqp_channel:call(Ch, #'queue.declare'{queue = <<"vhost1-username-3">>, exclusive = true})),
     close_connection(Conn).
 

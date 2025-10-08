@@ -15,7 +15,7 @@
 -define(RABBITMQ,<<"rabbitmq">>).
 -define(RABBITMQ_RESOURCE_ONE,<<"rabbitmq1">>).
 -define(RABBITMQ_RESOURCE_TWO,<<"rabbitmq2">>).
--define(AUTH_PORT, 8000).
+-define(AUTH_PORT, 8002).
 
 -import(rabbit_oauth2_provider, [
     get_internal_oauth_provider/0,get_internal_oauth_provider/1,
